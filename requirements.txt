@@ -2,6 +2,8 @@ torch>=2.0.0
 torchvision
 transformers
 diffusers
+accelerate
+peft
 safetensors
 einops
 sentencepiece
@@ -14,6 +16,7 @@ opencv-python
 imageio
 imageio[ffmpeg]
 tqdm
+pyyaml
 matplotlib
 pyquaternion
 nuscenes-devkit

@@ -41,6 +41,7 @@ Hao Cheng<sup>1</sup>
 - [Qualitative Results](#qualitative-results)
 - [Installation](#installation)
 - [Model Preparation](#model-preparation)
+- [NavSIM v1 Training](#navsim-v1-training)
 - [NavSIM v1 Evaluation](#navsim-v1-evaluation)
 - [nuScenes Evaluation](#nuscenes-evaluation)
 - [Bench2Drive Evaluation](#bench2drive-evaluation)
@@ -145,6 +146,35 @@ https://huggingface.co/mengmengliu1998/DriveVA and is saved as
 The Wan2.2 model directory should contain the text encoder, VAE, and diffusion
 checkpoint files required by the Wan2.2 TI2V 5B runtime. Override the defaults
 with `LOCAL_MODEL_PATH` and `FULL_CKPT` when needed.
+
+## NavSIM v1 Training
+
+Set the NAVSIM v1 trainval paths and Wan2.2 model directory:
+
+```bash
+export NAVSIM_LOG_PATH=/path/to/navsim_logs/trainval
+export SENSOR_BLOBS_PATH=/path/to/nuplan/sensor_blobs
+export NUPLAN_MAPS_ROOT=/path/to/nuplan/maps
+export NUPLAN_DATA_ROOT=/path/to/navsim/dataset
+export LOCAL_MODEL_PATH=$PWD/models
+export FULL_CKPT=$PWD/checkpoints/pdms90_9.safetensors
+
+bash examples/wanvideo/driveva_train/scripts/train_dist_multi_node_navsim.sh
+```
+
+To evaluate saved checkpoints on NavSIM, nuScenes, and Bench2Drive:
+
+```bash
+bash examples/wanvideo/driveva_train/scripts/train_w_infer.sh
+```
+
+`train_w_infer.sh` watches `OUTPUT_PATH` and evaluates both raw and EMA
+checkpoints by default. Use `EVAL_CKPT_KIND=ema` or `EVAL_CKPT_KIND=raw` to
+evaluate only one checkpoint kind.
+
+Common overrides include `OUTPUT_PATH`, `NUM_EPOCHS`, `SAVE_STEPS`, `LR`,
+`NUM_HISTORY_FRAMES`, `NUM_FUTURE_FRAMES`, `TRAINABLE_MODELS`, `USE_EMA`,
+`SAVE_EMA`, and `SMOKE_TEST=1`.
 
 ## NavSIM v1 Evaluation
 

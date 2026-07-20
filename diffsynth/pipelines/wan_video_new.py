@@ -413,6 +413,182 @@ class WanVideoPipeline(BasePipeline):
         return pipe
 
 
+    def _ensure_scheduler_training_state(self) -> None:
+        timesteps = getattr(self.scheduler, "timesteps", None)
+        need_reset = (
+            not bool(getattr(self.scheduler, "training", False))
+            or timesteps is None
+            or len(timesteps) != int(self.scheduler.num_train_timesteps)
+            or not hasattr(self.scheduler, "linear_timesteps_weights")
+        )
+        if need_reset:
+            self.scheduler.set_timesteps(int(self.scheduler.num_train_timesteps), training=True)
+
+
+    def training_loss(self, **inputs):
+        self._ensure_scheduler_training_state()
+
+        return_loss_breakdown = bool(inputs.pop("return_loss_breakdown", False))
+        num_train_steps = int(self.scheduler.num_train_timesteps)
+        max_timestep_boundary = int(float(inputs.get("max_timestep_boundary", 1.0)) * num_train_steps)
+        min_timestep_boundary = int(float(inputs.get("min_timestep_boundary", 0.0)) * num_train_steps)
+        max_timestep_boundary = max(1, min(max_timestep_boundary, num_train_steps))
+        min_timestep_boundary = max(0, min(min_timestep_boundary, max_timestep_boundary - 1))
+        timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
+        timestep = self.scheduler.timesteps[timestep_id].to(dtype=self.torch_dtype, device=self.device)
+
+        inputs["latents"] = self.scheduler.add_noise(inputs["input_latents"], inputs["noise"], timestep)
+        training_target = self.scheduler.training_target(inputs["input_latents"], inputs["noise"], timestep)
+
+        traj_target = None
+        has_vel_token = False
+        if "traj_tokens" in inputs and inputs["traj_tokens"] is not None:
+            traj = inputs.get("trajectory")
+            target_fps = inputs.get("target_fps", getattr(self, "target_fps", None))
+            history_positions = inputs.get("history_positions", inputs.get("history_trajectory"))
+            vel = inputs.get("ego_vel")
+            use_history_prefix, use_velocity_prefix = self._trajectory_prefix_usage(
+                has_history=history_positions is not None,
+                has_velocity=vel is not None,
+            )
+
+            hist_norm = None
+            hist_len = 0
+            if use_history_prefix and history_positions is not None:
+                if not torch.is_tensor(history_positions):
+                    history_positions = torch.from_numpy(np.asarray(history_positions))
+                if history_positions.ndim == 2:
+                    history_positions = history_positions.unsqueeze(0)
+                history_positions = history_positions.to(device=self.device, dtype=self.torch_dtype)
+                history_positions = self._ensure_traj_dim(history_positions, dim=3)
+                if self.trajectory_use_relative:
+                    history_positions = self._to_relative_trajectory(history_positions)
+                hist_norm = self.norm_trajectory(
+                    history_positions,
+                    is_relative=self.trajectory_use_relative,
+                    target_fps=target_fps,
+                )
+                hist_len = hist_norm.shape[1]
+
+            if not torch.is_tensor(traj):
+                traj = torch.from_numpy(np.asarray(traj))
+            if traj.ndim == 2:
+                traj = traj.unsqueeze(0)
+            traj = traj.to(device=self.device, dtype=self.torch_dtype)
+            traj = self._ensure_traj_dim(traj, dim=3)
+            if self.trajectory_use_relative:
+                traj = self._to_relative_trajectory(traj)
+            traj_norm = self.norm_trajectory(
+                traj,
+                is_relative=self.trajectory_use_relative,
+                target_fps=target_fps,
+            )
+
+            if use_velocity_prefix and vel is not None:
+                if not torch.is_tensor(vel):
+                    vel = torch.from_numpy(np.asarray(vel))
+                if vel.ndim == 1:
+                    vel = vel.unsqueeze(0)
+                vel = vel.to(device=self.device, dtype=self.torch_dtype)[..., :2]
+                vel_norm = self.norm_velocity(vel, target_fps=target_fps)
+            else:
+                vel_norm = None
+
+            traj_noise = torch.randn_like(traj_norm)
+            traj_noisy = self.scheduler.add_noise(traj_norm, traj_noise, timestep)
+            traj_noisy = torch.clamp(traj_noisy, min=-1, max=1)
+
+            vel_cond = None
+            if vel_norm is not None:
+                vel_cond = vel_norm
+                has_vel_token = True
+            prefix_len = hist_len + (1 if vel_cond is not None else 0)
+
+            traj_proj = self.trajectory_encoder.traj_proj
+            if hasattr(traj_proj, "weight"):
+                enc_dtype = traj_proj.weight.dtype
+            else:
+                enc_dtype = next(traj_proj.parameters()).dtype
+            if traj_noisy.dtype != enc_dtype:
+                traj_noisy = traj_noisy.to(enc_dtype)
+            if hist_norm is not None and hist_norm.dtype != enc_dtype:
+                hist_norm = hist_norm.to(enc_dtype)
+            if vel_cond is not None and vel_cond.dtype != enc_dtype:
+                vel_cond = vel_cond.to(enc_dtype)
+
+            inputs["traj_tokens"] = self.trajectory_encoder(
+                traj_noisy,
+                history_positions=hist_norm,
+                velocity=vel_cond,
+            )
+            inputs["traj_has_vel"] = has_vel_token
+            inputs["traj_prefix_len"] = prefix_len
+            if hist_norm is not None:
+                inputs["traj_prefix_mode"] = "history"
+            elif has_vel_token:
+                inputs["traj_prefix_mode"] = "velocity"
+
+            traj_target = self.scheduler.training_target(traj_norm, traj_noise, timestep)
+            inputs["return_traj_pred"] = True
+
+        inputs.setdefault("traj_postprocess", False)
+        inputs.setdefault("pipe", self)
+        noise_pred = self.model_fn(**inputs, timestep=timestep)
+
+        if isinstance(noise_pred, dict):
+            video_pred = noise_pred.get("video")
+            traj_pred = noise_pred.get("traj")
+        else:
+            video_pred = noise_pred
+            traj_pred = None
+
+        video_pred_for_loss = video_pred
+        training_target_for_loss = training_target
+        if bool(getattr(self, "train_future_video_noise_only", False)):
+            longcat_latents = inputs.get("longcat_latents")
+            if torch.is_tensor(longcat_latents) and longcat_latents.ndim >= 3:
+                cond_t = int(longcat_latents.shape[2])
+                if 0 < cond_t < video_pred.shape[2]:
+                    video_pred_for_loss = video_pred[:, :, cond_t:]
+                    training_target_for_loss = training_target[:, :, cond_t:]
+
+        video_loss = torch.nn.functional.mse_loss(
+            video_pred_for_loss.float(),
+            training_target_for_loss.float(),
+        )
+        traj_loss_weight = 0.0
+        if traj_pred is not None and traj_target is not None:
+            traj_pred_points = traj_pred
+            prefix_len = int(inputs.get("traj_prefix_len", 1 if has_vel_token else 0))
+            if prefix_len > 0 and traj_pred.shape[1] > prefix_len:
+                traj_pred_points = traj_pred[:, prefix_len:]
+            traj_loss = torch.nn.functional.mse_loss(traj_pred_points.float(), traj_target.float())
+            traj_loss_weight = 1.0
+        else:
+            traj_loss = torch.zeros_like(video_loss)
+
+        video_loss_scale = max(0.0, float(inputs.get("video_loss_scale", 1.0)))
+        trajectory_loss_scale = max(0.0, float(inputs.get("trajectory_loss_scale", 1.0)))
+        loss_unweighted = video_loss_scale * video_loss + trajectory_loss_scale * traj_loss_weight * traj_loss
+        loss_weight = self.scheduler.training_weight(timestep).to(device=loss_unweighted.device)
+        loss = loss_unweighted * loss_weight
+
+        if return_loss_breakdown:
+            return {
+                "loss": loss,
+                "loss_unweighted": loss_unweighted.detach(),
+                "video_loss": (video_loss * video_loss_scale * loss_weight).detach(),
+                "trajectory_loss": (
+                    traj_loss * traj_loss_weight * trajectory_loss_scale * loss_weight
+                ).detach(),
+                "lr_weight": loss_weight.detach(),
+                "trajectory_loss_weight": float(traj_loss_weight),
+                "video_loss_scale": float(video_loss_scale),
+                "trajectory_loss_scale": float(trajectory_loss_scale),
+            }
+        return loss
+
+
     @torch.no_grad()
     def __call__(
         self,
