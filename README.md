@@ -29,6 +29,7 @@ Hao Cheng<sup>1</sup>
 
 ## News
 
+- **`July 20th, 2026`:** DriveVA NavSIM training code released.
 - **`July 10th, 2026`:** DriveVA inference code and checkpoint released.
 - **`June 20th, 2026`:** DriveVA is accepted by ECCV 2026🎉🎉🎉!
 - **`Apr. 5th, 2026`:** DriveVA is released on [arXiv](https://arxiv.org/abs/2604.04198).
