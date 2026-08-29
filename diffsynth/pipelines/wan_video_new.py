@@ -697,7 +697,19 @@ class WanVideoPipeline(BasePipeline):
             if trajectory_len is not None:
                 traj_len = int(trajectory_len)
                 batch_size = inputs_shared["latents"].shape[0]
-                traj_noise = torch.randn((batch_size, traj_len, 3), device=self.device, dtype=self.torch_dtype)
+                # Keep planning initialization paired across repeated and
+                # compressed evaluations. Video noise is seeded in the input
+                # unit; the trajectory branch must use a separate deterministic
+                # stream or no_press results depend on the global CUDA RNG
+                # state and on method execution order.
+                trajectory_seed = None if seed is None else int(seed) + 1
+                traj_noise = self.generate_noise(
+                    (batch_size, traj_len, 3),
+                    seed=trajectory_seed,
+                    rand_device=rand_device,
+                    device=self.device,
+                    torch_dtype=self.torch_dtype,
+                )
                 traj_noisy = torch.clamp(traj_noise, min=-1, max=1)
 
             if traj_len is not None:
