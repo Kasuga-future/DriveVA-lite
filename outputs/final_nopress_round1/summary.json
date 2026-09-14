@@ -1,0 +1,20 @@
+{
+  "n_scenes": 4,
+  "valid_scenes": 4,
+  "pdm": 0.98601034283638,
+  "trajectory_l2": 0.014115215162746608,
+  "endpoint_l2": 0.01439320354256779,
+  "latency_ms_mean": 0.4793289117515087,
+  "selector_latency_ms_mean": 0.21375250071287155,
+  "model_latency_ms_mean": 0.2090558409690857,
+  "e2e_latency_ms_mean": 0.4793289117515087,
+  "peak_memory_mb_mean": 0.0,
+  "eligible_keep_ratio_mean": 1.0,
+  "history_keep_ratio_mean": 0.5,
+  "press": {
+    "name": "noop",
+    "injection_point": "video_input"
+  },
+  "mode": "causal",
+  "backend": "synthetic"
+}

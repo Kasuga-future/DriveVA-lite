@@ -1,0 +1,46 @@
+experiment:
+  name: synthetic_random_zero_smoke
+  seed: 20260828
+
+benchmark:
+  name: synthetic
+  max_scenes: 4
+
+model:
+  checkpoint: checkpoints/pdms90_9.safetensors
+
+press:
+  name: scorer_press
+  injection_point: video_input
+  domain:
+    name: last_history
+  scorer:
+    name: random
+    seed: 20260828
+  selector:
+    name: topk
+  operator:
+    name: zero
+  budget:
+    type: ratio
+    value: 0.5
+    reference: eligible
+
+evaluation:
+  mode: causal
+  random_baseline: false
+  random_seeds: [0, 1, 2]
+
+output:
+  dir: outputs/press_smoke
+
+synthetic:
+  frames: 4
+  height: 3
+  width: 4
+  num_cond_latents: 2
+  trajectory_length: 6
+  trajectory_prefix_length: 2
+  hidden_dim: 16
+  heads: 2
+  scenes: 4

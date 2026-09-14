@@ -1,0 +1,170 @@
+"""Build a press from the YAML schema in ``press.md``."""
+
+from __future__ import annotations
+
+from typing import Any
+
+from .core.budget import TokenBudget
+from .core.domain import build_domain
+from .core.registry import OPERATOR_REGISTRY, SCORER_REGISTRY, SELECTOR_REGISTRY, get_registered
+from .core.runtime import InjectionPoint
+from .operators import (
+    HiddenTokenMergeOperator,
+    KVMergeOperator,
+    KVPruneOperator,
+    MeanReplaceOperator,
+    ShuffleAllOperator,
+    ShuffleDroppedOperator,
+    ShuffleKeptOperator,
+    ShuffleOperator,
+    ZeroMaskOperator,
+)
+from .presses import ComposedPress, NoPress, ScorerPress, SimilarityMergePress
+from .scorers import (
+    ActionAttentionScorer,
+    ActionAttentionVNormScorer,
+    GradientInputScorer,
+    GradientNormScorer,
+    PlanningGradientInputScorer,
+    RandomScorer,
+    TokenNormScorer,
+)
+from .selectors import ThresholdSelector, TopKSelector
+
+
+def _section(value: Any, default: dict | None = None) -> dict:
+    if value is None:
+        return dict(default or {})
+    if isinstance(value, str):
+        return {"name": value}
+    if not isinstance(value, dict):
+        raise TypeError(f"expected config mapping or name, got {type(value).__name__}")
+    return dict(value)
+
+
+def _register_builtin_aliases() -> None:
+    # Importing the modules registers the canonical entries.  Aliases here are
+    # intentionally explicit so configuration names remain stable.
+    _ = (NoPress, ScorerPress, SimilarityMergePress, RandomScorer, TokenNormScorer,
+         ActionAttentionScorer, ActionAttentionVNormScorer, GradientNormScorer,
+         GradientInputScorer, PlanningGradientInputScorer, TopKSelector, ThresholdSelector, ZeroMaskOperator,
+         MeanReplaceOperator, ShuffleOperator, ShuffleAllOperator,
+         ShuffleDroppedOperator, ShuffleKeptOperator, KVPruneOperator,
+         HiddenTokenMergeOperator, KVMergeOperator, ComposedPress)
+
+
+def build_scorer(config: Any, *, gradient_forward=None, gradient_objective=None):
+    _register_builtin_aliases()
+    section = _section(config)
+    name = str(section.pop("name", "random")).lower()
+    aliases = {"norm": "token_norm", "attention": "action_attention", "attention_vnorm": "action_attention_vnorm"}
+    name = aliases.get(name, name)
+    if name in {"action_attention", "action_attention_vnorm"}:
+        heads = section.pop("heads", None)
+        if isinstance(heads, dict):
+            section.setdefault("head_mode", heads.get("mode", "mean"))
+            if "index" in heads:
+                section.setdefault("head_index", heads["index"])
+        action = section.pop("action", None)
+        if isinstance(action, dict):
+            section.setdefault("action_mode", action.get("mode", "mean"))
+        value_norm = section.pop("value_norm", None)
+        if isinstance(value_norm, dict):
+            section.setdefault("value_norm", value_norm.get("enabled", False))
+            if "head_mode" in value_norm:
+                section.setdefault("value_norm_head_mode", value_norm["head_mode"])
+            if "value_norm_head_mode" in value_norm:
+                section.setdefault("value_norm_head_mode", value_norm["value_norm_head_mode"])
+        if "layer" in section:
+            section["layer"] = section["layer"]
+    if name in {"gradient_norm", "gradient_input"}:
+        section.setdefault("forward_fn", gradient_forward)
+        section.setdefault("objective", gradient_objective)
+    cls = get_registered(SCORER_REGISTRY, name)
+    return cls(**section)
+
+
+def build_selector(config: Any):
+    _register_builtin_aliases()
+    section = _section(config, {"name": "topk"})
+    name = section.pop("name", "topk")
+    return get_registered(SELECTOR_REGISTRY, name)(**section)
+
+
+def build_operator(config: Any):
+    _register_builtin_aliases()
+    section = _section(config, {"name": "zero"})
+    name = section.pop("name", "zero")
+    return get_registered(OPERATOR_REGISTRY, name)(**section)
+
+
+def build_budget(config: Any) -> TokenBudget:
+    section = _section(config, {"type": "ratio", "value": 1.0, "reference": "eligible"})
+    kind = section.pop("type", section.pop("kind", None))
+    if kind is None:
+        raise ValueError("budget needs type=absolute or ratio")
+    return TokenBudget(type=kind, value=section.pop("value"), reference=section.pop("reference", "eligible"))
+
+
+def build_press(config: Any, *, gradient_forward=None, gradient_objective=None):
+    """Build a press without importing DriveVA internals."""
+
+    _register_builtin_aliases()
+    if isinstance(config, str):
+        config = {"name": config}
+    section = _section(config)
+    name = str(section.pop("name", "scorer_press")).lower()
+    if name in {"none", "noop", "full"}:
+        return NoPress()
+    if name == "similarity_merge":
+        domain = section.get("domain", "last_history")
+        return SimilarityMergePress(
+            budget=build_budget(section.get("budget")),
+            domain=domain,
+            feature=section.get("feature", "tokens"),
+        )
+    if name in {"composed", "compose"}:
+        children = section.pop("presses", section.pop("children", None))
+        if not children:
+            raise ValueError("composed press requires a non-empty presses list")
+        return ComposedPress(
+            [build_press(child, gradient_forward=gradient_forward, gradient_objective=gradient_objective) for child in children]
+        )
+    # Convenience shorthand: {name: random, budget: ...}.
+    if name not in {"scorer_press"}:
+        scorer_section = section.pop("scorer", {})
+        if isinstance(scorer_section, str):
+            scorer_section = {"name": scorer_section}
+        # A CLI method override replaces the configured scorer.  Do not pass
+        # options belonging to the previous scorer (for example Random's seed
+        # into TokenNorm) unless the names already agree.
+        configured_name = str(scorer_section.get("name", "")).lower() if isinstance(scorer_section, dict) else ""
+        if configured_name not in {name, aliases_for_scorer(name)}:
+            scorer_section = {}
+        scorer_config = {**scorer_section, "name": name}
+        section["scorer"] = scorer_config
+        name = "scorer_press"
+    scorer = build_scorer(section.pop("scorer", {"name": "random"}), gradient_forward=gradient_forward, gradient_objective=gradient_objective)
+    selector = build_selector(section.pop("selector", "topk"))
+    operator = build_operator(section.pop("operator", "zero"))
+    domain = section.pop("domain", "last_history")
+    if isinstance(domain, dict):
+        domain = domain.get("name", "last_history")
+    budget = build_budget(section.pop("budget", None))
+    injection_point = section.pop("injection_point", InjectionPoint.VIDEO_INPUT)
+    random_scope = section.pop("random_scope", None)
+    return ScorerPress(
+        scorer=scorer,
+        selector=selector,
+        operator=operator,
+        budget=budget,
+        domain=domain,
+        injection_point=injection_point,
+        random_scope=random_scope,
+    )
+def aliases_for_scorer(name: str) -> str:
+    return {
+        "norm": "token_norm",
+        "attention": "action_attention",
+        "attention_vnorm": "action_attention_vnorm",
+    }.get(name, name)

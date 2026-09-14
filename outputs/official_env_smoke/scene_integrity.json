@@ -1,0 +1,30 @@
+{
+  "suite_root": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke",
+  "ok": true,
+  "world_size": 1,
+  "coverage": {
+    "scene_filter_tokens": 7876,
+    "metric_cache_tokens": 12146,
+    "intersection_tokens": 7876,
+    "missing_metric_cache_tokens": 0
+  },
+  "method_count": 1,
+  "failed_method_count": 0,
+  "suite_errors": [],
+  "methods": [
+    {
+      "round": "round01",
+      "method": "causal_no_press",
+      "ok": true,
+      "errors": [],
+      "warnings": [],
+      "csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/round01/causal_no_press/pdm_score_2026.08.28.10.17.18.csv",
+      "n_csv": 1,
+      "n_events": 1,
+      "n_records": 1,
+      "rank_counts": {
+        "0": 1
+      }
+    }
+  ]
+}

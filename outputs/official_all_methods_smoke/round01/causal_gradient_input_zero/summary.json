@@ -1,0 +1,30 @@
+{
+  "method": "causal_gradient_input_zero",
+  "round": 1,
+  "mode": "causal",
+  "backend": "official_navsim",
+  "press": {
+    "name": "scorer_press",
+    "injection_point": "video_input",
+    "domain": "last_history",
+    "scorer": {
+      "name": "gradient_input",
+      "reduction": "l2"
+    },
+    "selector": {
+      "name": "topk"
+    },
+    "operator": {
+      "name": "zero"
+    },
+    "budget": {
+      "type": "ratio",
+      "value": 0.5,
+      "reference": "eligible"
+    }
+  },
+  "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/causal_gradient_input_zero/pdm_score_2026.08.28.07.52.38.csv",
+  "n_scenes": 1,
+  "valid_scenes": 1,
+  "probe_protocol": "frozen_score_cache"
+}

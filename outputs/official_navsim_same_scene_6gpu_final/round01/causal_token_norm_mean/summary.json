@@ -1,0 +1,29 @@
+{
+  "method": "causal_token_norm_mean",
+  "round": 1,
+  "mode": "causal",
+  "backend": "official_navsim",
+  "press": {
+    "name": "scorer_press",
+    "injection_point": "video_input",
+    "domain": "last_history",
+    "scorer": {
+      "name": "token_norm"
+    },
+    "selector": {
+      "name": "topk"
+    },
+    "operator": {
+      "name": "mean"
+    },
+    "budget": {
+      "type": "ratio",
+      "value": 0.5,
+      "reference": "eligible"
+    }
+  },
+  "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_navsim_same_scene_6gpu_final/round01/causal_token_norm_mean/pdm_score_2026.08.28.12.45.30.csv",
+  "n_scenes": 7876,
+  "valid_scenes": 7876,
+  "probe_protocol": "none"
+}

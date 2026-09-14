@@ -1,0 +1,31 @@
+{
+  "method": "causal_random_shuffle_drop",
+  "round": 1,
+  "mode": "causal",
+  "backend": "official_navsim",
+  "press": {
+    "name": "scorer_press",
+    "injection_point": "video_input",
+    "domain": "last_history",
+    "scorer": {
+      "name": "random",
+      "seed": 20260832,
+      "scope": "scene"
+    },
+    "selector": {
+      "name": "topk"
+    },
+    "operator": {
+      "name": "shuffle_drop"
+    },
+    "budget": {
+      "type": "ratio",
+      "value": 0.5,
+      "reference": "eligible"
+    }
+  },
+  "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_navsim_same_scene_6gpu_final/round01/causal_random_shuffle_drop/pdm_score_2026.08.28.11.50.21.csv",
+  "n_scenes": 7876,
+  "valid_scenes": 7876,
+  "probe_protocol": "none"
+}

@@ -1,0 +1,60 @@
+{
+  "n_scenes": 4,
+  "valid_scenes": 4,
+  "pdm": 0.9863084405660629,
+  "pdm_std": 0.00905507118267201,
+  "trajectory_l2": 0.013817848870530725,
+  "trajectory_l2_std": 0.009201454780792193,
+  "endpoint_l2": 0.012773523718351498,
+  "endpoint_l2_std": 0.007853788619769682,
+  "latency_ms_mean": 14.688008069992065,
+  "latency_ms_std": 1.9943938022227756,
+  "selector_latency_ms_mean": 4.403165075927973,
+  "selector_latency_ms_std": 0.058026664632240654,
+  "model_latency_ms_mean": 2.167280077934265,
+  "model_latency_ms_std": 0.025277033441819835,
+  "e2e_latency_ms_mean": 14.688008069992065,
+  "e2e_latency_ms_std": 1.9943938022227756,
+  "peak_memory_mb_mean": 0.0772705078125,
+  "peak_memory_mb_std": 0.002685546875,
+  "peak_memory_mb_max": 0.07861328125,
+  "eligible_keep_ratio_mean": 0.5,
+  "eligible_keep_ratio_std": 0.0,
+  "history_keep_ratio_mean": 0.25,
+  "history_keep_ratio_std": 0.0,
+  "K_mean": 6.0,
+  "K_std": 0.0,
+  "n_candidate_mean": 12.0,
+  "k_length_before_mean": null,
+  "k_length_after_mean": null,
+  "v_length_after_mean": null,
+  "theoretical_attn_ratio_mean": null,
+  "press": {
+    "name": "scorer_press",
+    "injection_point": "video_input",
+    "scorer": {
+      "name": "token_norm",
+      "requires_probe": false,
+      "probe_mode": "none",
+      "ord": 2.0
+    },
+    "selector": {
+      "name": "topk"
+    },
+    "operator": {
+      "name": "zero",
+      "preserves_sequence_length": true,
+      "physical_compression": false,
+      "driveva_compatible": true
+    },
+    "budget": {
+      "type": "ratio",
+      "value": 0.5,
+      "reference": "eligible"
+    },
+    "domain": "last_history",
+    "random_scope": null
+  },
+  "mode": "causal",
+  "backend": "synthetic"
+}

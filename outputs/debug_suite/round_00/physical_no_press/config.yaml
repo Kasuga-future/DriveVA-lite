@@ -1,0 +1,31 @@
+experiment:
+  name: full_compression_suite
+  seed: 20260828
+  round: 0
+  method: physical_no_press
+benchmark:
+  name: synthetic
+  max_scenes: 1
+model:
+  checkpoint: synthetic_framework_cohort
+press:
+  name: noop
+evaluation:
+  mode: physical
+  backend: synthetic
+  random_baseline: false
+  random_seeds:
+  - 20260929
+  - 20260930
+output:
+  dir: /mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/debug_suite/round_00/physical_no_press
+synthetic:
+  frames: 4
+  height: 3
+  width: 4
+  num_cond_latents: 2
+  trajectory_length: 6
+  trajectory_prefix_length: 2
+  hidden_dim: 16
+  heads: 2
+  scenes: 1

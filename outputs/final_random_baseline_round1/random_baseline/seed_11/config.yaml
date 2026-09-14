@@ -1,0 +1,47 @@
+experiment:
+  name: synthetic_token_norm_with_random_control
+  seed: 20260828
+benchmark:
+  name: synthetic
+  max_scenes: 2
+press:
+  name: scorer_press
+  injection_point: video_input
+  scorer:
+    name: random
+    requires_probe: false
+    probe_mode: none
+    seed: 11
+    scope: scene
+    layer: null
+  selector:
+    name: topk
+  operator:
+    name: zero
+    preserves_sequence_length: true
+    physical_compression: false
+    driveva_compatible: true
+  budget:
+    type: ratio
+    value: 0.5
+    reference: eligible
+  domain: last_history
+  random_scope: null
+evaluation:
+  mode: causal
+  random_baseline: false
+  random_seeds:
+  - 11
+  - 12
+output:
+  dir: outputs/final_random_baseline_round1
+synthetic:
+  frames: 4
+  height: 3
+  width: 4
+  num_cond_latents: 2
+  trajectory_length: 6
+  trajectory_prefix_length: 2
+  hidden_dim: 16
+  heads: 2
+  scenes: 2

@@ -1,0 +1,67 @@
+{
+  "n_scenes": 4,
+  "valid_scenes": 4,
+  "pdm": 0.416677288711071,
+  "pdm_std": 0.02808183252231549,
+  "trajectory_l2": 0.8771122694015503,
+  "trajectory_l2_std": 0.06637359814603763,
+  "endpoint_l2": 1.0970225185155869,
+  "endpoint_l2_std": 0.23120942485603313,
+  "latency_ms_mean": 2.2690559923648834,
+  "latency_ms_std": 1.0160063463172544,
+  "selector_latency_ms_mean": 0.88151590898633,
+  "selector_latency_ms_std": 0.43682174067310026,
+  "model_latency_ms_mean": 0.22628799453377724,
+  "model_latency_ms_std": 0.08809376335484788,
+  "e2e_latency_ms_mean": 2.2690559923648834,
+  "e2e_latency_ms_std": 1.0160063463172544,
+  "peak_memory_mb_mean": 8.1998291015625,
+  "peak_memory_mb_std": 0.003662109375,
+  "peak_memory_mb_max": 8.20166015625,
+  "eligible_keep_ratio_mean": 0.5,
+  "eligible_keep_ratio_std": 0.0,
+  "history_keep_ratio_mean": 0.25,
+  "history_keep_ratio_std": 0.0,
+  "K_mean": 6.0,
+  "K_std": 0.0,
+  "n_candidate_mean": 12.0,
+  "k_length_before_mean": 54.0,
+  "k_length_after_mean": 48.0,
+  "v_length_after_mean": 48.0,
+  "theoretical_attn_ratio_mean": 0.8888888888888888,
+  "press": {
+    "name": "scorer_press",
+    "injection_point": "self_attn_kv",
+    "scorer": {
+      "name": "action_attention_vnorm",
+      "requires_probe": false,
+      "probe_mode": "online",
+      "num_heads": null,
+      "layer": 15,
+      "head_mode": "mean",
+      "head_index": null,
+      "action_mode": "mean",
+      "softmax_domain": "all_sequence",
+      "value_norm": true,
+      "value_norm_head_mode": "mean"
+    },
+    "selector": {
+      "name": "topk"
+    },
+    "operator": {
+      "name": "kv_prune",
+      "preserves_sequence_length": false,
+      "physical_compression": true,
+      "driveva_compatible": true
+    },
+    "budget": {
+      "type": "ratio",
+      "value": 0.5,
+      "reference": "eligible"
+    },
+    "domain": "last_history",
+    "random_scope": null
+  },
+  "mode": "physical",
+  "backend": "synthetic"
+}

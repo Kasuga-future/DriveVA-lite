@@ -1,0 +1,59 @@
+{
+  "suite_name": "official_navsim_videopress",
+  "version": 1,
+  "backend": "official_navsim",
+  "repo_root": "/mnt/chenpeijian/autodrive/DriveVA-lite",
+  "device": "cuda:0",
+  "world_size": 1,
+  "rounds": 1,
+  "methods": [
+    "causal_no_press",
+    "causal_attention_zero",
+    "physical_random_kv_prune"
+  ],
+  "data": {
+    "navsim_log_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/openscene-v1.1/meta_datas/test",
+    "sensor_blobs_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/openscene-v1.1/sensor_blobs/test",
+    "metric_cache_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/metric_cache_full",
+    "scene_filter_yaml": "/mnt/chenpeijian/autodrive/DriveVA-lite/examples/wanvideo/driveva_infer/navsim_scene_filters/navtest.yaml"
+  },
+  "score_cache_root": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/official_press_score_cache_scene_integrity_gpu6",
+  "runs": [
+    {
+      "method": "causal_no_press",
+      "round": 1,
+      "protocol": "causal",
+      "backend": "official_navsim",
+      "output_dir": "round01/causal_no_press",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_scene_integrity_fullcache_smoke_gpu6/round01/causal_no_press/pdm_score_2026.08.28.09.15.38.csv",
+      "n_scenes": 4,
+      "valid_scenes": 4
+    },
+    {
+      "method": "causal_attention_zero",
+      "round": 1,
+      "protocol": "causal",
+      "backend": "official_navsim",
+      "output_dir": "round01/causal_attention_zero",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_scene_integrity_fullcache_smoke_gpu6/round01/causal_attention_zero/pdm_score_2026.08.28.09.15.50.csv",
+      "n_scenes": 4,
+      "valid_scenes": 4
+    },
+    {
+      "method": "physical_random_kv_prune",
+      "round": 1,
+      "protocol": "physical",
+      "backend": "official_navsim",
+      "output_dir": "round01/physical_random_kv_prune",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_scene_integrity_fullcache_smoke_gpu6/round01/physical_random_kv_prune/pdm_score_2026.08.28.09.16.00.csv",
+      "n_scenes": 4,
+      "valid_scenes": 4
+    }
+  ],
+  "coverage": {
+    "scene_filter_tokens": 12123,
+    "metric_cache_tokens": 12146,
+    "intersection_tokens": 12123,
+    "missing_metric_cache_tokens": 0
+  }
+}

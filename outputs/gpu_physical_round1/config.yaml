@@ -1,0 +1,36 @@
+experiment:
+  name: synthetic_random_kv_smoke
+  seed: 20260828
+benchmark:
+  name: synthetic
+  max_scenes: 2
+press:
+  name: scorer_press
+  injection_point: self_attn_kv
+  domain:
+    name: last_history
+  scorer:
+    name: random
+    seed: 20260828
+  selector:
+    name: topk
+  operator:
+    name: kv_prune
+  budget:
+    type: ratio
+    value: 0.5
+    reference: eligible
+evaluation:
+  mode: physical
+output:
+  dir: outputs/gpu_physical_round1
+synthetic:
+  frames: 4
+  height: 3
+  width: 4
+  num_cond_latents: 2
+  trajectory_length: 6
+  trajectory_prefix_length: 2
+  hidden_dim: 16
+  heads: 2
+  scenes: 2

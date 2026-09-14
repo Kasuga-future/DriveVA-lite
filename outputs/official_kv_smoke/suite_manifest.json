@@ -1,0 +1,36 @@
+{
+  "suite_name": "official_navsim_videopress",
+  "version": 1,
+  "backend": "official_navsim",
+  "repo_root": "/mnt/chenpeijian/autodrive/DriveVA-lite",
+  "device": "cuda:0",
+  "world_size": 1,
+  "rounds": 1,
+  "methods": [
+    "physical_random_kv_prune"
+  ],
+  "data": {
+    "navsim_log_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/openscene-v1.1/meta_datas/test",
+    "sensor_blobs_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/openscene-v1.1/sensor_blobs/test",
+    "metric_cache_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/metric_cache",
+    "scene_filter_yaml": "/mnt/chenpeijian/autodrive/DriveVA-lite/examples/wanvideo/driveva_infer/navsim_scene_filters/navtest.yaml"
+  },
+  "runs": [
+    {
+      "method": "physical_random_kv_prune",
+      "round": 1,
+      "protocol": "physical",
+      "backend": "official_navsim",
+      "output_dir": "round01/physical_random_kv_prune",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_kv_smoke/round01/physical_random_kv_prune/pdm_score_2026.08.28.07.44.00.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    }
+  ],
+  "coverage": {
+    "scene_filter_tokens": 12123,
+    "metric_cache_tokens": 128,
+    "intersection_tokens": 128,
+    "missing_metric_cache_tokens": 11995
+  }
+}

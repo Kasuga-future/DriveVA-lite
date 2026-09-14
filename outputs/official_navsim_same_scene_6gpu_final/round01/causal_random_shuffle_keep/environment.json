@@ -1,0 +1,19 @@
+{
+  "python": "3.10.20 (main, Jun 11 2026, 15:17:37) [GCC 14.3.0]",
+  "platform": "Linux-5.4.0-216-generic-x86_64-with-glibc2.31",
+  "torch": "2.5.0+cu124",
+  "cuda_runtime": "12.4",
+  "cuda_available": true,
+  "gpu": [
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA GeForce RTX 4090"
+  ],
+  "flash_attention": true,
+  "repo_root": "/mnt/chenpeijian/autodrive/DriveVA-lite",
+  "git_commit": "486b29ac871d63d69c3d15e0f3bbaf6a74ee139d",
+  "pid": 813855
+}

@@ -1,0 +1,140 @@
+Loading models from: /mnt/chenpeijian/autodrive/DriveVA-lite/models/Wan-AI/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth
+    model_name: wan_video_text_encoder model_class: WanTextEncoder
+    The following models are loaded: ['wan_video_text_encoder'].
+Loading models from: ['/mnt/chenpeijian/autodrive/DriveVA-lite/models/Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model-00003-of-00003.safetensors', '/mnt/chenpeijian/autodrive/DriveVA-lite/models/Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model-00001-of-00003.safetensors', '/mnt/chenpeijian/autodrive/DriveVA-lite/models/Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model-00002-of-00003.safetensors']
+    model_name: wan_video_dit model_class: WanModel
+    The following models are loaded: ['wan_video_dit'].
+Loading models from: /mnt/chenpeijian/autodrive/DriveVA-lite/models/Wan-AI/Wan2.2-TI2V-5B/Wan2.2_VAE.pth
+    model_name: wan_video_vae model_class: WanVideoVAE38
+    The following models are loaded: ['wan_video_vae'].
+Using wan_video_text_encoder from /mnt/chenpeijian/autodrive/DriveVA-lite/models/Wan-AI/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth.
+Using wan_video_dit from ['/mnt/chenpeijian/autodrive/DriveVA-lite/models/Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model-00003-of-00003.safetensors', '/mnt/chenpeijian/autodrive/DriveVA-lite/models/Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model-00001-of-00003.safetensors', '/mnt/chenpeijian/autodrive/DriveVA-lite/models/Wan-AI/Wan2.2-TI2V-5B/diffusion_pytorch_model-00002-of-00003.safetensors'].
+Using wan_video_vae from /mnt/chenpeijian/autodrive/DriveVA-lite/models/Wan-AI/Wan2.2-TI2V-5B/Wan2.2_VAE.pth.
+No wan_video_image_encoder models available.
+[official-press] loading checkpoint: /mnt/chenpeijian/autodrive/DriveVA-lite/checkpoints/pdms90_9.safetensors
+[official-press] checkpoint loaded missing=438 unexpected=0
+[official-press] start round=1 method=causal_no_press mode=causal
+Loading logs:   0%|          | 0/136 [00:00<?, ?it/s]Loading logs:   5%|▌         | 7/136 [00:00<00:02, 58.80it/s]Loading logs:  10%|▉         | 13/136 [00:00<00:03, 36.52it/s]Loading logs:  13%|█▎        | 18/136 [00:00<00:04, 24.65it/s]Loading logs:  19%|█▉        | 26/136 [00:00<00:03, 36.55it/s]Loading logs:  23%|██▎       | 31/136 [00:01<00:03, 26.57it/s]Loading logs:  28%|██▊       | 38/136 [00:01<00:02, 34.12it/s]Loading logs:  32%|███▏      | 44/136 [00:01<00:02, 37.25it/s]Loading logs:  36%|███▌      | 49/136 [00:01<00:03, 25.79it/s]Loading logs:  40%|███▉      | 54/136 [00:01<00:02, 29.22it/s]Loading logs:  44%|████▍     | 60/136 [00:01<00:02, 34.47it/s]Loading logs:  49%|████▊     | 66/136 [00:01<00:01, 37.25it/s]Loading logs:  52%|█████▏    | 71/136 [00:02<00:01, 39.28it/s]Loading logs:  56%|█████▌    | 76/136 [00:02<00:01, 37.56it/s]Loading logs:  60%|██████    | 82/136 [00:02<00:01, 41.35it/s]Loading logs:  64%|██████▍   | 87/136 [00:02<00:02, 20.64it/s]Loading logs:  68%|██████▊   | 93/136 [00:03<00:01, 24.55it/s]Loading logs:  71%|███████▏  | 97/136 [00:03<00:01, 23.86it/s]Loading logs:  74%|███████▍  | 101/136 [00:03<00:01, 24.97it/s]Loading logs:  77%|███████▋  | 105/136 [00:03<00:01, 27.68it/s]Loading logs:  81%|████████  | 110/136 [00:03<00:00, 31.55it/s]Loading logs:  84%|████████▍ | 114/136 [00:04<00:01, 16.89it/s]Loading logs:  87%|████████▋ | 118/136 [00:04<00:00, 18.51it/s]Loading logs:  90%|████████▉ | 122/136 [00:04<00:00, 21.81it/s]Loading logs:  93%|█████████▎| 126/136 [00:04<00:00, 24.07it/s]Loading logs:  96%|█████████▋| 131/136 [00:04<00:00, 28.51it/s]Loading logs: 100%|██████████| 136/136 [00:04<00:00, 28.76it/s]
+[official-press] coverage: {"intersection_tokens": 7876, "metric_cache_tokens": 12146, "missing_metric_cache_tokens": 0, "scene_filter_tokens": 7876}
+[eval] feature_builder_source=navsim.agents.videodrive.videodrive_features
+[eval][compat] injected for v2 metric-cache pickle compatibility: navsim.common.enums.SceneFrameType, navsim.planning.metric_caching.metric_cache.MapParameters
+[eval] using external pipeline
+[eval] infer timing mode: infer_trajectory_only=True skip_video_decode=True save_viz=False
+[eval] module devices: text_encoder=cuda:0 dit=cuda:0 vae=cuda:0 trajectory_encoder=cuda:0 trajectory_head=cuda:0
+[eval] cuda memory after model load: allocated=21754.3MB reserved=21768.0MB total=48646.3MB
+[eval] vae_progress=off
+Loading logs:   0%|          | 0/136 [00:00<?, ?it/s]Loading logs:   5%|▌         | 7/136 [00:00<00:02, 59.41it/s]Loading logs:  10%|▉         | 13/136 [00:00<00:03, 37.38it/s]Loading logs:  13%|█▎        | 18/136 [00:00<00:02, 41.41it/s]Loading logs:  19%|█▉        | 26/136 [00:00<00:02, 53.44it/s]Loading logs:  24%|██▎       | 32/136 [00:01<00:04, 22.47it/s]Loading logs:  29%|██▊       | 39/136 [00:01<00:03, 28.30it/s]Loading logs:  33%|███▎      | 45/136 [00:01<00:02, 33.28it/s]Loading logs:  38%|███▊      | 52/136 [00:01<00:02, 39.41it/s]Loading logs:  43%|████▎     | 58/136 [00:01<00:01, 41.60it/s]Loading logs:  47%|████▋     | 64/136 [00:01<00:01, 44.96it/s]Loading logs:  51%|█████▏    | 70/136 [00:02<00:02, 25.96it/s]Loading logs:  55%|█████▌    | 75/136 [00:02<00:02, 26.94it/s]Loading logs:  60%|██████    | 82/136 [00:02<00:01, 33.07it/s]Loading logs:  64%|██████▍   | 87/136 [00:02<00:01, 30.21it/s]Loading logs:  68%|██████▊   | 93/136 [00:02<00:01, 32.90it/s]Loading logs:  71%|███████▏  | 97/136 [00:03<00:02, 17.90it/s]Loading logs:  74%|███████▍  | 101/136 [00:03<00:01, 19.87it/s]Loading logs:  78%|███████▊  | 106/136 [00:03<00:01, 24.09it/s]Loading logs:  82%|████████▏ | 111/136 [00:03<00:00, 28.06it/s]Loading logs:  85%|████████▍ | 115/136 [00:03<00:00, 28.64it/s]Loading logs:  88%|████████▊ | 119/136 [00:04<00:00, 27.50it/s]Loading logs:  91%|█████████ | 124/136 [00:04<00:00, 30.19it/s]Loading logs:  95%|█████████▍| 129/136 [00:04<00:00, 16.97it/s]Loading logs:  98%|█████████▊| 133/136 [00:04<00:00, 19.97it/s]Loading logs: 100%|██████████| 136/136 [00:04<00:00, 27.94it/s]
+[eval] metric_cache_path=/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/metric_cache_full cache_tokens=12146
+[eval] shard config: world_size=1 active_shards=1 idle_ranks=0 virtual_shards_per_rank~=1 requested=auto
+[eval] total tokens=7876 local_tokens(rank0)=1
+[eval] traffic_agents_policy=unused
+[eval] legacy_simulate_traffic_agents=False
+[eval][nuscenes] enabled horizons=1s, 2s, 3s
+[eval][nuscenes] metrics: L2 (m), Collision (%)
+[eval][prompt][1/30] positive: A high-quality, photorealistic dashboard camera view of autonomous driving. Based on the past 2 seconds video showing driving straight ahead with stable lane keeping, predict and generate the next 4 seconds of realistic driving continuation, following command: go straight. Keep temporal consistency, realistic physics, and smooth motion, moving at moderate speed. [Technical: speed 5.43m/s]
+[eval][prompt][1/30] negative: worst quality, low quality, blurry, jittery, distorted, motion blur, ghosting, flickering, stuttering, camera shake, unstable footage, warping, trailing artifacts, temporal inconsistency, jerky motion, choppy framerate
+[eval] elapsed=1.90s avg_per_scene=1.90s scenes=1
+[eval] average metrics:
+[eval][avg] infer_time_s=1.408769
+[eval][avg] infer_time_ms=1408.768915
+[eval][avg] skip_video_decode=1.000000
+[eval][avg] gpu_mem_alloc_before_mb=21754.319336
+[eval][avg] gpu_mem_alloc_after_mb=21762.445312
+[eval][avg] gpu_mem_alloc_peak_mb=23286.720703
+[eval][avg] gpu_mem_alloc_peak_delta_mb=1532.401367
+[eval][avg] gpu_mem_reserved_before_mb=21768.000000
+[eval][avg] gpu_mem_reserved_after_mb=23652.000000
+[eval][avg] gpu_mem_reserved_peak_mb=23652.000000
+[eval][avg] gpu_mem_reserved_peak_delta_mb=1884.000000
+[eval][avg] no_at_fault_collisions=1.000000
+[eval][avg] drivable_area_compliance=1.000000
+[eval][avg] driving_direction_compliance=1.000000
+[eval][avg] ego_progress=0.826523
+[eval][avg] time_to_collision_within_bound=1.000000
+[eval][avg] history_comfort=1.000000
+[eval][avg] comfort=1.000000
+[eval][avg] multiplicative_metrics_prod=1.000000
+[eval][avg] pdm_score=0.927718
+[eval][avg] score=0.927718
+[eval][avg] nuscenes_l2_1s_m=0.285814
+[eval][avg] nuscenes_collision_1s_pct=0.000000
+[eval][avg] nuscenes_l2_2s_m=1.454947
+[eval][avg] nuscenes_collision_2s_pct=0.000000
+[eval][avg] nuscenes_l2_3s_m=3.774601
+[eval][avg] nuscenes_collision_3s_pct=0.000000
+[eval][infer_time] count=1 mean=1.408769s median=1.408769s p90=1.408769s min=1.408769s max=1.408769s mode=trajectory_only
+[eval][infer_memory] count=1 peak_alloc_mean=23286.7MB peak_alloc_max=23286.7MB peak_alloc_delta_mean=1532.4MB peak_alloc_delta_max=1532.4MB peak_reserved_mean=23652.0MB peak_reserved_max=23652.0MB peak_reserved_delta_mean=1884.0MB peak_reserved_delta_max=1884.0MB
+[eval][nuscenes][avg] L2 (m): 1s=0.2858, 2s=1.4549, 3s=3.7746
+[eval][nuscenes][avg] Collision (%): 1s=0.00, 2s=0.00, 3s=0.00
+[eval] Done. success=1 failed=0 saved=/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/round01/causal_no_press/pdm_score_2026.08.28.10.17.18.csv
+{
+  "suite_root": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke",
+  "backend": "official_navsim",
+  "run_count": 1,
+  "method_count": 1,
+  "coverage": {
+    "scene_filter_tokens": 7876,
+    "metric_cache_tokens": 12146,
+    "intersection_tokens": 7876,
+    "missing_metric_cache_tokens": 0
+  },
+  "tables": {
+    "run_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/statistics/run_statistics.csv",
+    "method_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/statistics/method_statistics.csv",
+    "run_markdown": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/statistics/run_statistics.md",
+    "method_markdown": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/statistics/method_statistics.md"
+  },
+  "plots": {
+    "pdm_by_method": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/visualizations/pdm_by_method.png",
+    "latency_by_method": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/visualizations/latency_by_method.png",
+    "compression_ratios": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/visualizations/compression_ratios.png",
+    "pdm_vs_latency": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/visualizations/pdm_vs_latency.png",
+    "round_stability": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/visualizations/round_stability.png",
+    "summary_table": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/visualizations/summary_table.png"
+  },
+  "method_rows": [
+    {
+      "method": "causal_no_press",
+      "round": "all",
+      "protocol": "causal",
+      "backend": "official_navsim",
+      "press": "noop",
+      "scorer": null,
+      "selector": null,
+      "operator": null,
+      "domain": null,
+      "rounds": 1,
+      "run_dir": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke",
+      "n_scenes": 1,
+      "valid_scenes": 1,
+      "pdm": 0.9277180648807123,
+      "pdm_std": 0.0,
+      "trajectory_l2": null,
+      "trajectory_l2_std": null,
+      "endpoint_l2": null,
+      "endpoint_l2_std": null,
+      "latency_ms_mean": 1408.7689146399498,
+      "latency_ms_std": 0.0,
+      "selector_latency_ms_mean": 0.0,
+      "selector_latency_ms_std": 0.0,
+      "model_latency_ms_mean": 1408.7689146399498,
+      "model_latency_ms_std": 0.0,
+      "e2e_latency_ms_mean": 1408.7689146399498,
+      "e2e_latency_ms_std": 0.0,
+      "peak_memory_mb_mean": 23286.720703125,
+      "peak_memory_mb_std": 0.0,
+      "peak_memory_mb_max": 23286.720703125,
+      "eligible_keep_ratio_mean": null,
+      "eligible_keep_ratio_std": null,
+      "history_keep_ratio_mean": null,
+      "history_keep_ratio_std": null,
+      "K_mean": null,
+      "K_std": null,
+      "n_candidate_mean": null,
+      "k_length_before_mean": null,
+      "k_length_after_mean": null,
+      "v_length_after_mean": null,
+      "theoretical_attn_ratio_mean": null
+    }
+  ]
+}

@@ -1,0 +1,31 @@
+{
+  "all": {
+    "comfort": 0.999746063991874,
+    "drivable_area_compliance": 0.9751142712036567,
+    "driving_direction_compliance": 0.984128999492128,
+    "ego_progress": 0.8317197145932638,
+    "gpu_mem_alloc_after_mb": 21902.411132068548,
+    "gpu_mem_alloc_before_mb": 21902.309719227123,
+    "gpu_mem_alloc_peak_delta_mb": 1398.250338622675,
+    "gpu_mem_alloc_peak_mb": 23300.560057849798,
+    "gpu_mem_reserved_after_mb": 35168.0,
+    "gpu_mem_reserved_before_mb": 35168.0,
+    "gpu_mem_reserved_peak_delta_mb": 0.0,
+    "gpu_mem_reserved_peak_mb": 35168.0,
+    "history_comfort": 0.999746063991874,
+    "infer_time_ms": 593.0457810460746,
+    "infer_time_s": 0.5930457810460745,
+    "multiplicative_metrics_prod": 0.952006094464195,
+    "no_at_fault_collisions": 0.9914931437277806,
+    "nuscenes_collision_1s_pct": 0.0,
+    "nuscenes_collision_2s_pct": 0.0,
+    "nuscenes_collision_3s_pct": 0.0,
+    "nuscenes_l2_1s_m": 0.22327208696868567,
+    "nuscenes_l2_2s_m": 0.4584105959958636,
+    "nuscenes_l2_3s_m": 0.8917843917961322,
+    "pdm_score": 0.90802947749635,
+    "score": 0.90802947749635,
+    "skip_video_decode": 1.0,
+    "time_to_collision_within_bound": 0.9865413915693245
+  }
+}

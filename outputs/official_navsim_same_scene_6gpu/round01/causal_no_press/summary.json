@@ -1,0 +1,13 @@
+{
+  "method": "causal_no_press",
+  "round": 1,
+  "mode": "causal",
+  "backend": "official_navsim",
+  "press": {
+    "name": "noop"
+  },
+  "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_navsim_same_scene_6gpu/round01/causal_no_press/pdm_score_2026.08.28.10.11.43.csv",
+  "n_scenes": 7876,
+  "valid_scenes": 0,
+  "probe_protocol": "none"
+}

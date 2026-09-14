@@ -1,0 +1,22 @@
+{
+  "suite_name": "official_navsim_videopress",
+  "version": 1,
+  "backend": "official_navsim",
+  "repo_root": "/mnt/chenpeijian/autodrive/DriveVA-lite",
+  "device": "cuda:0",
+  "world_size": 1,
+  "rounds": 1,
+  "methods": [
+    "causal_no_press",
+    "causal_attention_zero",
+    "physical_random_kv_prune"
+  ],
+  "data": {
+    "navsim_log_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/openscene-v1.1/meta_datas/test",
+    "sensor_blobs_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/openscene-v1.1/sensor_blobs/test",
+    "metric_cache_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/metric_cache_full",
+    "scene_filter_yaml": "/mnt/chenpeijian/autodrive/DriveVA-lite/examples/wanvideo/driveva_infer/navsim_scene_filters/navtest.yaml"
+  },
+  "score_cache_root": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/official_press_score_cache_scene_integrity",
+  "runs": []
+}

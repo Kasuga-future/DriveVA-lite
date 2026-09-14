@@ -1,0 +1,71 @@
+{
+  "suite_root": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke",
+  "backend": "official_navsim",
+  "run_count": 1,
+  "method_count": 1,
+  "coverage": {
+    "scene_filter_tokens": 7876,
+    "metric_cache_tokens": 12146,
+    "intersection_tokens": 7876,
+    "missing_metric_cache_tokens": 0
+  },
+  "tables": {
+    "run_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/statistics/run_statistics.csv",
+    "method_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/statistics/method_statistics.csv",
+    "run_markdown": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/statistics/run_statistics.md",
+    "method_markdown": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/statistics/method_statistics.md"
+  },
+  "plots": {
+    "pdm_by_method": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/visualizations/pdm_by_method.png",
+    "latency_by_method": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/visualizations/latency_by_method.png",
+    "compression_ratios": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/visualizations/compression_ratios.png",
+    "pdm_vs_latency": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/visualizations/pdm_vs_latency.png",
+    "round_stability": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/visualizations/round_stability.png",
+    "summary_table": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/visualizations/summary_table.png"
+  },
+  "method_rows": [
+    {
+      "method": "causal_no_press",
+      "round": "all",
+      "protocol": "causal",
+      "backend": "official_navsim",
+      "press": "noop",
+      "scorer": null,
+      "selector": null,
+      "operator": null,
+      "domain": null,
+      "rounds": 1,
+      "run_dir": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke",
+      "n_scenes": 1,
+      "valid_scenes": 1,
+      "pdm": 0.9277180648807123,
+      "pdm_std": 0.0,
+      "trajectory_l2": null,
+      "trajectory_l2_std": null,
+      "endpoint_l2": null,
+      "endpoint_l2_std": null,
+      "latency_ms_mean": 1408.7689146399498,
+      "latency_ms_std": 0.0,
+      "selector_latency_ms_mean": 0.0,
+      "selector_latency_ms_std": 0.0,
+      "model_latency_ms_mean": 1408.7689146399498,
+      "model_latency_ms_std": 0.0,
+      "e2e_latency_ms_mean": 1408.7689146399498,
+      "e2e_latency_ms_std": 0.0,
+      "peak_memory_mb_mean": 23286.720703125,
+      "peak_memory_mb_std": 0.0,
+      "peak_memory_mb_max": 23286.720703125,
+      "eligible_keep_ratio_mean": null,
+      "eligible_keep_ratio_std": null,
+      "history_keep_ratio_mean": null,
+      "history_keep_ratio_std": null,
+      "K_mean": null,
+      "K_std": null,
+      "n_candidate_mean": null,
+      "k_length_before_mean": null,
+      "k_length_after_mean": null,
+      "v_length_after_mean": null,
+      "theoretical_attn_ratio_mean": null
+    }
+  ]
+}

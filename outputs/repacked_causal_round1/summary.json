@@ -1,0 +1,34 @@
+{
+  "n_scenes": 4,
+  "valid_scenes": 4,
+  "pdm": 0.9849511831998825,
+  "trajectory_l2": 0.01520920597249642,
+  "endpoint_l2": 0.014870888844598085,
+  "latency_ms_mean": 0.6878254935145378,
+  "peak_memory_mb_mean": 0.0,
+  "eligible_keep_ratio_mean": 0.5,
+  "history_keep_ratio_mean": 0.25,
+  "press": {
+    "name": "scorer_press",
+    "injection_point": "video_input",
+    "scorer": {
+      "name": "random",
+      "requires_probe": false,
+      "probe_mode": "none",
+      "seed": 20260828
+    },
+    "selector": {
+      "name": "topk"
+    },
+    "operator": {
+      "name": "zero"
+    },
+    "budget": {
+      "type": "ratio",
+      "value": 0.5,
+      "reference": "eligible"
+    },
+    "domain": "last_history"
+  },
+  "mode": "causal"
+}

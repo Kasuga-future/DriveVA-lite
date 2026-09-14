@@ -1,0 +1,88 @@
+{
+  "n_scenes": 2,
+  "valid_scenes": 2,
+  "pdm": 0.984771341085434,
+  "trajectory_l2": 0.015406165271997452,
+  "endpoint_l2": 0.009753153601195663,
+  "latency_ms_mean": 1.8714992329478264,
+  "selector_latency_ms_mean": 0.8665714412927628,
+  "model_latency_ms_mean": 0.24870876222848892,
+  "e2e_latency_ms_mean": 1.8714992329478264,
+  "peak_memory_mb_mean": 0.0,
+  "eligible_keep_ratio_mean": 0.5,
+  "history_keep_ratio_mean": 0.25,
+  "press": {
+    "name": "scorer_press",
+    "injection_point": "video_input",
+    "scorer": {
+      "name": "token_norm",
+      "requires_probe": false,
+      "probe_mode": "none",
+      "ord": 2.0
+    },
+    "selector": {
+      "name": "topk"
+    },
+    "operator": {
+      "name": "zero",
+      "preserves_sequence_length": true,
+      "physical_compression": false,
+      "driveva_compatible": true
+    },
+    "budget": {
+      "type": "ratio",
+      "value": 0.5,
+      "reference": "eligible"
+    },
+    "domain": "last_history",
+    "random_scope": null
+  },
+  "mode": "causal",
+  "backend": "synthetic",
+  "random_baseline": {
+    "seeds": [
+      11,
+      12
+    ],
+    "runs": [
+      {
+        "seed": 11,
+        "n_scenes": 2,
+        "valid_scenes": 2,
+        "pdm": 0.9863239824771881,
+        "trajectory_l2": 0.013806072762235999,
+        "endpoint_l2": 0.008420780417509377,
+        "latency_ms_mean": 1.0552853345870972,
+        "selector_latency_ms_mean": 0.4893150180578232,
+        "model_latency_ms_mean": 0.18270686268806458,
+        "e2e_latency_ms_mean": 1.0552853345870972,
+        "peak_memory_mb_mean": 0.0,
+        "eligible_keep_ratio_mean": 0.5,
+        "history_keep_ratio_mean": 0.25
+      },
+      {
+        "seed": 12,
+        "n_scenes": 2,
+        "valid_scenes": 2,
+        "pdm": 0.9848864674568176,
+        "trajectory_l2": 0.015303724561817944,
+        "endpoint_l2": 0.009605188679415733,
+        "latency_ms_mean": 0.3612237051129341,
+        "selector_latency_ms_mean": 0.13559777289628983,
+        "model_latency_ms_mean": 0.07438287138938904,
+        "e2e_latency_ms_mean": 0.3612237051129341,
+        "peak_memory_mb_mean": 0.0,
+        "eligible_keep_ratio_mean": 0.5,
+        "history_keep_ratio_mean": 0.25
+      }
+    ],
+    "paired": {
+      "n_scenes": 2,
+      "mean_delta": -0.0008338838815689087,
+      "ci95": [
+        -0.0014664232730865479,
+        -0.00020134449005126953
+      ]
+    }
+  }
+}

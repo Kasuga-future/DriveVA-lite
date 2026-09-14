@@ -1,0 +1,32 @@
+{
+  "method": "causal_attention_zero",
+  "round": 1,
+  "mode": "causal",
+  "backend": "official_navsim",
+  "press": {
+    "name": "scorer_press",
+    "injection_point": "video_input",
+    "domain": "last_history",
+    "scorer": {
+      "name": "action_attention",
+      "layer": 15,
+      "head_mode": "mean",
+      "action_mode": "mean"
+    },
+    "selector": {
+      "name": "topk"
+    },
+    "operator": {
+      "name": "zero"
+    },
+    "budget": {
+      "type": "ratio",
+      "value": 0.5,
+      "reference": "eligible"
+    }
+  },
+  "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_navsim_same_scene_6gpu_final/round01/causal_attention_zero/pdm_score_2026.08.28.13.17.14.csv",
+  "n_scenes": 7876,
+  "valid_scenes": 7876,
+  "probe_protocol": "frozen_score_cache"
+}

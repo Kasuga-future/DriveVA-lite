@@ -1,0 +1,43 @@
+{
+  "suite_name": "official_navsim_videopress",
+  "version": 1,
+  "backend": "official_navsim",
+  "repo_root": "/mnt/chenpeijian/autodrive/DriveVA-lite",
+  "device": "cuda:0",
+  "world_size": 2,
+  "rounds": 1,
+  "methods": [
+    "causal_no_press",
+    "causal_random_zero",
+    "causal_random_mean",
+    "causal_random_shuffle_all",
+    "causal_random_shuffle_drop",
+    "causal_random_shuffle_keep",
+    "causal_token_norm_zero",
+    "causal_token_norm_mean",
+    "causal_attention_zero",
+    "causal_attention_vnorm_zero",
+    "causal_gradient_norm_zero",
+    "causal_gradient_input_zero",
+    "physical_no_press",
+    "physical_random_kv_prune",
+    "physical_token_norm_kv_prune",
+    "physical_attention_kv_prune",
+    "physical_attention_vnorm_kv_prune",
+    "physical_similarity_merge"
+  ],
+  "data": {
+    "navsim_log_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/openscene-v1.1/meta_datas/test",
+    "sensor_blobs_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/openscene-v1.1/sensor_blobs/test",
+    "metric_cache_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/metric_cache_full",
+    "scene_filter_yaml": "/mnt/chenpeijian/autodrive/DriveVA-lite/examples/wanvideo/driveva_infer/navsim_scene_filters/navtest.yaml"
+  },
+  "score_cache_root": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/official_press_score_cache",
+  "runs": [],
+  "coverage": {
+    "scene_filter_tokens": 12123,
+    "metric_cache_tokens": 12146,
+    "intersection_tokens": 12123,
+    "missing_metric_cache_tokens": 0
+  }
+}

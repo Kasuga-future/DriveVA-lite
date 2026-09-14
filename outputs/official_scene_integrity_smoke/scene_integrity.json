@@ -1,0 +1,60 @@
+{
+  "suite_root": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_scene_integrity_smoke",
+  "ok": false,
+  "world_size": 1,
+  "coverage": {
+    "scene_filter_tokens": 12123,
+    "metric_cache_tokens": 128,
+    "intersection_tokens": 128,
+    "missing_metric_cache_tokens": 11995
+  },
+  "method_count": 3,
+  "failed_method_count": 0,
+  "suite_errors": [
+    "suite manifest records missing metric-cache scenes"
+  ],
+  "methods": [
+    {
+      "round": "round01",
+      "method": "causal_attention_zero",
+      "ok": true,
+      "errors": [],
+      "warnings": [],
+      "csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_scene_integrity_smoke/round01/causal_attention_zero/pdm_score_2026.08.28.08.10.43.csv",
+      "n_csv": 4,
+      "n_events": 4,
+      "n_records": 4,
+      "rank_counts": {
+        "0": 4
+      }
+    },
+    {
+      "round": "round01",
+      "method": "causal_no_press",
+      "ok": true,
+      "errors": [],
+      "warnings": [],
+      "csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_scene_integrity_smoke/round01/causal_no_press/pdm_score_2026.08.28.08.10.32.csv",
+      "n_csv": 4,
+      "n_events": 4,
+      "n_records": 4,
+      "rank_counts": {
+        "0": 4
+      }
+    },
+    {
+      "round": "round01",
+      "method": "physical_random_kv_prune",
+      "ok": true,
+      "errors": [],
+      "warnings": [],
+      "csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_scene_integrity_smoke/round01/physical_random_kv_prune/pdm_score_2026.08.28.08.10.53.csv",
+      "n_csv": 4,
+      "n_events": 4,
+      "n_records": 4,
+      "rank_counts": {
+        "0": 4
+      }
+    }
+  ]
+}

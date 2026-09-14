@@ -1,0 +1,55 @@
+{
+  "suite_name": "official_navsim_videopress",
+  "version": 1,
+  "backend": "official_navsim",
+  "repo_root": "/mnt/chenpeijian/autodrive/DriveVA-lite",
+  "device": "cuda:0",
+  "world_size": 1,
+  "rounds": 1,
+  "scene_boundary_guard": {
+    "installed": true,
+    "already_installed": false,
+    "guard": "scene_token+scene_name"
+  },
+  "data_environment": {
+    "OPENSCENE_DATA_ROOT": "/mnt/chenpeijian/autodrive/DriveVA-lite/data/navsim_v1.1/openscene-v1.1",
+    "NUPLAN_MAPS_ROOT": "/mnt/chenpeijian/autodrive/DriveVA-lite/data/nuplan/nuplan-maps-v1.0",
+    "NUPLAN_DATA_ROOT": "/mnt/chenpeijian/autodrive/DriveVA-lite/data/nuplan"
+  },
+  "scene_filter": {
+    "num_history_frames": 5,
+    "num_future_frames": 10,
+    "frame_interval": 1,
+    "has_route": true,
+    "yaml_filter_only": true,
+    "window_length": 15
+  },
+  "methods": [
+    "causal_no_press"
+  ],
+  "data": {
+    "navsim_log_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/openscene-v1.1/meta_datas/test",
+    "sensor_blobs_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/openscene-v1.1/sensor_blobs/test",
+    "metric_cache_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/metric_cache_full",
+    "scene_filter_yaml": "/mnt/chenpeijian/autodrive/DriveVA-lite/examples/wanvideo/driveva_infer/navsim_scene_filters/navtest.yaml"
+  },
+  "score_cache_root": null,
+  "runs": [
+    {
+      "method": "causal_no_press",
+      "round": 1,
+      "protocol": "causal",
+      "backend": "official_navsim",
+      "output_dir": "round01/causal_no_press",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/round01/causal_no_press/pdm_score_2026.08.28.10.17.18.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    }
+  ],
+  "coverage": {
+    "scene_filter_tokens": 7876,
+    "metric_cache_tokens": 12146,
+    "intersection_tokens": 7876,
+    "missing_metric_cache_tokens": 0
+  }
+}

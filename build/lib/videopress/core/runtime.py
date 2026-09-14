@@ -1,0 +1,317 @@
+"""Runtime lifecycle and injection-point enums."""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import Enum
+import time
+from typing import Any, Iterator, Optional
+
+
+class EvaluationMode(str, Enum):
+    CAUSAL = "causal"
+    PHYSICAL = "physical"
+
+    @classmethod
+    def parse(cls, value: "EvaluationMode | str") -> "EvaluationMode":
+        if isinstance(value, cls):
+            return value
+        try:
+            return cls(str(value).strip().lower())
+        except ValueError as exc:
+            raise ValueError(f"Unknown evaluation mode: {value}") from exc
+
+
+class InjectionPoint(str, Enum):
+    VIDEO_INPUT = "video_input"
+    BLOCK_INPUT = "block_input"
+    SELF_ATTN_KV = "self_attn_kv"
+    SELF_ATTN_OUTPUT = "self_attn_output"
+
+    @classmethod
+    def parse(cls, value: "InjectionPoint | str") -> "InjectionPoint":
+        if isinstance(value, cls):
+            return value
+        try:
+            return cls(str(value).strip().lower())
+        except ValueError as exc:
+            raise ValueError(f"Unknown injection point: {value}") from exc
+
+
+@dataclass(frozen=True)
+class CompressionEventKey:
+    """Stable identity for one press execution in a model forward."""
+
+    scene_token: str
+    diffusion_rank: int | None
+    layer_idx: int | None
+    injection_point: str
+
+
+@dataclass
+class CompressionEvent:
+    key: CompressionEventKey
+    result: Any
+    context: Any = None
+
+
+class VideoPressRuntime:
+    """Owns press state and makes hook installation exception-safe."""
+
+    def __init__(
+        self,
+        press=None,
+        mode: EvaluationMode | str = EvaluationMode.CAUSAL,
+        adapter=None,
+        artifact_dir=None,
+        score_cache=None,
+        allow_sample_domain_override: bool = False,
+    ):
+        self.press = press
+        self.mode = EvaluationMode.parse(mode)
+        self.adapter = adapter
+        self.artifact_dir = artifact_dir
+        self.score_cache = score_cache
+        self.allow_sample_domain_override = bool(allow_sample_domain_override)
+        self.layout = None
+        self.current_scene = None
+        self.current_sample = None
+        self.current_context = None
+        self.current_diffusion_rank = None
+        self.current_timestep = None
+        self.last_result = None
+        self.events: list[CompressionEvent] = []
+        self.artifacts: dict[str, Any] = {}
+        self.selector_latency_ms = 0.0
+        self._installed = False
+
+    def enabled(self) -> bool:
+        return self.press is not None
+
+    def begin_sample(self, sample=None, layout=None) -> None:
+        self.current_sample = sample
+        self.current_scene = getattr(sample, "scene_token", None) if sample is not None else None
+        self.current_diffusion_rank = getattr(sample, "diffusion_rank", None) if sample is not None else None
+        self.current_timestep = getattr(sample, "timestep", None) if sample is not None else None
+        if layout is not None:
+            self.layout = layout
+        self.current_context = None
+        self.last_result = None
+        self.events = []
+        self.artifacts = {}
+        self.selector_latency_ms = 0.0
+
+    def set_layout(self, layout) -> None:
+        self.layout = layout
+
+    def set_context(self, context) -> None:
+        self.current_context = context
+        self.layout = context.layout
+
+    @staticmethod
+    def _domain_label(domain: Any) -> str:
+        if isinstance(domain, dict):
+            domain = domain.get("name", "last_history")
+        return str(getattr(domain, "name", domain))
+
+    def resolve_domain_spec(self, sample=None) -> tuple[Any, Any, bool]:
+        """Resolve the configured domain, with opt-in sample overrides only."""
+
+        configured = getattr(self.press, "domain", None) or "last_history"
+        resolved = configured
+        overridden = False
+        sample = self.current_sample if sample is None else sample
+        metadata = getattr(sample, "metadata", {}) if sample is not None else {}
+        if self.allow_sample_domain_override and isinstance(metadata, dict):
+            sample_domain = metadata.get("domain")
+            if sample_domain is not None:
+                resolved = sample_domain
+                overridden = self._domain_label(configured) != self._domain_label(resolved)
+        return configured, resolved, overridden
+
+    def score_key(self, ctx):
+        """Build the disk-cache key used by probe/intervention execution."""
+
+        from ..probes.score_cache import ScoreKey
+
+        scene_tokens = ctx.metadata.get("scene_tokens") if isinstance(ctx.metadata, dict) else None
+        if scene_tokens:
+            unique_scenes = {str(token) for token in scene_tokens}
+            if len(unique_scenes) > 1:
+                raise NotImplementedError(
+                    "ScoreCache V1 requires one scene per batch; split the batch before probe scoring"
+                )
+
+        scorer = getattr(self.press, "scorer", None)
+        signature = scorer.signature() if scorer is not None and hasattr(scorer, "signature") else type(scorer).__name__
+        model_name = ctx.metadata.get("model_name") if isinstance(ctx.metadata, dict) else None
+        if model_name is not None:
+            signature = f"{signature}:model={model_name}"
+        layer_idx = ctx.layer_idx
+        if layer_idx is None:
+            layer_idx = getattr(scorer, "layer", None)
+        return ScoreKey(
+            scene_token=str(ctx.scene_token),
+            diffusion_rank=ctx.diffusion_rank,
+            layer_idx=layer_idx,
+            scorer_signature=str(signature),
+        )
+
+    def execute_press(self, ctx):
+        """Execute one press and record it as an event.
+
+        Probe scorers use a detached context and, when a ``ScoreCache`` is
+        configured, persist both scores and the selector ranking before the
+        intervention pass.  The intervention never calls the scorer again.
+        """
+
+        if self.press is None:
+            raise RuntimeError("cannot execute a press-less runtime")
+        scorer = getattr(self.press, "scorer", None)
+        requires_probe = bool(getattr(scorer, "requires_probe", False))
+        injection_point = InjectionPoint.parse(getattr(self.press, "injection_point", InjectionPoint.VIDEO_INPUT))
+        probe_mode = getattr(scorer, "probe_mode", "none")
+        probe_mode = getattr(probe_mode, "value", probe_mode)
+        requires_frozen_ranking = requires_probe or (
+            injection_point is InjectionPoint.VIDEO_INPUT
+            and probe_mode == "online"
+        )
+        if ctx.tokens.is_cuda:
+            import torch
+
+            torch.cuda.synchronize(ctx.tokens.device)
+        started = time.perf_counter()
+        if requires_frozen_ranking and hasattr(self.press, "apply_with_selection"):
+            key = self.score_key(ctx)
+            scores = None
+            ranking = None
+            cache = self.score_cache
+            if cache is not None and cache.contains(key):
+                scores = cache.load(key, map_location=ctx.tokens.device)
+                ranking = cache.load_ranking(key, map_location=ctx.tokens.device)
+                if ranking is None:
+                    raise RuntimeError(f"score cache entry has no frozen ranking: {cache.path_for(key)}")
+            else:
+                probe_ctx = ctx.clone_for_probe() if requires_probe else ctx
+                scores = self.press.score(probe_ctx)
+                selection = self.press.select(probe_ctx, scores)
+                ranking = self.press.ranking(scores)
+                if cache is not None:
+                    cache.save(key, scores, ranking=ranking, metadata={"selection": selection.metadata})
+            if scores.device != ctx.tokens.device:
+                scores = scores.to(ctx.tokens.device)
+            if ranking is not None and ranking.device != ctx.tokens.device:
+                ranking = ranking.to(ctx.tokens.device)
+            selection = self.press.select(ctx, scores, cached_ranking=ranking)
+            if ctx.tokens.is_cuda:
+                import torch
+
+                torch.cuda.synchronize(ctx.tokens.device)
+            selector_latency_ms = (time.perf_counter() - started) * 1000.0
+            result = self.press.apply_with_selection(ctx, scores.detach(), selection)
+            if cache is not None:
+                result.metadata.setdefault("score_cache", {})
+                result.metadata["score_cache"].update(
+                    {
+                        "path": str(cache.path_for(key)),
+                        "key": key.__dict__,
+                        "digests": cache.digest(key),
+                        "ranking_frozen": True,
+                    }
+                )
+        elif (
+            not requires_frozen_ranking
+            and hasattr(self.press, "score")
+            and hasattr(self.press, "select")
+            and hasattr(self.press, "apply_with_selection")
+        ):
+            scores = self.press.score(ctx)
+            selection = self.press.select(ctx, scores)
+            if ctx.tokens.is_cuda:
+                import torch
+
+                torch.cuda.synchronize(ctx.tokens.device)
+            selector_latency_ms = (time.perf_counter() - started) * 1000.0
+            result = self.press.apply_with_selection(ctx, scores, selection)
+        else:
+            result = self.press.apply(ctx)
+            if ctx.tokens.is_cuda:
+                import torch
+
+                torch.cuda.synchronize(ctx.tokens.device)
+            selector_latency_ms = (time.perf_counter() - started) * 1000.0
+        self.selector_latency_ms += selector_latency_ms
+        result.metadata.setdefault("timing", {})
+        result.metadata["timing"]["selector_latency_ms"] = selector_latency_ms
+        self.record_result(ctx, result)
+        return result
+
+    def record_result(self, ctx, result) -> CompressionEvent:
+        point = getattr(self.press, "injection_point", InjectionPoint.VIDEO_INPUT)
+        point = InjectionPoint.parse(point).value
+        event = CompressionEvent(
+            key=CompressionEventKey(
+                scene_token=str(ctx.scene_token),
+                diffusion_rank=ctx.diffusion_rank,
+                layer_idx=ctx.layer_idx,
+                injection_point=point,
+            ),
+            result=result,
+            context=ctx,
+        )
+        self.events.append(event)
+        self.last_result = result
+        return event
+
+    def record_artifact(self, name: str, value: Any) -> None:
+        self.artifacts[str(name)] = value
+
+    def apply_video_input(self, **kwargs):
+        if self.press is None:
+            return kwargs["video_tokens"]
+        if self.adapter is None or not hasattr(self.adapter, "apply_video_input"):
+            raise RuntimeError("VIDEO_INPUT requires an adapter with apply_video_input()")
+        return self.adapter.apply_video_input(self, **kwargs)
+
+    def install(self, pipe) -> None:
+        if self._installed:
+            return
+        if self.press is not None and hasattr(self.press, "prepare"):
+            self.press.prepare(self)
+        try:
+            if self.adapter is not None:
+                self.adapter.install_hooks(pipe, self)
+            elif hasattr(pipe, "install_tokenpress_runtime"):
+                pipe.install_tokenpress_runtime(self)
+            else:
+                self._previous_runtime = getattr(pipe, "tokenpress_runtime", None)
+                pipe.tokenpress_runtime = self
+        except Exception:
+            if self.adapter is not None:
+                self.adapter.remove_hooks(pipe, self)
+            raise
+        self._installed = True
+
+    def remove(self, pipe) -> None:
+        if not self._installed:
+            return
+        try:
+            if self.adapter is not None:
+                self.adapter.remove_hooks(pipe, self)
+            elif hasattr(pipe, "remove_tokenpress_runtime"):
+                pipe.remove_tokenpress_runtime(self)
+            elif hasattr(self, "_previous_runtime"):
+                pipe.tokenpress_runtime = self._previous_runtime
+        finally:
+            if self.press is not None and hasattr(self.press, "finalize"):
+                self.press.finalize(self)
+            self._installed = False
+
+    @contextmanager
+    def activate(self, pipe) -> Iterator["VideoPressRuntime"]:
+        self.install(pipe)
+        try:
+            yield self
+        finally:
+            self.remove(pipe)

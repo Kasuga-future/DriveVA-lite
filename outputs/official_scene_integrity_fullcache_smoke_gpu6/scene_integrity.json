@@ -1,0 +1,58 @@
+{
+  "suite_root": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_scene_integrity_fullcache_smoke_gpu6",
+  "ok": true,
+  "world_size": 1,
+  "coverage": {
+    "scene_filter_tokens": 12123,
+    "metric_cache_tokens": 12146,
+    "intersection_tokens": 12123,
+    "missing_metric_cache_tokens": 0
+  },
+  "method_count": 3,
+  "failed_method_count": 0,
+  "suite_errors": [],
+  "methods": [
+    {
+      "round": "round01",
+      "method": "causal_attention_zero",
+      "ok": true,
+      "errors": [],
+      "warnings": [],
+      "csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_scene_integrity_fullcache_smoke_gpu6/round01/causal_attention_zero/pdm_score_2026.08.28.09.15.50.csv",
+      "n_csv": 4,
+      "n_events": 4,
+      "n_records": 4,
+      "rank_counts": {
+        "0": 4
+      }
+    },
+    {
+      "round": "round01",
+      "method": "causal_no_press",
+      "ok": true,
+      "errors": [],
+      "warnings": [],
+      "csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_scene_integrity_fullcache_smoke_gpu6/round01/causal_no_press/pdm_score_2026.08.28.09.15.38.csv",
+      "n_csv": 4,
+      "n_events": 4,
+      "n_records": 4,
+      "rank_counts": {
+        "0": 4
+      }
+    },
+    {
+      "round": "round01",
+      "method": "physical_random_kv_prune",
+      "ok": true,
+      "errors": [],
+      "warnings": [],
+      "csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_scene_integrity_fullcache_smoke_gpu6/round01/physical_random_kv_prune/pdm_score_2026.08.28.09.16.00.csv",
+      "n_csv": 4,
+      "n_events": 4,
+      "n_records": 4,
+      "rank_counts": {
+        "0": 4
+      }
+    }
+  ]
+}

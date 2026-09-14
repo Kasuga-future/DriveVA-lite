@@ -1,0 +1,223 @@
+{
+  "suite_name": "official_navsim_videopress",
+  "version": 1,
+  "backend": "official_navsim",
+  "repo_root": "/mnt/chenpeijian/autodrive/DriveVA-lite",
+  "device": "cuda:0",
+  "world_size": 1,
+  "rounds": 1,
+  "methods": [
+    "causal_no_press",
+    "causal_random_zero",
+    "causal_random_mean",
+    "causal_random_shuffle_all",
+    "causal_random_shuffle_drop",
+    "causal_random_shuffle_keep",
+    "causal_token_norm_zero",
+    "causal_token_norm_mean",
+    "causal_attention_zero",
+    "causal_attention_vnorm_zero",
+    "causal_gradient_norm_zero",
+    "causal_gradient_input_zero",
+    "physical_no_press",
+    "physical_random_kv_prune",
+    "physical_token_norm_kv_prune",
+    "physical_attention_kv_prune",
+    "physical_attention_vnorm_kv_prune",
+    "physical_similarity_merge"
+  ],
+  "data": {
+    "navsim_log_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/openscene-v1.1/meta_datas/test",
+    "sensor_blobs_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/openscene-v1.1/sensor_blobs/test",
+    "metric_cache_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/metric_cache",
+    "scene_filter_yaml": "/mnt/chenpeijian/autodrive/DriveVA-lite/examples/wanvideo/driveva_infer/navsim_scene_filters/navtest.yaml"
+  },
+  "runs": [
+    {
+      "method": "causal_no_press",
+      "round": 1,
+      "protocol": "causal",
+      "backend": "official_navsim",
+      "output_dir": "round01/causal_no_press",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/causal_no_press/pdm_score_2026.08.28.07.51.16.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    },
+    {
+      "method": "causal_random_zero",
+      "round": 1,
+      "protocol": "causal",
+      "backend": "official_navsim",
+      "output_dir": "round01/causal_random_zero",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/causal_random_zero/pdm_score_2026.08.28.07.51.23.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    },
+    {
+      "method": "causal_random_mean",
+      "round": 1,
+      "protocol": "causal",
+      "backend": "official_navsim",
+      "output_dir": "round01/causal_random_mean",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/causal_random_mean/pdm_score_2026.08.28.07.51.30.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    },
+    {
+      "method": "causal_random_shuffle_all",
+      "round": 1,
+      "protocol": "causal",
+      "backend": "official_navsim",
+      "output_dir": "round01/causal_random_shuffle_all",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/causal_random_shuffle_all/pdm_score_2026.08.28.07.51.38.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    },
+    {
+      "method": "causal_random_shuffle_drop",
+      "round": 1,
+      "protocol": "causal",
+      "backend": "official_navsim",
+      "output_dir": "round01/causal_random_shuffle_drop",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/causal_random_shuffle_drop/pdm_score_2026.08.28.07.51.45.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    },
+    {
+      "method": "causal_random_shuffle_keep",
+      "round": 1,
+      "protocol": "causal",
+      "backend": "official_navsim",
+      "output_dir": "round01/causal_random_shuffle_keep",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/causal_random_shuffle_keep/pdm_score_2026.08.28.07.51.51.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    },
+    {
+      "method": "causal_token_norm_zero",
+      "round": 1,
+      "protocol": "causal",
+      "backend": "official_navsim",
+      "output_dir": "round01/causal_token_norm_zero",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/causal_token_norm_zero/pdm_score_2026.08.28.07.51.59.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    },
+    {
+      "method": "causal_token_norm_mean",
+      "round": 1,
+      "protocol": "causal",
+      "backend": "official_navsim",
+      "output_dir": "round01/causal_token_norm_mean",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/causal_token_norm_mean/pdm_score_2026.08.28.07.52.05.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    },
+    {
+      "method": "causal_attention_zero",
+      "round": 1,
+      "protocol": "causal",
+      "backend": "official_navsim",
+      "output_dir": "round01/causal_attention_zero",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/causal_attention_zero/pdm_score_2026.08.28.07.52.14.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    },
+    {
+      "method": "causal_attention_vnorm_zero",
+      "round": 1,
+      "protocol": "causal",
+      "backend": "official_navsim",
+      "output_dir": "round01/causal_attention_vnorm_zero",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/causal_attention_vnorm_zero/pdm_score_2026.08.28.07.52.22.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    },
+    {
+      "method": "causal_gradient_norm_zero",
+      "round": 1,
+      "protocol": "causal",
+      "backend": "official_navsim",
+      "output_dir": "round01/causal_gradient_norm_zero",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/causal_gradient_norm_zero/pdm_score_2026.08.28.07.52.30.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    },
+    {
+      "method": "causal_gradient_input_zero",
+      "round": 1,
+      "protocol": "causal",
+      "backend": "official_navsim",
+      "output_dir": "round01/causal_gradient_input_zero",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/causal_gradient_input_zero/pdm_score_2026.08.28.07.52.38.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    },
+    {
+      "method": "physical_no_press",
+      "round": 1,
+      "protocol": "physical",
+      "backend": "official_navsim",
+      "output_dir": "round01/physical_no_press",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/physical_no_press/pdm_score_2026.08.28.07.52.45.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    },
+    {
+      "method": "physical_random_kv_prune",
+      "round": 1,
+      "protocol": "physical",
+      "backend": "official_navsim",
+      "output_dir": "round01/physical_random_kv_prune",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/physical_random_kv_prune/pdm_score_2026.08.28.07.52.53.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    },
+    {
+      "method": "physical_token_norm_kv_prune",
+      "round": 1,
+      "protocol": "physical",
+      "backend": "official_navsim",
+      "output_dir": "round01/physical_token_norm_kv_prune",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/physical_token_norm_kv_prune/pdm_score_2026.08.28.07.53.00.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    },
+    {
+      "method": "physical_attention_kv_prune",
+      "round": 1,
+      "protocol": "physical",
+      "backend": "official_navsim",
+      "output_dir": "round01/physical_attention_kv_prune",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/physical_attention_kv_prune/pdm_score_2026.08.28.07.53.07.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    },
+    {
+      "method": "physical_attention_vnorm_kv_prune",
+      "round": 1,
+      "protocol": "physical",
+      "backend": "official_navsim",
+      "output_dir": "round01/physical_attention_vnorm_kv_prune",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/physical_attention_vnorm_kv_prune/pdm_score_2026.08.28.07.53.14.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    },
+    {
+      "method": "physical_similarity_merge",
+      "round": 1,
+      "protocol": "physical",
+      "backend": "official_navsim",
+      "output_dir": "round01/physical_similarity_merge",
+      "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/physical_similarity_merge/pdm_score_2026.08.28.07.54.01.csv",
+      "n_scenes": 1,
+      "valid_scenes": 1
+    }
+  ],
+  "coverage": {
+    "scene_filter_tokens": 12123,
+    "metric_cache_tokens": 128,
+    "intersection_tokens": 128,
+    "missing_metric_cache_tokens": 11995
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "method": "physical_similarity_merge",
+  "round": 1,
+  "mode": "physical",
+  "backend": "official_navsim",
+  "press": {
+    "name": "similarity_merge",
+    "injection_point": "self_attn_kv",
+    "domain": "last_history",
+    "feature": "tokens",
+    "budget": {
+      "type": "ratio",
+      "value": 0.5,
+      "reference": "eligible"
+    }
+  },
+  "official_csv": "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_all_methods_smoke/round01/physical_similarity_merge/pdm_score_2026.08.28.07.54.01.csv",
+  "n_scenes": 1,
+  "valid_scenes": 1,
+  "probe_protocol": "none"
+}

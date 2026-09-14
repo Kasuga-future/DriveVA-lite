@@ -1,0 +1,44 @@
+experiment:
+  name: full_compression_suite
+  seed: 20260829
+  round: 1
+  method: causal_gradient_input_zero
+benchmark:
+  name: synthetic
+  max_scenes: 4
+model:
+  checkpoint: synthetic_framework_cohort
+press:
+  name: scorer_press
+  injection_point: video_input
+  domain: last_history
+  scorer:
+    name: gradient_input
+    reduction: l2
+  selector:
+    name: topk
+  operator:
+    name: zero
+  budget:
+    type: ratio
+    value: 0.5
+    reference: eligible
+evaluation:
+  mode: causal
+  backend: synthetic
+  random_baseline: false
+  random_seeds:
+  - 20260930
+  - 20260931
+output:
+  dir: /mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/full_compression_suite/round_01/causal_gradient_input_zero
+synthetic:
+  frames: 4
+  height: 3
+  width: 4
+  num_cond_latents: 2
+  trajectory_length: 6
+  trajectory_prefix_length: 2
+  hidden_dim: 16
+  heads: 2
+  scenes: 4

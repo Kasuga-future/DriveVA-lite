@@ -1,0 +1,216 @@
+{
+  "ok": true,
+  "repo_root": "/mnt/chenpeijian/autodrive/DriveVA-lite",
+  "log_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/openscene-v1.1/meta_datas/test",
+  "sensor_blobs_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/openscene-v1.1/sensor_blobs/test",
+  "metric_cache_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/metric_cache_full",
+  "scene_filter_yaml": "/mnt/chenpeijian/autodrive/DriveVA-lite/examples/wanvideo/driveva_infer/navsim_scene_filters/navtest.yaml",
+  "guard": {
+    "installed": true,
+    "already_installed": false,
+    "guard": "scene_token+scene_name"
+  },
+  "scene_filter": {
+    "num_history_frames": 5,
+    "num_future_frames": 10,
+    "frame_interval": 1,
+    "has_route": true,
+    "requested_log_names": 136,
+    "requested_tokens": 12146,
+    "window_length": 15
+  },
+  "raw_official_loader": {
+    "tokens": 12123,
+    "invalid_window_count": 4247,
+    "cross_scene_windows": 4247,
+    "issue_counts": {
+      "scene_token_count=2": 4247,
+      "scene_name_count=2": 4247,
+      "cross_scene_boundary": 4247,
+      "noncontiguous_frame_idx": 4247
+    },
+    "examples": [
+      {
+        "token": "d89e9c599cf5571b",
+        "issues": [
+          "scene_token_count=2",
+          "scene_name_count=2",
+          "cross_scene_boundary",
+          "noncontiguous_frame_idx"
+        ],
+        "scene_tokens": [
+          "3f0c8af93190514a",
+          "f45aa344fc825a54"
+        ],
+        "scene_names": [
+          "log-0122-scene-0003",
+          "log-0122-scene-0004"
+        ],
+        "frame_idx": [
+          35,
+          36,
+          37,
+          38,
+          39,
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9
+        ]
+      },
+      {
+        "token": "943cbb2398a150b4",
+        "issues": [
+          "scene_token_count=2",
+          "scene_name_count=2",
+          "cross_scene_boundary",
+          "noncontiguous_frame_idx"
+        ],
+        "scene_tokens": [
+          "2b23297329b75f50",
+          "c31caa082a3652ef"
+        ],
+        "scene_names": [
+          "log-0122-scene-0005",
+          "log-0122-scene-0006"
+        ],
+        "frame_idx": [
+          36,
+          37,
+          38,
+          39,
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10
+        ]
+      },
+      {
+        "token": "e966ed2a366b5bcb",
+        "issues": [
+          "scene_token_count=2",
+          "scene_name_count=2",
+          "cross_scene_boundary",
+          "noncontiguous_frame_idx"
+        ],
+        "scene_tokens": [
+          "2b23297329b75f50",
+          "c31caa082a3652ef"
+        ],
+        "scene_names": [
+          "log-0122-scene-0005",
+          "log-0122-scene-0006"
+        ],
+        "frame_idx": [
+          37,
+          38,
+          39,
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11
+        ]
+      },
+      {
+        "token": "81ac4c9af9ea5562",
+        "issues": [
+          "scene_token_count=2",
+          "scene_name_count=2",
+          "cross_scene_boundary",
+          "noncontiguous_frame_idx"
+        ],
+        "scene_tokens": [
+          "2b23297329b75f50",
+          "c31caa082a3652ef"
+        ],
+        "scene_names": [
+          "log-0122-scene-0005",
+          "log-0122-scene-0006"
+        ],
+        "frame_idx": [
+          38,
+          39,
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12
+        ]
+      },
+      {
+        "token": "0bcae698fd905226",
+        "issues": [
+          "scene_token_count=2",
+          "scene_name_count=2",
+          "cross_scene_boundary",
+          "noncontiguous_frame_idx"
+        ],
+        "scene_tokens": [
+          "2b23297329b75f50",
+          "2e1513ccb65d591d"
+        ],
+        "scene_names": [
+          "log-0122-scene-0006",
+          "log-0122-scene-0007"
+        ],
+        "frame_idx": [
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          0
+        ]
+      }
+    ]
+  },
+  "guarded_official_loader": {
+    "tokens": 7876,
+    "errors": 0,
+    "error_examples": [],
+    "tokens_equal_filtered_raw": true
+  },
+  "metric_cache": {
+    "tokens": 12146,
+    "missing_guarded_tokens": 0,
+    "missing_examples": []
+  }
+}

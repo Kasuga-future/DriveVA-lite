@@ -1,0 +1,40 @@
+{
+  "backend": "official_navsim",
+  "round": 1,
+  "method": "causal_random_zero",
+  "mode": "causal",
+  "press": {
+    "name": "scorer_press",
+    "injection_point": "video_input",
+    "domain": "last_history",
+    "scorer": {
+      "name": "random",
+      "seed": 20260829,
+      "scope": "scene"
+    },
+    "selector": {
+      "name": "topk"
+    },
+    "operator": {
+      "name": "zero"
+    },
+    "budget": {
+      "type": "ratio",
+      "value": 0.5,
+      "reference": "eligible"
+    }
+  },
+  "data": {
+    "repo_root": "/mnt/chenpeijian/autodrive/DriveVA-lite",
+    "navsim_log_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/openscene-v1.1/meta_datas/test",
+    "sensor_blobs_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/openscene-v1.1/sensor_blobs/test",
+    "metric_cache_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/metric_cache",
+    "scene_filter_yaml": "/mnt/chenpeijian/autodrive/DriveVA-lite/examples/wanvideo/driveva_infer/navsim_scene_filters/navtest.yaml"
+  },
+  "model": {
+    "full_ckpt": "/mnt/nvme/chenpeijian/autodrive/DriveVA/checkpoints/pdms90_9.safetensors",
+    "local_model_path": "/mnt/nvme/chenpeijian/autodrive/DriveVA/models",
+    "num_inference_steps": 3,
+    "model_future_frames": 8
+  }
+}

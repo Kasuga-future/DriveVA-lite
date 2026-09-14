@@ -1,0 +1,5 @@
+# Per-round VideoTokenPress statistics
+
+| method | round | protocol | backend | press | scorer | selector | operator | domain | n_scenes | valid_scenes | pdm | pdm_std | trajectory_l2 | trajectory_l2_std | endpoint_l2 | endpoint_l2_std | K_mean | K_std | n_candidate_mean | eligible_keep_ratio_mean | history_keep_ratio_mean | theoretical_attn_ratio_mean | k_length_before_mean | k_length_after_mean | v_length_after_mean | selector_latency_ms_mean | selector_latency_ms_std | model_latency_ms_mean | model_latency_ms_std | e2e_latency_ms_mean | e2e_latency_ms_std | peak_memory_mb_mean | peak_memory_mb_std | peak_memory_mb_max | run_dir |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| causal_no_press | 1 | causal | official_navsim | noop |  |  |  |  | 1 | 1 | 0.927718 | 0 |  |  |  |  |  |  |  |  |  |  |  |  |  | 0 | 0 | 1408.77 | 0 | 1408.77 | 0 | 23286.7 | 0 | 23286.7 | /mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/official_env_smoke/round01/causal_no_press |

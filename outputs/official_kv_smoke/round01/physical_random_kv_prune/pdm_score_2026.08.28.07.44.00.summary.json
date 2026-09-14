@@ -1,0 +1,25 @@
+{
+  "all": {
+    "comfort": 1.0,
+    "drivable_area_compliance": 1.0,
+    "driving_direction_compliance": 1.0,
+    "ego_progress": 0.8443730368905495,
+    "gpu_mem_alloc_after_mb": 25716.5146484375,
+    "gpu_mem_alloc_before_mb": 21754.3193359375,
+    "gpu_mem_alloc_peak_delta_mb": 4261.81494140625,
+    "gpu_mem_alloc_peak_mb": 26016.13427734375,
+    "gpu_mem_reserved_after_mb": 26162.0,
+    "gpu_mem_reserved_before_mb": 21768.0,
+    "gpu_mem_reserved_peak_delta_mb": 4394.0,
+    "gpu_mem_reserved_peak_mb": 26162.0,
+    "history_comfort": 1.0,
+    "infer_time_ms": 1544.11437548697,
+    "infer_time_s": 1.54411437548697,
+    "multiplicative_metrics_prod": 1.0,
+    "no_at_fault_collisions": 1.0,
+    "pdm_score": 0.935155432037729,
+    "score": 0.935155432037729,
+    "skip_video_decode": 1.0,
+    "time_to_collision_within_bound": 1.0
+  }
+}
