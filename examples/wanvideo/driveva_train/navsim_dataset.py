@@ -44,6 +44,8 @@ class NavsimDriveVAConfig:
     max_scenes: Optional[int] = None
     train_log_names: Optional[List[str]] = None
     val_log_names: Optional[List[str]] = None
+    train_scene_tokens: Optional[List[str]] = None
+    val_scene_tokens: Optional[List[str]] = None
     image_height: int = 480
     image_width: int = 832
     image_normalize: str = "[-1,1]"
@@ -116,6 +118,23 @@ def _first_present(mapping: Dict[str, Any], keys: tuple[str, ...]) -> Any:
     return None
 
 
+def _selector_command_3way(command: Any, sample_token: str) -> np.ndarray:
+    """Map NAVSIM's 4-way one-hot command to selector's 3-way encoding.
+
+    The selector keeps the existing [left, straight, right] interface.  NAVSIM's
+    fourth/default class is folded into straight so it is never represented as
+    an all-zero condition.  The original command is still passed to DriveVA.
+    """
+    raw = np.asarray(command, dtype=np.float32).reshape(-1)
+    if raw.size == 3:
+        return raw
+    if raw.size != 4:
+        raise ValueError(f"Expected 3- or 4-way driving command for sample {sample_token}, got shape {raw.shape}")
+    mapped = raw[:3].copy()
+    mapped[1] = max(mapped[1], raw[3])
+    return mapped
+
+
 def _quiet_stdout(enabled: bool):
     if enabled:
         return contextlib.redirect_stdout(io.StringIO())
@@ -148,6 +167,7 @@ class NavsimDriveVADataset(torch.utils.data.Dataset):
             )
 
         log_names = cfg.train_log_names if split == "train" else cfg.val_log_names
+        scene_tokens = cfg.train_scene_tokens if split == "train" else cfg.val_scene_tokens
         scene_filter = SceneFilter(
             num_history_frames=int(cfg.num_history_frames),
             num_future_frames=int(cfg.num_future_frames),
@@ -155,6 +175,7 @@ class NavsimDriveVADataset(torch.utils.data.Dataset):
             has_route=bool(cfg.has_route),
             max_scenes=cfg.max_scenes,
             log_names=log_names,
+            tokens=scene_tokens,
         )
         self._scene_loader = SceneLoader(
             data_path=Path(cfg.navsim_log_path),
@@ -249,6 +270,9 @@ class NavsimDriveVADataset(torch.utils.data.Dataset):
         ego_vel = _normalize_ego_vel_planar(features.get("vel"))
         speed = float(np.linalg.norm(ego_vel[:2]))
         driving_command = _first_present(features, ("driving_command", "command"))
+        if driving_command is None:
+            raise ValueError(f"Missing driving_command/command for sample {sample_token}")
+        command_np = _selector_command_3way(driving_command, sample_token)
         prompt = _build_prompt_fixed(history_positions, driving_command, speed, None)
 
         return {
@@ -261,6 +285,7 @@ class NavsimDriveVADataset(torch.utils.data.Dataset):
             "trajectory": torch.as_tensor(trajectory, dtype=torch.float32),
             "history_positions": torch.as_tensor(history_positions, dtype=torch.float32),
             "ego_vel": torch.as_tensor(ego_vel, dtype=torch.float32),
+            "driving_command": torch.as_tensor(command_np, dtype=torch.float32),
         }
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:

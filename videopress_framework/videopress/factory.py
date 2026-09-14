@@ -8,6 +8,7 @@ from .core.budget import TokenBudget
 from .core.domain import build_domain
 from .core.registry import OPERATOR_REGISTRY, SCORER_REGISTRY, SELECTOR_REGISTRY, get_registered
 from .core.runtime import InjectionPoint
+from .core.retention import apply_history_retention_policy
 from .operators import (
     HiddenTokenMergeOperator,
     KVMergeOperator,
@@ -23,12 +24,25 @@ from .presses import ComposedPress, NoPress, ScorerPress, SimilarityMergePress
 from .scorers import (
     ActionAttentionScorer,
     ActionAttentionVNormScorer,
+    ActionAttentionVNormTemporalScorer,
+    ActionContributionStabilityScorer,
     GradientInputScorer,
     GradientNormScorer,
+    LearnedPlanningSelectorScorer,
+    PlanningGradientInputScorer,
     RandomScorer,
     TokenNormScorer,
 )
-from .selectors import ThresholdSelector, TopKSelector
+from .selectors import (
+    AdaptiveMassSelector,
+    AdaptiveSpatialMassSelector,
+    HistoryQuotaSelector,
+    HistoryThresholdSelector,
+    HistoryTopKSelector,
+    ProtectedTokenSelector,
+    ThresholdSelector,
+    TopKSelector,
+)
 
 
 def _section(value: Any, default: dict | None = None) -> dict:
@@ -45,8 +59,8 @@ def _register_builtin_aliases() -> None:
     # Importing the modules registers the canonical entries.  Aliases here are
     # intentionally explicit so configuration names remain stable.
     _ = (NoPress, ScorerPress, SimilarityMergePress, RandomScorer, TokenNormScorer,
-         ActionAttentionScorer, ActionAttentionVNormScorer, GradientNormScorer,
-         GradientInputScorer, TopKSelector, ThresholdSelector, ZeroMaskOperator,
+         ActionAttentionScorer, ActionAttentionVNormScorer, ActionAttentionVNormTemporalScorer, ActionContributionStabilityScorer, GradientNormScorer,
+         GradientInputScorer, PlanningGradientInputScorer, LearnedPlanningSelectorScorer, AdaptiveMassSelector, AdaptiveSpatialMassSelector, HistoryQuotaSelector, HistoryThresholdSelector, HistoryTopKSelector, ProtectedTokenSelector, TopKSelector, ThresholdSelector, ZeroMaskOperator,
          MeanReplaceOperator, ShuffleOperator, ShuffleAllOperator,
          ShuffleDroppedOperator, ShuffleKeptOperator, KVPruneOperator,
          HiddenTokenMergeOperator, KVMergeOperator, ComposedPress)
@@ -58,7 +72,7 @@ def build_scorer(config: Any, *, gradient_forward=None, gradient_objective=None)
     name = str(section.pop("name", "random")).lower()
     aliases = {"norm": "token_norm", "attention": "action_attention", "attention_vnorm": "action_attention_vnorm"}
     name = aliases.get(name, name)
-    if name in {"action_attention", "action_attention_vnorm"}:
+    if name in {"action_attention", "action_attention_vnorm", "action_attention_vnorm_temporal", "action_contribution_stability"}:
         heads = section.pop("heads", None)
         if isinstance(heads, dict):
             section.setdefault("head_mode", heads.get("mode", "mean"))
@@ -87,6 +101,9 @@ def build_selector(config: Any):
     _register_builtin_aliases()
     section = _section(config, {"name": "topk"})
     name = section.pop("name", "topk")
+    if str(name).lower() == "protected":
+        base = section.pop("base", section.pop("base_selector", {"name": "topk"}))
+        return ProtectedTokenSelector(base_selector=build_selector(base), **section)
     return get_registered(SELECTOR_REGISTRY, name)(**section)
 
 
@@ -113,9 +130,14 @@ def build_press(config: Any, *, gradient_forward=None, gradient_objective=None):
         config = {"name": config}
     section = _section(config)
     name = str(section.pop("name", "scorer_press")).lower()
+    retention_policy = section.get("retention_policy")
     if name in {"none", "noop", "full"}:
+        if retention_policy is not None:
+            raise ValueError("NoPress cannot implement a history retention policy")
         return NoPress()
     if name == "similarity_merge":
+        if retention_policy is not None:
+            raise ValueError("similarity_merge does not delete unselected tokens and cannot implement a retention policy")
         domain = section.get("domain", "last_history")
         return SimilarityMergePress(
             budget=build_budget(section.get("budget")),
@@ -123,6 +145,8 @@ def build_press(config: Any, *, gradient_forward=None, gradient_objective=None):
             feature=section.get("feature", "tokens"),
         )
     if name in {"composed", "compose"}:
+        if retention_policy is not None:
+            raise ValueError("apply history retention policies to each composed child explicitly")
         children = section.pop("presses", section.pop("children", None))
         if not children:
             raise ValueError("composed press requires a non-empty presses list")
@@ -143,6 +167,9 @@ def build_press(config: Any, *, gradient_forward=None, gradient_objective=None):
         scorer_config = {**scorer_section, "name": name}
         section["scorer"] = scorer_config
         name = "scorer_press"
+    if retention_policy is not None:
+        section = apply_history_retention_policy(section, str(retention_policy))
+    retention_policy = section.pop("retention_policy", None)
     scorer = build_scorer(section.pop("scorer", {"name": "random"}), gradient_forward=gradient_forward, gradient_objective=gradient_objective)
     selector = build_selector(section.pop("selector", "topk"))
     operator = build_operator(section.pop("operator", "zero"))
@@ -152,6 +179,7 @@ def build_press(config: Any, *, gradient_forward=None, gradient_objective=None):
     budget = build_budget(section.pop("budget", None))
     injection_point = section.pop("injection_point", InjectionPoint.VIDEO_INPUT)
     random_scope = section.pop("random_scope", None)
+    cross_layer_persistence = section.pop("cross_layer_persistence", None)
     return ScorerPress(
         scorer=scorer,
         selector=selector,
@@ -160,6 +188,8 @@ def build_press(config: Any, *, gradient_forward=None, gradient_objective=None):
         domain=domain,
         injection_point=injection_point,
         random_scope=random_scope,
+        retention_policy=retention_policy,
+        cross_layer_persistence=cross_layer_persistence,
     )
 def aliases_for_scorer(name: str) -> str:
     return {

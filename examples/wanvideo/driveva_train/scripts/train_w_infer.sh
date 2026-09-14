@@ -9,6 +9,10 @@ CONFIG="${CONFIG:-${NAVSIM_TRAIN_CONFIG:-"${DRIVEVA_TRAIN_DIR}/configs/navsim_v1
 TRAIN_SCRIPT="${TRAIN_SCRIPT:-"${SCRIPT_DIR}/train_navsim_v1.sh"}"
 INFER_ALL_SCRIPT="${INFER_ALL_SCRIPT:-"${DRIVEVA_INFER_DIR}/scripts/infer_all.sh"}"
 
+# shellcheck source=/dev/null
+source "${DRIVEVA_INFER_DIR}/scripts/distributed_env.sh"
+driveva_resolve_python
+
 if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
   export MAX_SCENES="${MAX_SCENES:-8}"
   export NUM_EPOCHS="${NUM_EPOCHS:-1}"

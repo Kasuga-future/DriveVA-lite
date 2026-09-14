@@ -9,9 +9,13 @@ import atexit
 import contextlib
 import importlib
 import json
+import math
 import os
+import pickle
 import random
+import statistics
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -28,8 +32,199 @@ from diffsynth.pipelines.wan_video_new import ModelConfig, WanVideoPipeline
 from diffsynth.trainers.utils import DiffusionTrainingModule, ModelLogger, launch_training_task
 
 from navsim_dataset import DEFAULT_NEGATIVE_PROMPT, NavsimDriveVAConfig, NavsimDriveVADataset
+FRAMEWORK_ROOT = Path(__file__).resolve().parents[3] / "videopress_framework"
+if str(FRAMEWORK_ROOT) not in sys.path:
+    sys.path.insert(0, str(FRAMEWORK_ROOT))
+
+from videopress.training.online_selector import (
+    DynamicTokenSelector, counterfactual_group_bce, critical_box_token_mask,
+    displacement_token_bce,
+    gradient_input_scores,
+    hard_topk_mask, horizon_weighted_trajectory_displacement,
+    keep_ratio_at_step, online_topk_labels, parse_horizon_weights,
+    parse_keep_schedule, selector_metrics, selector_pairwise_ranking_loss,
+    signed_removal_scores, signed_soft_keep_labels,
+    spatial_counterfactual_probe,
+)
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def _flatten_sample_token(sample_token: Any) -> Optional[str]:
+    """``data["token"]`` is a length-1 list per batch element after collation."""
+    if sample_token is None:
+        return None
+    if isinstance(sample_token, (list, tuple)):
+        if not sample_token:
+            return None
+        return str(sample_token[0])
+    return str(sample_token)
+
+
+def _dump_counterfactual_probe(
+    dump_dir: Path,
+    *,
+    rank: int,
+    global_step: int,
+    sample_token: Optional[str],
+    tokens: torch.Tensor,
+    positions: torch.Tensor,
+    ego_state: torch.Tensor,
+    command: torch.Tensor,
+    selector_timestep: Optional[torch.Tensor],
+    logits: torch.Tensor,
+    membership: torch.Tensor,
+    group_index: int,
+    baseline_loss: torch.Tensor,
+    masked_loss: torch.Tensor,
+    relative_delta: float,
+    helpful_target: float,
+    confidence: float,
+    trajectory_metrics: Optional[dict] = None,
+    extra: Optional[dict] = None,
+    shard_tag: Optional[str] = None,
+) -> str:
+    """Persist one counterfactual probe so it can be re-analysed offline.
+
+    The selector sees ``tokens``/``positions``/``ego_state``/``command``/
+    ``timestep``; the teacher supplies exactly one scalar label per probe.
+    Dumping both sides makes the label's learnability an offline question that
+    does not need the 5B backbone again.
+    """
+    shard_dir = dump_dir / f"rank{int(rank)}"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    # The tag is part of the name because one optimizer step can emit many
+    # shards (one per tile, or one per removal size) that share the same step.
+    tag = str(shard_tag) if shard_tag else f"tile-{int(group_index):02d}"
+    path = shard_dir / f"step-{int(global_step):06d}-{tag}.pt"
+    time_tensor = (
+        torch.zeros(1)
+        if selector_timestep is None
+        else torch.as_tensor(selector_timestep).detach().float().reshape(-1)
+    )
+    payload = {
+        "global_step": int(global_step),
+        "rank": int(rank),
+        "sample_token": _flatten_sample_token(sample_token),
+        "tokens": tokens.detach().to(torch.float16).cpu(),
+        "positions": positions.detach().float().cpu(),
+        "ego_state": ego_state.detach().float().cpu(),
+        "command": command.detach().float().cpu(),
+        "selector_timestep": time_tensor.cpu(),
+        "selector_logits": logits.detach().float().cpu(),
+        "membership": membership.detach().bool().cpu(),
+        "group_index": int(group_index),
+        "baseline_loss_unweighted": float(baseline_loss.detach().float().reshape(-1)[0]),
+        "masked_loss_unweighted": float(masked_loss.detach().float().reshape(-1)[0]),
+        "relative_delta": float(relative_delta),
+        "helpful_target": float(helpful_target),
+        "confidence": float(confidence),
+    }
+    payload.update(
+        {
+            key: float(value)
+            for key, value in (trajectory_metrics or {}).items()
+            if isinstance(value, (int, float))
+        }
+    )
+    if extra:
+        payload.update(extra)
+    tmp_path = path.with_suffix(".pt.tmp")
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)
+    return str(path)
+
+
+def _probe_relative_delta(baseline_loss: torch.Tensor, masked_loss: torch.Tensor) -> float:
+    baseline = float(baseline_loss.detach().float().reshape(-1)[0])
+    masked = float(masked_loss.detach().float().reshape(-1)[0])
+    return (masked - baseline) / max(abs(baseline), 1e-6)
+
+
+def _append_counterfactual_jsonl(path: Path, row: dict) -> None:
+    """Append one compact JSON line per (scene, tile, latent) probe.
+
+    The full ``.pt`` shard (``_dump_counterfactual_probe``) stores the 3072-d
+    hidden states, which is what makes a 12-tile x 2-latent sweep expensive on
+    disk.  The route-temporal-key-set probe only needs the scalar labels plus
+    the tile geometry and the ego condition, so it writes those instead.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {}
+    for key, value in row.items():
+        if value is None or isinstance(value, (bool, str, list, dict)):
+            payload[key] = value
+        elif isinstance(value, int):
+            payload[key] = int(value)
+        else:
+            number = float(value)
+            # Keep the file valid JSON (no bare NaN/Infinity literals).
+            payload[key] = number if math.isfinite(number) else None
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def _trajectory_divergence(
+    baseline_pred: Optional[torch.Tensor],
+    masked_pred: Optional[torch.Tensor],
+    *,
+    prefix_len: int = 0,
+    horizon_weights=(),
+    target_fps: float = 2.0,
+) -> dict:
+    """Geometric distance between the two predicted plans (review P3 item 3).
+
+    The planning-loss delta is a signed functional that can cancel: a tile whose
+    removal rotates the prediction without changing its error barely moves the
+    MSE.  Plan displacement cannot cancel and is therefore a candidate for a
+    much lower-variance teacher target.
+    """
+    if not torch.is_tensor(baseline_pred) or not torch.is_tensor(masked_pred):
+        return {}
+    baseline = baseline_pred.detach().float()
+    masked = masked_pred.detach().float()
+    if baseline.shape != masked.shape or baseline.ndim != 3:
+        return {}
+    if int(prefix_len) > 0 and baseline.shape[1] > int(prefix_len):
+        baseline = baseline[:, int(prefix_len) :]
+        masked = masked[:, int(prefix_len) :]
+    if baseline.shape[1] == 0:
+        return {}
+    step_displacement = (baseline - masked).norm(dim=-1)
+    scale = baseline.abs().mean().clamp_min(1e-6)
+    metrics = {
+        "counterfactual_traj_disp_mean": float(step_displacement.mean()),
+        "counterfactual_traj_disp_max": float(step_displacement.max()),
+        "counterfactual_traj_disp_final": float(step_displacement[:, -1].mean()),
+        "counterfactual_traj_disp_relative": float(step_displacement.mean() / scale),
+        "counterfactual_traj_endpoint_disp": float(
+            (baseline[:, -1] - masked[:, -1]).norm(dim=-1).mean()
+        ),
+        "counterfactual_traj_scale": float(scale),
+    }
+    if horizon_weights:
+        weighted, indices = horizon_weighted_trajectory_displacement(
+            baseline,
+            masked,
+            horizon_weights,
+            target_fps=target_fps,
+        )
+        metrics.update(
+            {
+                "counterfactual_traj_disp_long_horizon": float(weighted.mean()),
+                "counterfactual_traj_disp_long_horizon_relative": float(
+                    weighted.mean() / scale
+                ),
+                "counterfactual_traj_horizon_indices": indices,
+                "counterfactual_traj_horizon_seconds": [
+                    float(seconds) for seconds, _ in horizon_weights
+                ],
+                "counterfactual_traj_horizon_weights": [
+                    float(weight) for _, weight in horizon_weights
+                ],
+            }
+        )
+    return metrics
 
 
 _NAVSIM_EVAL_LOG_DEFAULT = "/path/to/navsim_v1.1/navsim_logs/test"
@@ -156,6 +351,113 @@ def _env_bool(*names: str, default: bool = False) -> bool:
 def _add_optional_arg(argv: list[str], flag: str, value: Any) -> None:
     if value is not None and str(value) != "":
         argv.extend([flag, str(value)])
+
+
+def _read_jsonl_manifest(path: str) -> list[dict[str, Any]]:
+    manifest_path = Path(path).expanduser().resolve()
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"scene manifest not found: {manifest_path}")
+    rows: list[dict[str, Any]] = []
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            if not isinstance(row, dict):
+                raise ValueError(f"{manifest_path}:{line_no} must contain a JSON object")
+            rows.append(row)
+    if not rows:
+        raise ValueError(f"scene manifest is empty: {manifest_path}")
+    return rows
+
+
+def _manifest_scene_tokens(rows: list[dict[str, Any]], path: str) -> list[str]:
+    tokens = [str(row["scene_token"]) for row in rows if row.get("scene_token") is not None]
+    if len(tokens) != len(rows):
+        raise ValueError(f"every row in {path} must contain scene_token")
+    if len(set(tokens)) != len(tokens):
+        raise ValueError(f"duplicate scene_token values in {path}")
+    return tokens
+
+
+def _forbidden_manifest_tokens(spec: str) -> tuple[set[str], list[dict[str, Any]]]:
+    """Load a comma-separated set of manifests used as leakage guards."""
+
+    paths = [value.strip() for value in str(spec).split(",") if value.strip()]
+    if not paths:
+        raise ValueError("forbidden_scene_manifest must name at least one manifest")
+    union: set[str] = set()
+    summaries: list[dict[str, Any]] = []
+    for path in paths:
+        rows = _read_jsonl_manifest(path)
+        tokens = set(_manifest_scene_tokens(rows, path))
+        union.update(tokens)
+        summaries.append({"path": str(Path(path).expanduser().resolve()), "scenes": len(tokens)})
+    return union, summaries
+
+
+def _representative_frame_tokens(
+    rows: list[dict[str, Any]],
+    *,
+    manifest_path: str,
+    num_history_frames: int,
+    num_future_frames: int,
+    frame_interval: Optional[int],
+    has_route: bool = True,
+    windows_per_scene: int = 1,
+) -> list[str]:
+    """Choose deterministic, temporally spread windows per independent scene.
+
+    Split manifests identify semantic scenes with ``scene_token`` while NAVSIM's
+    SceneFilter expects the current-frame ``token``.  Selecting one central
+    valid windows prevents a scene run from silently expanding into every
+    highly correlated sliding-window sample while allowing controlled temporal
+    diversity.
+    """
+    window = int(num_history_frames) + int(num_future_frames)
+    stride = 1 if frame_interval is None else int(frame_interval)
+    if window <= 0 or stride <= 0:
+        raise ValueError("history/future window and frame_interval must be positive")
+    if int(windows_per_scene) <= 0:
+        raise ValueError("windows_per_scene must be positive")
+    selected: list[str] = []
+    for row_no, row in enumerate(rows, start=1):
+        explicit = row.get("sample_token") or row.get("frame_token")
+        if explicit is not None:
+            selected.append(str(explicit))
+            continue
+        metadata_path = row.get("metadata_path")
+        if not metadata_path:
+            raise ValueError(f"{manifest_path}:{row_no} lacks metadata_path/sample_token")
+        resolved = Path(str(metadata_path)).expanduser().resolve()
+        if not resolved.is_file():
+            raise FileNotFoundError(f"manifest metadata not found: {resolved}")
+        with resolved.open("rb") as handle:
+            frames = pickle.load(handle)
+        starts = []
+        for start in range(0, max(0, len(frames) - window + 1), stride):
+            current = frames[start + int(num_history_frames) - 1]
+            if has_route and not current.get("roadblock_ids"):
+                continue
+            starts.append(start)
+        if not starts:
+            raise ValueError(f"no valid training window in {resolved}")
+        count = min(int(windows_per_scene), len(starts))
+        if count == len(starts):
+            selected_starts = starts
+        else:
+            # Interior quantiles avoid always choosing only the first/last
+            # feasible moments while keeping selected windows well separated.
+            indices = [min(len(starts) - 1, int((i + 1) * len(starts) / (count + 1))) for i in range(count)]
+            selected_starts = [starts[index] for index in indices]
+        selected.extend(
+            str(frames[start + int(num_history_frames) - 1]["token"])
+            for start in selected_starts
+        )
+    if len(set(selected)) != len(selected):
+        raise ValueError(f"representative frame tokens are not unique in {manifest_path}")
+    return selected
 
 
 def _module_training_states(root: torch.nn.Module) -> Dict[torch.nn.Module, bool]:
@@ -528,6 +830,45 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
         infer_replace_history_latents_before_decode: bool,
         trajectory_condition_mode: str,
         num_history_frames: int,
+        enable_online_selector: bool = False,
+        selector_warmup_steps: int = 0,
+        selector_layer: int = 15,
+        selector_loss_weight: float = 1.0,
+        selector_keep_schedule: str = "",
+        selector_input_variant: str = "token_condition",
+        selector_feature_mode: str = "all",
+        selector_teacher_keep_ratio: float = 0.375,
+        selector_gradient_interval: int = 1,
+        selector_mask_start_step: int = -1,
+        selector_only: bool = False,
+        selector_checkpoint: Optional[str] = None,
+        selector_teacher_mode: str = "gradient_abs",
+        selector_signed_temperature: float = 1.0,
+        selector_counterfactual_interval: int = 4,
+        selector_counterfactual_weight: float = 1.0,
+        selector_counterfactual_scale: float = 0.05,
+        selector_counterfactual_tile_h: int = 3,
+        selector_counterfactual_tile_w: int = 4,
+        selector_counterfactual_physical: bool = False,
+        selector_teacher_timesteps: str = "",
+        selector_teacher_seed: Optional[int] = None,
+        selector_counterfactual_dump_dir: Optional[str] = None,
+        selector_counterfactual_replicate: int = 0,
+        selector_counterfactual_sweep_all: bool = False,
+        selector_counterfactual_replays: int = 1,
+        selector_counterfactual_scales: str = "",
+        selector_counterfactual_abstain_eps: float = 0.0,
+        selector_counterfactual_noise_seed: int = 1234,
+        selector_counterfactual_latent_index: str = "0",
+        selector_counterfactual_jsonl_dir: Optional[str] = None,
+        selector_teacher_disp_scale: float = 0.01,
+        selector_teacher_disp_normalize: str = "scene",
+        selector_ranking_loss_weight: float = 0.0,
+        selector_ranking_margin: float = 0.0,
+        selector_ranking_max_pairs: int = 4096,
+        selector_critical_token_mode: str = "none",
+        selector_critical_token_dilation: float = 0.0,
+        selector_long_horizon_weights: str = "",
     ):
         super().__init__()
         self.negative_prompt = negative_prompt
@@ -537,6 +878,160 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
         self.extra_inputs = [x.strip() for x in extra_inputs.split(",") if x.strip()] if extra_inputs else []
         self.max_timestep_boundary = float(max_timestep_boundary)
         self.min_timestep_boundary = float(min_timestep_boundary)
+        self.enable_online_selector = bool(enable_online_selector)
+        self.selector_warmup_steps = max(0, int(selector_warmup_steps))
+        self.selector_layer = int(selector_layer)
+        self.selector_loss_weight = float(selector_loss_weight)
+        self.selector_keep_schedule = parse_keep_schedule(selector_keep_schedule)
+        self.selector_input_variant = str(selector_input_variant)
+        self.selector_teacher_keep_ratio = float(selector_teacher_keep_ratio)
+        self.selector_gradient_interval = max(1, int(selector_gradient_interval))
+        self.selector_mask_start_step = int(selector_mask_start_step)
+        self.selector_only = bool(selector_only)
+        self.selector_feature_mode = str(selector_feature_mode)
+        self.selector = (
+            DynamicTokenSelector(feature_mode=self.selector_feature_mode)
+            if self.enable_online_selector
+            else None
+        )
+        self.selector_teacher_mode = str(selector_teacher_mode)
+        self.selector_signed_temperature = float(selector_signed_temperature)
+        self.selector_counterfactual_interval = max(1, int(selector_counterfactual_interval))
+        self.selector_counterfactual_weight = float(selector_counterfactual_weight)
+        self.selector_counterfactual_scale = float(selector_counterfactual_scale)
+        self.selector_counterfactual_tile_h = int(selector_counterfactual_tile_h)
+        self.selector_counterfactual_tile_w = int(selector_counterfactual_tile_w)
+        self.selector_counterfactual_physical = bool(selector_counterfactual_physical)
+        self.selector_teacher_seed = (
+            None if selector_teacher_seed is None else int(selector_teacher_seed)
+        )
+        self.selector_counterfactual_dump_dir = (
+            None
+            if selector_counterfactual_dump_dir in (None, "")
+            else Path(str(selector_counterfactual_dump_dir)).expanduser().resolve()
+        )
+        # 0 disables the determinism control.  N>0 repeats the masked forward N
+        # extra times so the counterfactual label's numerical noise floor is
+        # measured instead of assumed.
+        self.selector_counterfactual_replicate = max(
+            0, int(selector_counterfactual_replicate)
+        )
+        # Probe every spatial tile of the scene in one optimizer step instead of
+        # one tile per step (review P1 label-coverage fix).
+        self.selector_counterfactual_sweep_all = bool(selector_counterfactual_sweep_all)
+        # Number of independent noise realisations averaged into one label
+        # (review P3-1).  >1 replaces the single random planning-residual
+        # direction with its expectation.
+        self.selector_counterfactual_replays = max(1, int(selector_counterfactual_replays))
+        # Optional comma-separated removal sizes in tiles; each is probed in the
+        # same step so the perturbation-size dose-response is measurable.
+        self.selector_counterfactual_scales = tuple(
+            int(value.strip())
+            for value in str(selector_counterfactual_scales).split(",")
+            if value.strip()
+        )
+        if any(value <= 0 for value in self.selector_counterfactual_scales):
+            raise ValueError("selector counterfactual scales must be positive tile counts")
+        # Dead zone for the tile label (review P1): probes inside +-abstain_eps
+        # get zero weight instead of a hard 0/1 target.
+        self.selector_counterfactual_abstain_eps = float(selector_counterfactual_abstain_eps)
+        if not math.isfinite(self.selector_counterfactual_abstain_eps) or self.selector_counterfactual_abstain_eps < 0:
+            raise ValueError("selector counterfactual abstain_eps must be finite and non-negative")
+        self.selector_counterfactual_noise_seed = int(selector_counterfactual_noise_seed)
+        # Which conditioned history latent the counterfactual teacher probes,
+        # counted back from the newest one: 0 == newest (historical default),
+        # 1 == the previous history latent, ...  A comma-separated list probes
+        # several latents in the same optimizer step (route-temporal-key-set
+        # probe, 2026-09-11).  The default must reproduce the historical
+        # single-latent behaviour exactly.
+        self.selector_counterfactual_latent_indices = tuple(
+            int(value.strip())
+            for value in str(selector_counterfactual_latent_index).split(",")
+            if value.strip()
+        )
+        if not self.selector_counterfactual_latent_indices:
+            self.selector_counterfactual_latent_indices = (0,)
+        if any(value < 0 for value in self.selector_counterfactual_latent_indices):
+            raise ValueError(
+                "selector counterfactual latent indices must be non-negative "
+                "(they count back from the newest history latent)"
+            )
+        self.selector_counterfactual_jsonl_dir = (
+            None
+            if selector_counterfactual_jsonl_dir in (None, "")
+            else Path(str(selector_counterfactual_jsonl_dir)).expanduser().resolve()
+        )
+        if self.selector_counterfactual_jsonl_dir is not None:
+            self.selector_counterfactual_jsonl_dir.mkdir(parents=True, exist_ok=True)
+        # Displacement teacher: relative plan displacement caused by removing a
+        # tile, scaled into (0, 1) so the selector logit keeps "keep-worthiness"
+        # semantics.  Default 0.01 is ~3x the mean measured displacement.
+        self.selector_teacher_disp_scale = float(selector_teacher_disp_scale)
+        if not math.isfinite(self.selector_teacher_disp_scale) or self.selector_teacher_disp_scale <= 0:
+            raise ValueError("selector teacher disp_scale must be finite and positive")
+        self.selector_teacher_disp_normalize = str(selector_teacher_disp_normalize)
+        if self.selector_teacher_disp_normalize not in {"scene", "absolute"}:
+            raise ValueError("selector teacher disp_normalize must be scene or absolute")
+        self.selector_ranking_loss_weight = float(selector_ranking_loss_weight)
+        self.selector_ranking_margin = float(selector_ranking_margin)
+        self.selector_ranking_max_pairs = int(selector_ranking_max_pairs)
+        if not math.isfinite(self.selector_ranking_loss_weight) or self.selector_ranking_loss_weight < 0:
+            raise ValueError("selector ranking loss weight must be finite and non-negative")
+        if not math.isfinite(self.selector_ranking_margin) or self.selector_ranking_margin < 0:
+            raise ValueError("selector ranking margin must be finite and non-negative")
+        if self.selector_ranking_max_pairs <= 0:
+            raise ValueError("selector ranking max pairs must be positive")
+        self.selector_critical_token_mode = str(selector_critical_token_mode)
+        if self.selector_critical_token_mode not in {"none", "provided", "boxes"}:
+            raise ValueError("selector critical token mode must be none, provided, or boxes")
+        self.selector_critical_token_dilation = float(selector_critical_token_dilation)
+        if not math.isfinite(self.selector_critical_token_dilation) or self.selector_critical_token_dilation < 0:
+            raise ValueError("selector critical token dilation must be finite and non-negative")
+        self.selector_long_horizon_weights = parse_horizon_weights(
+            selector_long_horizon_weights
+        )
+        if self.selector_counterfactual_dump_dir is not None:
+            self.selector_counterfactual_dump_dir.mkdir(parents=True, exist_ok=True)
+        self.selector_teacher_timesteps = [
+            float(value.strip())
+            for value in str(selector_teacher_timesteps).split(",")
+            if value.strip()
+        ]
+        if any(
+            not math.isfinite(value) or value < 0.0 or value > 1000.0
+            for value in self.selector_teacher_timesteps
+        ):
+            raise ValueError("selector teacher timesteps must be finite values in [0, 1000]")
+        if self.selector is not None and selector_checkpoint:
+            selector_path = Path(selector_checkpoint).expanduser().resolve()
+            if not selector_path.is_file():
+                raise FileNotFoundError(f"selector checkpoint not found: {selector_path}")
+            state = load_state_dict(str(selector_path))
+            if isinstance(state, dict) and isinstance(state.get("state_dict"), dict):
+                state = state["state_dict"]
+            normalized = {}
+            for key, value in state.items():
+                name = str(key)
+                if name.startswith("module."):
+                    name = name[len("module.") :]
+                if name.startswith("selector."):
+                    name = name[len("selector.") :]
+                normalized[name] = value
+            missing, unexpected = self.selector.load_state_dict(normalized, strict=False)
+            incompatible_missing = [
+                key
+                for key in missing
+                if not key.startswith(
+                    ("context_mlp.", "context_scoring.", "timestep_mlp.", "timestep_scoring.")
+                )
+            ]
+            if incompatible_missing or unexpected:
+                raise ValueError(
+                    f"incompatible selector checkpoint {selector_path}: "
+                    f"missing={incompatible_missing}, unexpected={unexpected}"
+                )
+            print(f"[selector] initialized from {selector_path}")
+        self.global_step = 0
 
         model_configs = [
             ModelConfig(
@@ -591,6 +1086,223 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
             lora_checkpoint=lora_checkpoint,
         )
 
+    # ------------------------------------------------------------------
+    # Counterfactual teacher helpers (review P0/P1/P3, 2026-09-11)
+    # ------------------------------------------------------------------
+    def _counterfactual_probe_specs(
+        self, event: int, world_size: int, rank: int, group_count: int
+    ) -> list[dict]:
+        """Return the interventions to probe in this step.
+
+        Each spec is ``{"tiles": (...), "removal_count": n, "anchor_tile": t}``.
+        ``selector_counterfactual_scales`` (perturbation-size sweep) takes
+        precedence, then exhaustive tile sweep, then the historical single-tile
+        rotation.
+        """
+        if self.selector_counterfactual_scales:
+            specs = []
+            for scale in self.selector_counterfactual_scales:
+                count = max(1, min(int(scale), group_count))
+                offset = (event * max(1, world_size) + rank) % group_count
+                tiles = tuple(sorted((offset + step) % group_count for step in range(count)))
+                specs.append(
+                    {"tiles": tiles, "removal_count": count, "anchor_tile": offset}
+                )
+            return specs
+        if self.selector_counterfactual_sweep_all:
+            return [
+                {"tiles": (tile,), "removal_count": 1, "anchor_tile": tile}
+                for tile in range(group_count)
+            ]
+        anchor = (event * world_size + rank) % group_count
+        return [{"tiles": (anchor,), "removal_count": 1, "anchor_tile": anchor}]
+
+    def _counterfactual_mask(
+        self, positions: torch.Tensor, spec: dict, *, latent_index: int = 0
+    ):
+        """Keep-mask and membership for one spec (possibly several tiles).
+
+        ``positions`` is the (t, y, x) grid of the conditioned history latent
+        selected by ``latent_index`` (0 == newest).  Every history latent shares
+        the same patch grid, so the tile membership is latent-independent; the
+        token range the mask is applied to is selected downstream by
+        ``counterfactual_latent_index`` inside ``model_fn_wan_video``.
+        """
+        membership = None
+        for tile in spec["tiles"]:
+            _, single = spatial_counterfactual_probe(
+                positions,
+                int(tile),
+                tile_h=self.selector_counterfactual_tile_h,
+                tile_w=self.selector_counterfactual_tile_w,
+            )
+            membership = single if membership is None else (membership | single)
+        # A spec whose tiles contain no tokens at all is a bug in the grid
+        # arithmetic.  Removing *all* tiles is legitimate (whole-frame deletion)
+        # and the pipeline restores the sequence length by scattering the kept
+        # tokens back into a zero tensor.
+        if membership is None or not membership.any(dim=1).all():
+            raise ValueError(f"counterfactual spec {spec} selects no tokens")
+        if int(latent_index) != int(spec.get("latent_index", latent_index)):
+            raise ValueError(
+                "counterfactual latent index mismatch between spec and probe loop"
+            )
+        return (~membership).to(dtype=positions.dtype), membership
+
+    def _counterfactual_replay_noise(
+        self, replay_index: int, reference: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor]:
+        """A fresh but reproducible video-noise realisation.
+
+        Changing the video noise is what changes the planning residual
+        direction, which is the quantity that turns the per-probe sign into a
+        coin flip; averaging over realisations replaces it with its mean.
+        """
+        if reference is None:
+            return None
+        generator = torch.Generator("cpu").manual_seed(
+            int(self.selector_counterfactual_noise_seed) + int(replay_index) * 104729
+        )
+        noise = torch.randn(
+            tuple(reference.shape), generator=generator, dtype=torch.float32
+        )
+        return noise.to(device=reference.device, dtype=reference.dtype)
+
+    @staticmethod
+    def _with_noise(
+        base: dict,
+        noise_override: Optional[torch.Tensor],
+        trajectory_noise: Optional[torch.Tensor],
+    ) -> dict:
+        out = dict(base)
+        if noise_override is not None:
+            out["noise"] = noise_override
+        out["forced_trajectory_noise"] = trajectory_noise
+        return out
+
+    @staticmethod
+    def _mean_relative_displacement(trajectory_records: list) -> float:
+        values = [
+            float(record["counterfactual_traj_disp_relative"])
+            for record in trajectory_records
+            if "counterfactual_traj_disp_relative" in record
+        ]
+        return float(sum(values) / len(values)) if values else 0.0
+
+    @staticmethod
+    def _mean_trajectory_metric(trajectory_records: list, key: str) -> float:
+        values = [float(record[key]) for record in trajectory_records if key in record]
+        if not values:
+            raise RuntimeError(f"counterfactual trajectory metric {key!r} is missing")
+        return float(sum(values) / len(values))
+
+    @staticmethod
+    def _counterfactual_shard_tag(spec: dict, specs: list) -> str:
+        """Stable per-probe file tag.
+
+        ``tile-NN`` (the historical name) whenever every spec addresses a
+        distinct (latent, tile) pair, otherwise the removal-size tag.  When more
+        than one history latent is probed in the same step the latent index is
+        prefixed so the two probes of one tile cannot overwrite each other.
+        """
+        pairs = {(int(item.get("latent_index", 0)), int(item["anchor_tile"])) for item in specs}
+        if len(specs) == 1 or len(pairs) == len(specs):
+            tag = "tile-%02d" % int(spec["anchor_tile"])
+        else:
+            tag = "rm%02d" % int(spec["removal_count"])
+        if len({latent for latent, _ in pairs}) > 1:
+            tag = "latent%02d-%s" % (int(spec.get("latent_index", 0)), tag)
+        return tag
+
+    def _append_replay_labels(
+        self, *, rank: int, specs: list, spec_deltas: list
+    ) -> None:
+        """Add the noise-averaged label to each spec's first-replay shard."""
+        shard_dir = Path(self.selector_counterfactual_dump_dir) / f"rank{int(rank)}"
+        for spec_position, spec in enumerate(specs):
+            deltas = spec_deltas[spec_position]
+            tag = self._counterfactual_shard_tag(spec, specs)
+            path = shard_dir / f"step-{int(self.global_step):06d}-{tag}.pt"
+            if not path.is_file():
+                continue
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+            payload["replay_deltas"] = [float(value) for value in deltas]
+            payload["delta_mean_over_replays"] = float(sum(deltas) / len(deltas))
+            payload["delta_std_over_replays"] = float(
+                statistics.pstdev(deltas) if len(deltas) > 1 else 0.0
+            )
+            payload["sign_agreement_over_replays"] = float(
+                max(
+                    sum(1 for value in deltas if value >= 0),
+                    sum(1 for value in deltas if value < 0),
+                )
+                / len(deltas)
+            )
+            tmp_path = path.with_suffix(".pt.tmp")
+            torch.save(payload, tmp_path)
+            os.replace(tmp_path, path)
+
+    def _counterfactual_replicate_controls(
+        self,
+        models: dict,
+        probe_inputs: dict,
+        probe_base: dict,
+        probe_mask: torch.Tensor,
+        baseline_unweighted: torch.Tensor,
+        replay_traj_noise: torch.Tensor,
+        first_masked_loss: Optional[torch.Tensor] = None,
+    ) -> dict:
+        """Determinism controls: replicate the masked forward and probe the
+        identity (all-keep) mask.  Any spread here is the resolution limit of
+        the counterfactual label."""
+        metrics: dict = {}
+        replicate_deltas = []
+        for _ in range(self.selector_counterfactual_replicate):
+            with torch.no_grad():
+                repeat_result = self.pipe.training_loss(
+                    **models, **probe_inputs, return_loss_breakdown=True
+                )
+            repeat_unweighted = repeat_result.get(
+                "trajectory_loss_unweighted", repeat_result["trajectory_loss"]
+            )
+            replicate_deltas.append(
+                _probe_relative_delta(baseline_unweighted, repeat_unweighted)
+            )
+        metrics["counterfactual_control_mask_delta"] = float(replicate_deltas[0])
+        metrics["counterfactual_control_mask_delta_max"] = float(
+            max(abs(value) for value in replicate_deltas)
+        )
+        if first_masked_loss is not None:
+            metrics["counterfactual_control_mask_loss_first"] = float(
+                first_masked_loss.detach().float().reshape(-1)[0]
+            )
+            metrics["counterfactual_control_mask_loss_repeat"] = float(
+                repeat_result.get(
+                    "trajectory_loss_unweighted", repeat_result["trajectory_loss"]
+                )
+                .detach()
+                .float()
+                .reshape(-1)[0]
+            )
+        identity_inputs = dict(probe_inputs)
+        identity_inputs["counterfactual_history_token_mask"] = torch.ones_like(
+            probe_mask
+        )
+        with torch.no_grad():
+            identity_result = self.pipe.training_loss(
+                **models, **identity_inputs, return_loss_breakdown=True
+            )
+        identity_unweighted = identity_result.get(
+            "trajectory_loss_unweighted", identity_result["trajectory_loss"]
+        )
+        metrics["counterfactual_control_identity_delta"] = float(
+            _probe_relative_delta(baseline_unweighted, identity_unweighted)
+        )
+        metrics["counterfactual_control_identity_loss"] = float(
+            identity_unweighted.detach().float().reshape(-1)[0]
+        )
+        return metrics
+
     def forward_preprocess(self, data: Dict[str, Any]) -> Dict[str, Any]:
         inputs_posi = {"prompt": data["prompt"]}
         inputs_nega = {"negative_prompt": self.negative_prompt}
@@ -610,11 +1322,21 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
             "min_timestep_boundary": self.min_timestep_boundary,
             "target_fps": self.target_fps,
         }
+        if self.enable_online_selector and self.selector_teacher_seed is not None:
+            # Match official inference: video uses seed N and trajectory uses
+            # the independent N+1 stream. This removes RNG noise from signed
+            # counterfactual labels while preserving the normal training path.
+            inputs_shared["seed"] = self.selector_teacher_seed
+            inputs_shared["fixed_trajectory_noise_seed"] = self.selector_teacher_seed + 1
 
         if "trajectory" in data:
             inputs_shared["trajectory"] = data["trajectory"]
         if "ego_vel" in data:
             inputs_shared["ego_vel"] = data["ego_vel"]
+            inputs_shared["ego_state"] = data["ego_vel"][..., :2]
+        if "driving_command" in data:
+            inputs_shared["driving_command"] = data["driving_command"]
+            inputs_shared["command"] = data["driving_command"]
         if self.pipe.trajectory_condition_mode in {"auto", "history"} and "history_positions" in data:
             inputs_shared["history_positions"] = data["history_positions"]
 
@@ -640,11 +1362,711 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
             )
         return {**inputs_shared, **inputs_posi}
 
-    def forward(self, data, inputs=None):
+    def forward(self, data, inputs=None, global_step=None):
         if inputs is None:
             inputs = self.forward_preprocess(data)
+        if global_step is not None:
+            self.global_step = int(global_step)
+        teacher_step = self.enable_online_selector and self.global_step >= self.selector_warmup_steps and self.global_step % self.selector_gradient_interval == 0
+        counterfactual_step = (
+            teacher_step
+            and self.selector_teacher_mode in {"signed_hybrid", "displacement"}
+            and self.global_step % self.selector_counterfactual_interval == 0
+        )
+        if counterfactual_step and self.selector_teacher_timesteps:
+            world_size = 1
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                world_size = torch.distributed.get_world_size()
+            group_count = self.selector_counterfactual_tile_h * self.selector_counterfactual_tile_w
+            counterfactual_event = self.global_step // self.selector_counterfactual_interval
+            events_per_spatial_sweep = max(1, math.ceil(group_count / world_size))
+            timestep_index = (
+                counterfactual_event // events_per_spatial_sweep
+            ) % len(self.selector_teacher_timesteps)
+            inputs["forced_training_timestep"] = self.selector_teacher_timesteps[
+                timestep_index
+            ]
+        sparse_step = self.enable_online_selector and self.selector_mask_start_step >= 0 and self.global_step >= self.selector_mask_start_step
+        if teacher_step:
+            inputs["capture_history_tokens"] = True
+            inputs["capture_planning_graph"] = not counterfactual_step
+            inputs["capture_training_replay"] = counterfactual_step
+            inputs["selector_layer"] = self.selector_layer
+        if counterfactual_step:
+            # The main (baseline) forward captures the token grid of the first
+            # requested history latent; every probe below then re-points the
+            # mask at its own latent.  Default index 0 keeps the historical
+            # newest-latent behaviour bit-identical.
+            inputs["counterfactual_latent_index"] = int(
+                self.selector_counterfactual_latent_indices[0]
+            )
+        if sparse_step and not teacher_step and hasattr(self, "_selector_mask"):
+            inputs["history_token_mask"] = self._selector_mask
         models = {name: getattr(self.pipe, name) for name in self.pipe.in_iteration_models}
-        return self.pipe.training_loss(**models, **inputs, return_loss_breakdown=True)
+        if counterfactual_step:
+            with torch.no_grad():
+                result = self.pipe.training_loss(**models, **inputs, return_loss_breakdown=True)
+        else:
+            result = self.pipe.training_loss(**models, **inputs, return_loss_breakdown=True)
+        if not self.enable_online_selector or self.selector is None:
+            return result
+        tokens = inputs.get("history_tokens")
+        tokens = getattr(self.pipe, "_last_history_tokens", None)
+        positions = getattr(self.pipe, "_last_token_positions", None)
+        planning_loss = result.get("planning_loss_for_teacher")
+        if not teacher_step or tokens is None:
+            return result
+        ratio = keep_ratio_at_step(self.global_step, self.selector_warmup_steps, self.selector_keep_schedule)
+        teacher_start = time.perf_counter()
+        ego_state = inputs.get("ego_state")
+        command = inputs.get("command")
+        if positions is None or ego_state is None or command is None:
+            raise RuntimeError("Online selector requires real token positions, ego_state, and driving command")
+        if ego_state.ndim == 1: ego_state = ego_state.unsqueeze(0)
+        if command.ndim == 1: command = command.unsqueeze(0)
+        positions = positions.unsqueeze(0).expand(tokens.shape[0], -1, -1)
+        critical_token_mask = None
+        if self.selector_critical_token_mode == "provided":
+            if not isinstance(data, dict) or data.get("critical_token_mask") is None:
+                raise RuntimeError(
+                    "selector critical-token mode=provided requires data['critical_token_mask']"
+                )
+            critical_token_mask = torch.as_tensor(
+                data["critical_token_mask"], device=tokens.device, dtype=torch.bool
+            )
+            if critical_token_mask.ndim == 1:
+                critical_token_mask = critical_token_mask.unsqueeze(0)
+            logits_shape = (tokens.shape[0], tokens.shape[1])
+            if critical_token_mask.shape != logits_shape:
+                raise ValueError(
+                    "critical_token_mask must match selector candidates "
+                    f"{logits_shape}, got {tuple(critical_token_mask.shape)}"
+                )
+        elif self.selector_critical_token_mode == "boxes":
+            if not isinstance(data, dict) or data.get("critical_object_boxes_yxyx") is None:
+                raise RuntimeError(
+                    "selector critical-token mode=boxes requires "
+                    "data['critical_object_boxes_yxyx']"
+                )
+            critical_token_mask = critical_box_token_mask(
+                positions,
+                torch.as_tensor(data["critical_object_boxes_yxyx"]),
+                box_valid=data.get("critical_object_box_valid"),
+                dilation=self.selector_critical_token_dilation,
+            )
+        if not hasattr(self, "_selector_condition_logged"):
+            print("[selector] condition:", f"history_tokens={tuple(tokens.shape)}", f"token_positions={tuple(positions.shape)}", f"ego_state={tuple(ego_state.shape)}", f"driving_command={tuple(command.shape)}", f"token_mean={tokens.detach().float().mean():.5f}", f"token_std={tokens.detach().float().std():.5f}", f"position_range=({positions.min():.3f},{positions.max():.3f})", f"ego_sample={ego_state[0].tolist()}", f"command_sample={command[0].tolist()}")
+            self._selector_condition_logged = True
+        selector_timestep = getattr(self.pipe, "_last_training_timestep", None)
+        logits = self.selector(
+            tokens.detach(), positions, ego_state, command, timestep=selector_timestep
+        )
+        counterfactual_metrics = {}
+        if counterfactual_step:
+            world_size = 1
+            rank = 0
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                world_size = torch.distributed.get_world_size()
+                rank = torch.distributed.get_rank()
+            group_count = self.selector_counterfactual_tile_h * self.selector_counterfactual_tile_w
+            # ``counterfactual_step`` only fires every N optimizer steps.  Using
+            # the raw global step here can alias with the tile-grid size, so
+            # index by counterfactual events instead (review defect C).
+            counterfactual_event = self.global_step // self.selector_counterfactual_interval
+            # A "probe spec" is one intervention: a removal size (in tiles) and
+            # the concrete tile subset that is removed.  The same spec is
+            # repeated for every requested history latent; the extra
+            # ``latent_index`` key selects which conditioned history latent's
+            # token range the mask is applied to.
+            base_specs = self._counterfactual_probe_specs(
+                counterfactual_event, world_size, rank, group_count
+            )
+            specs = [
+                {**spec, "latent_index": int(latent_index)}
+                for latent_index in self.selector_counterfactual_latent_indices
+                for spec in base_specs
+            ]
+            conditioned_latents = None
+            longcat_latents = inputs.get("longcat_latents")
+            if torch.is_tensor(longcat_latents) and longcat_latents.ndim >= 3:
+                conditioned_latents = int(longcat_latents.shape[2])
+            if conditioned_latents is not None:
+                for latent_index in self.selector_counterfactual_latent_indices:
+                    if latent_index > conditioned_latents - 1:
+                        raise ValueError(
+                            "counterfactual latent index "
+                            f"{latent_index} exceeds the {conditioned_latents} "
+                            "conditioned history latents available in this batch"
+                        )
+            replay_timestep = getattr(self.pipe, "_last_training_timestep", None)
+            replay_traj_noise = getattr(self.pipe, "_last_trajectory_noise", None)
+            if replay_timestep is None or replay_traj_noise is None:
+                raise RuntimeError("counterfactual teacher did not capture replay state")
+            probe_base = dict(inputs)
+            probe_base.update(
+                {
+                    "capture_history_tokens": False,
+                    "capture_planning_graph": False,
+                    "capture_training_replay": False,
+                    "forced_training_timestep": replay_timestep,
+                    "counterfactual_layer": self.selector_layer,
+                    "counterfactual_physical_prune": self.selector_counterfactual_physical,
+                    "return_traj_pred": True,
+                    "use_gradient_checkpointing": False,
+                    "use_gradient_checkpointing_offload": False,
+                }
+            )
+            reference_unweighted = result.get(
+                "trajectory_loss_unweighted", result["trajectory_loss"]
+            )
+            replay_timestep_float = replay_timestep.detach().float()
+            # label[spec][replay] -> signed relative loss change
+            spec_deltas = [[] for _ in specs]
+            spec_trajectory = [[] for _ in specs]
+            spec_baseline_loss = []
+            member_rows = []
+            baseline_loss_values = []
+            tile_records = []
+
+            for replay_index in range(self.selector_counterfactual_replays):
+                if replay_index == 0:
+                    # Reuse the baseline that the ordinary training path already
+                    # produced, so the default single-replay behaviour is
+                    # bit-identical to the pre-2026-09-11 teacher.
+                    baseline_result = result
+                    baseline_unweighted = reference_unweighted
+                    noise_override = None
+                    traj_noise_override = replay_traj_noise
+                else:
+                    # A different noise realisation is exactly what changes the
+                    # planning residual direction, which is the quantity that
+                    # makes the per-probe sign a coin flip (see report
+                    # dynamic_token_learnability_verdict_20260911 section 7).
+                    noise_override = self._counterfactual_replay_noise(
+                        replay_index, inputs.get("noise")
+                    )
+                    traj_noise_override = torch.randn_like(
+                        replay_traj_noise.detach().float()
+                    ).to(dtype=replay_traj_noise.dtype, device=replay_traj_noise.device)
+                    with torch.no_grad():
+                        baseline_result = self.pipe.training_loss(
+                            **models,
+                            **self._with_noise(
+                                probe_base, noise_override, traj_noise_override
+                            ),
+                            return_loss_breakdown=True,
+                        )
+                    baseline_unweighted = baseline_result.get(
+                        "trajectory_loss_unweighted",
+                        baseline_result["trajectory_loss"],
+                    )
+                baseline_loss_values.append(
+                    float(baseline_unweighted.detach().float().reshape(-1)[0])
+                )
+                for spec_position, spec in enumerate(specs):
+                    probe_mask, membership = self._counterfactual_mask(
+                        positions, spec, latent_index=int(spec["latent_index"])
+                    )
+                    probe_inputs = self._with_noise(
+                        probe_base, noise_override, traj_noise_override
+                    )
+                    probe_inputs["counterfactual_history_token_mask"] = probe_mask
+                    probe_inputs["counterfactual_latent_index"] = int(
+                        spec["latent_index"]
+                    )
+                    with torch.no_grad():
+                        masked_result = self.pipe.training_loss(
+                            **models, **probe_inputs, return_loss_breakdown=True
+                        )
+                    masked_unweighted = masked_result.get(
+                        "trajectory_loss_unweighted", masked_result["trajectory_loss"]
+                    )
+                    measured_delta = _probe_relative_delta(
+                        baseline_unweighted, masked_unweighted
+                    )
+                    spec_deltas[spec_position].append(measured_delta)
+                    trajectory_divergence = _trajectory_divergence(
+                        baseline_result.get("trajectory_pred"),
+                        masked_result.get("trajectory_pred"),
+                        prefix_len=int(
+                            baseline_result.get("trajectory_prefix_len", 0) or 0
+                        ),
+                        horizon_weights=self.selector_long_horizon_weights,
+                        target_fps=self.target_fps,
+                    )
+                    spec_trajectory[spec_position].append(trajectory_divergence)
+                    if replay_index != 0:
+                        continue
+                    # Per-probe record, metrics and diagnostics use the first
+                    # realisation so that single-replay runs are unchanged.
+                    group_logits = logits.detach()[membership]
+                    group_probabilities = torch.sigmoid(group_logits.float())
+                    record = {
+                        "group_index": int(spec["anchor_tile"]),
+                        "latent_index": int(spec["latent_index"]),
+                        "removal_count": int(spec["removal_count"]),
+                        "removal_tiles": list(spec["tiles"]),
+                        "measured_delta": measured_delta,
+                        "baseline_loss": float(
+                            baseline_unweighted.detach().float().reshape(-1)[0]
+                        ),
+                        "masked_loss": float(
+                            masked_unweighted.detach().float().reshape(-1)[0]
+                        ),
+                        "helpful_target": float((measured_delta >= 0)),
+                        "confidence": float(
+                            min(
+                                abs(measured_delta)
+                                / float(self.selector_counterfactual_scale),
+                                1.0,
+                            )
+                        ),
+                        "group_logit": float(group_logits.mean().item()),
+                        "group_probability_mean": float(
+                            group_probabilities.mean().item()
+                        ),
+                        "group_probability_std": float(
+                            group_probabilities.std(unbiased=False).item()
+                        ),
+                        "trajectory": trajectory_divergence,
+                    }
+                    tile_records.append(record)
+                    member_rows.append(membership)
+                    if self.selector_counterfactual_jsonl_dir is not None:
+                        with torch.no_grad():
+                            tile_rows = membership.detach()[0].bool()
+                            tile_pos_mean = (
+                                positions.detach()[0][tile_rows].float().mean(dim=0)
+                            )
+                        history_positions = (
+                            data.get("history_positions")
+                            if isinstance(data, dict)
+                            else None
+                        )
+                        history_rows = None
+                        if torch.is_tensor(history_positions):
+                            history_rows = (
+                                history_positions.detach()
+                                .float()
+                                .reshape(-1, history_positions.shape[-1])[:, :3]
+                                .cpu()
+                                .tolist()
+                            )
+                        _append_counterfactual_jsonl(
+                            self.selector_counterfactual_jsonl_dir
+                            / f"rank{int(rank)}.jsonl",
+                            {
+                                "scene_token": _flatten_sample_token(
+                                    data.get("token") if isinstance(data, dict) else None
+                                ),
+                                "global_step": int(self.global_step),
+                                "tile": int(spec["anchor_tile"]),
+                                "latent_index": int(spec["latent_index"]),
+                                "relative_delta": float(measured_delta),
+                                "counterfactual_traj_disp_relative": float(
+                                    trajectory_divergence.get(
+                                        "counterfactual_traj_disp_relative", float("nan")
+                                    )
+                                ),
+                                "counterfactual_traj_disp_mean": float(
+                                    trajectory_divergence.get(
+                                        "counterfactual_traj_disp_mean", float("nan")
+                                    )
+                                ),
+                                "counterfactual_traj_disp_max": float(
+                                    trajectory_divergence.get(
+                                        "counterfactual_traj_disp_max", float("nan")
+                                    )
+                                ),
+                                "counterfactual_traj_disp_long_horizon_relative": float(
+                                    trajectory_divergence.get(
+                                        "counterfactual_traj_disp_long_horizon_relative",
+                                        float("nan"),
+                                    )
+                                ),
+                                "tile_pos_t": float(tile_pos_mean[0]),
+                                "tile_pos_y": float(tile_pos_mean[1]),
+                                "tile_pos_x": float(tile_pos_mean[2]),
+                                "ego_vx": float(ego_state.detach()[0, 0]),
+                                "ego_vy": float(ego_state.detach()[0, 1]),
+                                "command": [
+                                    float(value)
+                                    for value in command.detach()[0].reshape(-1)[:3]
+                                ],
+                                "baseline_loss": float(
+                                    baseline_unweighted.detach().float().reshape(-1)[0]
+                                ),
+                                "masked_loss": float(
+                                    masked_unweighted.detach().float().reshape(-1)[0]
+                                ),
+                                "conditioned_latents": conditioned_latents,
+                                # Layer at which the tile mask was applied.  The
+                                # replay forward takes this from
+                                # ``self.selector_layer``, so recording it makes
+                                # the cross-layer importance scan (P2 of
+                                # reports/next_steps_plan_20260911.md)
+                                # self-traceable instead of relying on a config
+                                # sidecar.
+                                "counterfactual_layer": int(self.selector_layer),
+                                "teacher_timestep": float(
+                                    replay_timestep_float.reshape(-1)[0]
+                                ),
+                                "history_positions": history_rows,
+                                "run_id": os.environ.get("DRIVEVA_RUN_ID"),
+                            },
+                        )
+                    if self.selector_counterfactual_replicate > 0 and spec_position == 0:
+                        counterfactual_metrics.update(
+                            self._counterfactual_replicate_controls(
+                                models,
+                                probe_inputs,
+                                probe_base,
+                                probe_mask,
+                                baseline_unweighted,
+                                replay_traj_noise,
+                                masked_unweighted,
+                            )
+                        )
+                    if self.selector_counterfactual_dump_dir is not None:
+                        _dump_counterfactual_probe(
+                            self.selector_counterfactual_dump_dir,
+                            rank=rank,
+                            global_step=self.global_step,
+                            sample_token=data.get("token")
+                            if isinstance(data, dict)
+                            else None,
+                            tokens=tokens,
+                            positions=positions,
+                            ego_state=ego_state,
+                            command=command,
+                            selector_timestep=selector_timestep,
+                            logits=logits,
+                            membership=membership,
+                            group_index=int(spec["anchor_tile"]),
+                            baseline_loss=baseline_unweighted,
+                            masked_loss=masked_unweighted,
+                            relative_delta=measured_delta,
+                            helpful_target=record["helpful_target"],
+                            confidence=record["confidence"],
+                            trajectory_metrics=trajectory_divergence,
+                            extra={
+                                "removal_count": int(spec["removal_count"]),
+                                "removal_tiles": list(spec["tiles"]),
+                                "spec_index": int(spec_position),
+                                "replays": int(self.selector_counterfactual_replays),
+                                "run_id": os.environ.get("DRIVEVA_RUN_ID"),
+                            },
+                            shard_tag=self._counterfactual_shard_tag(spec, specs),
+                        )
+            # ---- multi-replay label (review P3-1 noise averaging) -----------
+            if self.selector_counterfactual_dump_dir is not None and (
+                self.selector_counterfactual_replays > 1
+            ):
+                # The averaged label only exists once every replay has run, so it
+                # is appended to the shard written by the first replay.
+                self._append_replay_labels(
+                    rank=rank,
+                    specs=specs,
+                    spec_deltas=spec_deltas,
+                )
+            for spec_position, spec in enumerate(specs):
+                deltas = spec_deltas[spec_position]
+                if self.selector_counterfactual_replays > 1:
+                    counterfactual_metrics[
+                        f"counterfactual_mean_delta_spec{spec_position}"
+                    ] = float(sum(deltas) / len(deltas))
+                    counterfactual_metrics[
+                        f"counterfactual_std_delta_spec{spec_position}"
+                    ] = float(
+                        statistics.pstdev(deltas) if len(deltas) > 1 else 0.0
+                    )
+                    counterfactual_metrics[
+                        f"counterfactual_sign_agreement_spec{spec_position}"
+                    ] = float(
+                        max(sum(1 for value in deltas if value >= 0),
+                            sum(1 for value in deltas if value < 0))
+                        / len(deltas)
+                    )
+            if self.selector_counterfactual_replays > 1:
+                agreement = [
+                    counterfactual_metrics[
+                        f"counterfactual_sign_agreement_spec{position}"
+                    ]
+                    for position in range(len(specs))
+                ]
+                mean_deltas = [
+                    counterfactual_metrics[f"counterfactual_mean_delta_spec{position}"]
+                    for position in range(len(specs))
+                ]
+                single_deltas = [spec_deltas[position][0] for position in range(len(specs))]
+                counterfactual_metrics["counterfactual_replays"] = float(
+                    self.selector_counterfactual_replays
+                )
+                counterfactual_metrics["counterfactual_sign_agreement_mean"] = float(
+                    sum(agreement) / len(agreement)
+                )
+                counterfactual_metrics["counterfactual_mean_delta"] = float(
+                    sum(mean_deltas) / len(mean_deltas)
+                )
+                counterfactual_metrics["counterfactual_replay_std_mean"] = float(
+                    sum(
+                        counterfactual_metrics[
+                            f"counterfactual_std_delta_spec{position}"
+                        ]
+                        for position in range(len(specs))
+                    )
+                    / len(specs)
+                )
+                # How much of the single-realisation spread survives averaging:
+                # the ratio of between-spec spread to within-spec spread is the
+                # signal-to-noise of the averaged label.
+                counterfactual_metrics["counterfactual_single_delta_std"] = float(
+                    statistics.pstdev(single_deltas)
+                    if len(single_deltas) > 1
+                    else 0.0
+                )
+                counterfactual_metrics["counterfactual_mean_delta_std"] = float(
+                    statistics.pstdev(mean_deltas) if len(mean_deltas) > 1 else 0.0
+                )
+            # ---- supervision -------------------------------------------------
+            primary_positions = list(range(len(specs)))
+            stacked_membership = torch.cat(
+                [member_rows[position] for position in primary_positions], dim=0
+            )
+            stacked_logits = logits.repeat(len(primary_positions), 1)
+            if self.selector_counterfactual_replays > 1:
+                label_deltas = torch.tensor(
+                    [
+                        counterfactual_metrics[
+                            f"counterfactual_mean_delta_spec{position}"
+                        ]
+                        for position in primary_positions
+                    ],
+                    device=reference_unweighted.device,
+                    dtype=reference_unweighted.dtype,
+                )
+                baseline_tensor = torch.tensor(
+                    baseline_loss_values,
+                    device=reference_unweighted.device,
+                    dtype=reference_unweighted.dtype,
+                ).mean()
+                masked_tensor = baseline_tensor * (1.0 + label_deltas)
+            else:
+                masked_tensor = torch.tensor(
+                    [record["masked_loss"] for record in tile_records],
+                    device=reference_unweighted.device,
+                    dtype=reference_unweighted.dtype,
+                )
+                baseline_tensor = reference_unweighted
+            if self.selector_teacher_mode == "displacement":
+                # Magnitude teacher (2026-09-11 verdict, section 12.2): the sign
+                # of the loss change is unlearnable, its geometric magnitude is
+                # not.  Displacement is averaged over replays when replays > 1.
+                displacement_key = (
+                    "counterfactual_traj_disp_long_horizon_relative"
+                    if self.selector_long_horizon_weights
+                    else "counterfactual_traj_disp_relative"
+                )
+                if self.selector_counterfactual_replays > 1:
+                    displacement_values = [
+                        self._mean_trajectory_metric(
+                            spec_trajectory[position], displacement_key
+                        )
+                        for position in range(len(specs))
+                    ]
+                else:
+                    displacement_values = [
+                        float(
+                            record["trajectory"].get(
+                                displacement_key, 0.0
+                            )
+                        )
+                        for record in tile_records
+                    ]
+                displacement_tensor = torch.tensor(
+                    displacement_values,
+                    device=reference_unweighted.device,
+                    dtype=torch.float32,
+                )
+                selector_loss, counterfactual_metrics_bce = displacement_token_bce(
+                    stacked_logits,
+                    stacked_membership,
+                    displacement_tensor,
+                    disp_scale=self.selector_teacher_disp_scale,
+                    normalize=self.selector_teacher_disp_normalize,
+                )
+                counterfactual_metrics["counterfactual_displacement_mean"] = float(
+                    displacement_tensor.mean()
+                )
+                counterfactual_metrics["counterfactual_displacement_target_key"] = (
+                    displacement_key
+                )
+            else:
+                selector_loss, counterfactual_metrics_bce = counterfactual_group_bce(
+                    stacked_logits,
+                    stacked_membership,
+                    baseline_tensor,
+                    masked_tensor,
+                    relative_scale=self.selector_counterfactual_scale,
+                    abstain_eps=self.selector_counterfactual_abstain_eps,
+                )
+            counterfactual_metrics.update(counterfactual_metrics_bce)
+            selector_loss = self.selector_counterfactual_weight * selector_loss
+            result["selector_bce_unweighted"] = torch.tensor(
+                float(counterfactual_metrics.get("counterfactual_unweighted_bce", 0.0)),
+                device=selector_loss.device,
+            )
+            scores = None
+            labels = (logits.detach() >= 0).float()
+            counterfactual_metrics["counterfactual_group_index"] = float(
+                sum(record["group_index"] for record in tile_records) / len(tile_records)
+            )
+            counterfactual_metrics["counterfactual_tiles_per_step"] = float(
+                len(primary_positions)
+            )
+            counterfactual_metrics["counterfactual_removal_count_mean"] = float(
+                sum(record["removal_count"] for record in tile_records)
+                / len(tile_records)
+            )
+            counterfactual_metrics["counterfactual_measured_delta_single"] = float(
+                sum(record["measured_delta"] for record in tile_records)
+                / len(tile_records)
+            )
+            # Spec-0, first-realisation delta: the historical single-probe label,
+            # kept so the existing summary tooling and the determinism control
+            # compare like with like.
+            counterfactual_metrics["counterfactual_measured_delta"] = float(
+                spec_deltas[0][0]
+            )
+            counterfactual_metrics["counterfactual_baseline_loss_unweighted"] = float(
+                sum(baseline_loss_values) / len(baseline_loss_values)
+            )
+            counterfactual_metrics["counterfactual_masked_loss_unweighted"] = float(
+                sum(record["masked_loss"] for record in tile_records)
+                / len(tile_records)
+            )
+            counterfactual_metrics["counterfactual_group_probability_mean"] = float(
+                sum(record["group_probability_mean"] for record in tile_records)
+                / len(tile_records)
+            )
+            counterfactual_metrics["counterfactual_group_probability_std"] = float(
+                sum(record["group_probability_std"] for record in tile_records)
+                / len(tile_records)
+            )
+            counterfactual_metrics["counterfactual_probability_mean"] = float(
+                torch.sigmoid(logits.detach().float()).mean().item()
+            )
+            counterfactual_metrics.update(
+                {
+                    "counterfactual_timestep_mean": float(
+                        replay_timestep_float.mean().item()
+                    ),
+                    "counterfactual_timestep_min": float(
+                        replay_timestep_float.min().item()
+                    ),
+                    "counterfactual_timestep_max": float(
+                        replay_timestep_float.max().item()
+                    ),
+                }
+            )
+            for key in (
+                "counterfactual_traj_disp_mean",
+                "counterfactual_traj_disp_max",
+                "counterfactual_traj_disp_final",
+                "counterfactual_traj_disp_relative",
+                "counterfactual_traj_disp_long_horizon",
+                "counterfactual_traj_disp_long_horizon_relative",
+                "counterfactual_traj_endpoint_disp",
+                "counterfactual_traj_scale",
+            ):
+                values = [
+                    record["trajectory"][key]
+                    for record in tile_records
+                    if key in record["trajectory"]
+                ]
+                if values:
+                    counterfactual_metrics[key] = float(sum(values) / len(values))
+        else:
+            if self.selector_teacher_mode == "displacement":
+                raise RuntimeError(
+                    "the displacement teacher needs the counterfactual probe; "
+                    "set --selector-counterfactual-interval 1"
+                )
+            if planning_loss is None:
+                raise RuntimeError("signed/gradient teacher requires planning loss graph")
+            if self.selector_teacher_mode == "signed_hybrid":
+                scores = signed_removal_scores(planning_loss, tokens, retain_graph=True)
+                labels = signed_soft_keep_labels(
+                    scores, temperature=self.selector_signed_temperature
+                )
+            else:
+                scores = gradient_input_scores(
+                    planning_loss,
+                    tokens,
+                    # DDP plus non-reentrant gradient checkpointing keeps shared
+                    # autograd bookkeeping until the outer loss backward completes.
+                    retain_graph=True,
+                )
+                labels = online_topk_labels(scores, self.selector_teacher_keep_ratio)
+            selector_loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, labels)
+        metric_labels = (
+            online_topk_labels(scores, self.selector_teacher_keep_ratio)
+            if scores is not None
+            else labels
+        )
+        # Keep ``selector_bce`` semantically stable for historical dashboards:
+        # it is the pre-ranking supervision term, while ``selector_total_loss``
+        # is the quantity actually optimized when the optional ranking term is
+        # enabled.
+        selector_bce = selector_loss
+        ranking_loss = selector_loss.new_zeros(())
+        if self.selector_ranking_loss_weight > 0 and scores is not None:
+            ranking_loss = selector_pairwise_ranking_loss(
+                logits,
+                metric_labels,
+                margin=self.selector_ranking_margin,
+                max_pairs=self.selector_ranking_max_pairs,
+            )
+            selector_loss = selector_loss + self.selector_ranking_loss_weight * ranking_loss
+        result["selector_bce"] = selector_bce.detach()
+        result["selector_ranking_loss"] = ranking_loss.detach()
+        result["selector_total_loss"] = selector_loss.detach()
+        sm = selector_metrics(logits, metric_labels)
+        result["selector_topk_overlap"] = torch.tensor(sm["selector_topk_overlap"], device=selector_loss.device)
+        result["selector_pairwise_accuracy"] = torch.tensor(
+            sm["selector_pairwise_accuracy"], device=selector_loss.device
+        )
+        result["selector_ndcg_at_k"] = torch.tensor(
+            sm["selector_ndcg_at_k"], device=selector_loss.device
+        )
+        result["selector_positive_logit_mean"] = sm["selector_mean_positive_logit"]
+        result["selector_negative_logit_mean"] = sm["selector_mean_negative_logit"]
+        result["current_keep_ratio"] = float(ratio)
+        result["teacher_positive_ratio"] = float(labels.mean())
+        if scores is not None:
+            result["gradient_score_mean"] = float(scores.mean().detach())
+            result["gradient_score_std"] = float(scores.std().detach())
+            result["gradient_score_max"] = float(scores.max().detach())
+            result["gradient_score_nonzero_ratio"] = float((scores > 0).float().mean().detach())
+            result["gradient_topk_count"] = int(metric_labels.sum(dim=1)[0].item())
+        result.update(counterfactual_metrics)
+        result["gradient_teacher_time_ms"] = (time.perf_counter() - teacher_start) * 1000.0
+        result["planning_loss"] = result.get("trajectory_loss")
+        if self.selector_only:
+            # The teacher backward has already consumed the frozen downstream
+            # graph.  Optimise only the lightweight selector BCE.
+            result["loss"] = self.selector_loss_weight * selector_loss
+        else:
+            result["loss"] = result["loss"] + self.selector_loss_weight * selector_loss
+        # Consumers can apply this to the history portion while preserving sequence length.
+        result["history_mask"] = hard_topk_mask(
+            logits, ratio, protected_mask=critical_token_mask
+        ).detach()
+        result["selector_protected_token_count"] = float(
+            critical_token_mask.sum().item() if critical_token_mask is not None else 0
+        )
+        self._selector_mask = result["history_mask"]
+        return result
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -657,6 +2079,19 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--use_cache_only", action="store_true")
     parser.add_argument("--force_cache_computation", action="store_true")
     parser.add_argument("--train_log_names", type=str, default=None)
+    parser.add_argument("--train_scene_manifest", type=str, default=None)
+    parser.add_argument(
+        "--forbidden_scene_manifest",
+        type=str,
+        default=None,
+        help="Comma-separated manifests whose semantic scene tokens must not occur in training.",
+    )
+    parser.add_argument(
+        "--allow_missing_route",
+        action="store_true",
+        help="Allow manifest-selected training scenes whose current frame has no route roadblocks.",
+    )
+    parser.add_argument("--windows_per_scene", type=int, default=1)
     parser.add_argument("--max_scenes", type=int, default=None)
     parser.add_argument("--frame_interval", type=int, default=None)
     parser.add_argument("--skip_missing_files", action="store_true")
@@ -678,6 +2113,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--lora_checkpoint", type=str, default=None)
 
     parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--seed", type=int, default=20260910)
     parser.add_argument("--num_epochs", type=int, default=8)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--dataset_num_workers", type=int, default=4)
@@ -735,17 +2171,172 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0)
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0)
+    parser.add_argument("--enable-online-selector", dest="enable_online_selector", action="store_true")
+    parser.add_argument("--selector-warmup-steps", type=int, default=0)
+    parser.add_argument("--selector-layer", type=int, default=15)
+    parser.add_argument("--selector-loss-weight", type=float, default=1.0)
+    parser.add_argument("--selector-input-variant", type=str, default="token_condition", choices=["token_condition"])
+    parser.add_argument(
+        "--selector-feature-mode",
+        type=str,
+        default="all",
+        choices=["all", "condition_position_time"],
+    )
+    parser.add_argument("--selector-keep-schedule", type=str, default="")
+    parser.add_argument("--selector-teacher-keep-ratio", type=float, default=0.375)
+    parser.add_argument("--selector-gradient-interval", type=int, default=1)
+    parser.add_argument("--selector-mask-start-step", type=int, default=-1)
+    parser.add_argument("--selector-only", action="store_true")
+    parser.add_argument("--selector-checkpoint", type=str, default=None)
+    parser.add_argument(
+        "--selector-teacher-mode",
+        type=str,
+        default="gradient_abs",
+        choices=["gradient_abs", "signed_hybrid", "displacement"],
+    )
+    parser.add_argument("--selector-signed-temperature", type=float, default=1.0)
+    parser.add_argument("--selector-counterfactual-interval", type=int, default=4)
+    parser.add_argument("--selector-counterfactual-weight", type=float, default=1.0)
+    parser.add_argument("--selector-counterfactual-scale", type=float, default=0.05)
+    parser.add_argument("--selector-counterfactual-tile-h", type=int, default=3)
+    parser.add_argument("--selector-counterfactual-tile-w", type=int, default=4)
+    parser.add_argument("--selector-counterfactual-physical", action="store_true")
+    parser.add_argument("--selector-teacher-timesteps", type=str, default="")
+    parser.add_argument("--selector-teacher-seed", type=int, default=None)
+    parser.add_argument(
+        "--selector-counterfactual-dump-dir",
+        type=str,
+        default=None,
+        help="optional directory receiving one .pt shard per counterfactual probe",
+    )
+    parser.add_argument(
+        "--selector-counterfactual-replicate",
+        type=int,
+        default=0,
+        help="repeat the masked forward N times to measure the label noise floor",
+    )
+    parser.add_argument(
+        "--selector-counterfactual-sweep-all",
+        action="store_true",
+        help="probe every spatial tile of the scene in one step (full label coverage)",
+    )
+    parser.add_argument(
+        "--selector-counterfactual-replays",
+        type=int,
+        default=1,
+        help="independent noise realisations averaged into one label",
+    )
+    parser.add_argument(
+        "--selector-counterfactual-scales",
+        type=str,
+        default="",
+        help="comma-separated removal sizes in tiles, probed in the same step",
+    )
+    parser.add_argument("--selector-counterfactual-abstain-eps", type=float, default=0.0)
+    parser.add_argument("--selector-counterfactual-noise-seed", type=int, default=1234)
+    parser.add_argument(
+        "--selector-counterfactual-latent-index",
+        type=str,
+        default=str(_env_first("SELECTOR_COUNTERFACTUAL_LATENT_INDEX", default="0")),
+        help=(
+            "conditioned history latent the counterfactual teacher probes, "
+            "counted back from the newest history latent (0 = newest, the "
+            "historical default); a comma-separated list probes several "
+            "latents in the same step"
+        ),
+    )
+    parser.add_argument(
+        "--selector-counterfactual-jsonl-dir",
+        type=str,
+        default=_env_first("SELECTOR_COUNTERFACTUAL_JSONL_DIR", default=""),
+        help=(
+            "optional directory receiving one compact JSON line per "
+            "(scene, tile, latent) probe instead of the 3072-d .pt shards"
+        ),
+    )
+    parser.add_argument("--run-id", type=str, default=None)
+    parser.add_argument("--selector-teacher-disp-scale", type=float, default=0.01)
+    parser.add_argument(
+        "--selector-teacher-disp-normalize",
+        type=str,
+        default="scene",
+        choices=["scene", "absolute"],
+    )
+    parser.add_argument(
+        "--selector-ranking-loss-weight",
+        type=float,
+        default=0.0,
+        help="auxiliary top-k ranking loss weight; 0 preserves the legacy objective",
+    )
+    parser.add_argument("--selector-ranking-margin", type=float, default=0.0)
+    parser.add_argument("--selector-ranking-max-pairs", type=int, default=4096)
+    parser.add_argument(
+        "--selector-critical-token-mode",
+        choices=["none", "provided", "boxes"],
+        default="none",
+        help="force provided token mask or projected yxyx object boxes into top-k",
+    )
+    parser.add_argument("--selector-critical-token-dilation", type=float, default=0.0)
+    parser.add_argument(
+        "--selector-long-horizon-weights",
+        type=str,
+        default="",
+        help="comma-separated seconds:weight target, e.g. 1:0.2,2:0.3,3:0.5",
+    )
 
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
+    process_seed = int(args.seed) + int(os.environ.get("RANK", "0"))
+    random.seed(process_seed)
+    np.random.seed(process_seed % (2**32))
+    torch.manual_seed(process_seed)
+    if args.selector_only and not args.enable_online_selector:
+        raise ValueError("--selector-only requires --enable-online-selector")
+    if args.selector_only and not args.full_ckpt:
+        raise ValueError("--selector-only requires a pretrained --full_ckpt teacher")
+    if args.selector_only and args.lora_checkpoint:
+        raise ValueError("--selector-only is incompatible with --lora_checkpoint")
+    if args.selector_only and args.selector_gradient_interval != 1:
+        raise ValueError("--selector-only requires --selector-gradient-interval 1")
+    if args.selector_only and args.selector_warmup_steps != 0:
+        raise ValueError("--selector-only requires --selector-warmup-steps 0")
+    if args.enable_online_selector and not 0 <= args.selector_layer < 30:
+        raise ValueError("--selector-layer must be in [0, 29]")
+    if args.enable_online_selector and not 0.0 < args.selector_teacher_keep_ratio <= 1.0:
+        raise ValueError("--selector-teacher-keep-ratio must be in (0, 1]")
+    if args.selector_signed_temperature <= 0:
+        raise ValueError("--selector-signed-temperature must be positive")
+    if args.selector_counterfactual_interval <= 0:
+        raise ValueError("--selector-counterfactual-interval must be positive")
+    if args.selector_counterfactual_weight < 0 or args.selector_counterfactual_scale <= 0:
+        raise ValueError("counterfactual weight must be non-negative and scale positive")
+    if args.selector_counterfactual_tile_h <= 0 or args.selector_counterfactual_tile_w <= 0:
+        raise ValueError("counterfactual tile dimensions must be positive")
+    latent_index_tokens = [
+        value.strip()
+        for value in str(args.selector_counterfactual_latent_index).split(",")
+        if value.strip()
+    ]
+    if not latent_index_tokens:
+        raise ValueError("--selector-counterfactual-latent-index must not be empty")
+    for token in latent_index_tokens:
+        if not token.lstrip("+-").isdigit() or int(token) < 0:
+            raise ValueError(
+                "--selector-counterfactual-latent-index must be a non-negative "
+                f"integer or comma-separated list of them, got '{token}'"
+            )
+    if args.enable_online_selector and args.selector_mask_start_step >= 0 and args.selector_mask_start_step <= args.selector_warmup_steps:
+        raise ValueError("--selector-mask-start-step must be greater than --selector-warmup-steps")
     if args.lora_base_model is not None and args.lora_base_model.strip().lower() in {"none", "null", ""}:
         args.lora_base_model = None
     if int(args.target_fps) <= 0:
         raise ValueError(f"--target_fps must be > 0, got {args.target_fps}")
-    if args.use_trajectory and args.trainable_models is None:
+    if args.selector_only:
+        args.trainable_models = ""
+    elif args.use_trajectory and args.trainable_models is None:
         args.trainable_models = "trajectory_encoder,trajectory_head"
 
     extra_inputs = [x.strip() for x in args.extra_inputs.split(",") if x.strip()] if args.extra_inputs else []
@@ -767,6 +2358,36 @@ def main(argv: Optional[list[str]] = None) -> int:
         json.dump(vars(args), f, indent=2)
 
     train_logs = [x.strip() for x in args.train_log_names.split(",") if x.strip()] if args.train_log_names else None
+    train_scene_tokens = None
+    if args.train_scene_manifest:
+        train_rows = _read_jsonl_manifest(args.train_scene_manifest)
+        semantic_train_tokens = _manifest_scene_tokens(train_rows, args.train_scene_manifest)
+        train_scene_tokens = _representative_frame_tokens(
+            train_rows,
+            manifest_path=args.train_scene_manifest,
+            num_history_frames=args.num_history_frames,
+            num_future_frames=args.num_future_frames,
+            frame_interval=args.frame_interval,
+            has_route=not args.allow_missing_route,
+            windows_per_scene=args.windows_per_scene,
+        )
+        if args.forbidden_scene_manifest:
+            forbidden_tokens, forbidden_summaries = _forbidden_manifest_tokens(
+                args.forbidden_scene_manifest
+            )
+            overlap = sorted(set(semantic_train_tokens) & forbidden_tokens)
+            if overlap:
+                raise ValueError(
+                    f"train/forbidden scene manifests overlap by {len(overlap)} scene_token values; "
+                    f"examples={overlap[:5]}"
+                )
+            print(
+                "[train][split-audit]",
+                f"train_scenes={len(semantic_train_tokens)}",
+                f"forbidden_scenes={len(forbidden_tokens)}",
+                f"forbidden_manifests={forbidden_summaries}",
+                "scene_token_overlap=0",
+            )
     dataset = NavsimDriveVADataset(
         NavsimDriveVAConfig(
             repo_root=args.repo_root,
@@ -778,7 +2399,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             num_history_frames=args.num_history_frames,
             num_future_frames=args.num_future_frames,
             frame_interval=args.frame_interval,
+            has_route=not args.allow_missing_route,
             train_log_names=train_logs,
+            train_scene_tokens=train_scene_tokens,
             max_scenes=args.max_scenes,
             image_height=args.height,
             image_width=args.width,
@@ -788,6 +2411,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
         split="train",
     )
+    expected_manifest_samples = (
+        len(train_scene_tokens)
+        if train_scene_tokens is not None and args.max_scenes is None
+        else min(len(train_scene_tokens), int(args.max_scenes))
+        if train_scene_tokens is not None
+        else None
+    )
+    if expected_manifest_samples is not None and len(dataset) != expected_manifest_samples:
+        raise RuntimeError(
+            f"scene manifest requested {expected_manifest_samples} samples but NAVSIM loaded {len(dataset)}"
+        )
 
     model = DriveVANavsimTrainingModule(
         local_model_path=args.local_model_path,
@@ -808,6 +2442,45 @@ def main(argv: Optional[list[str]] = None) -> int:
         infer_replace_history_latents_before_decode=args.infer_replace_history_latents_before_decode,
         trajectory_condition_mode=args.trajectory_condition_mode,
         num_history_frames=args.num_history_frames,
+        enable_online_selector=args.enable_online_selector,
+        selector_warmup_steps=args.selector_warmup_steps,
+        selector_layer=args.selector_layer,
+        selector_loss_weight=args.selector_loss_weight,
+        selector_keep_schedule=args.selector_keep_schedule,
+        selector_input_variant=args.selector_input_variant,
+        selector_feature_mode=args.selector_feature_mode,
+        selector_teacher_keep_ratio=args.selector_teacher_keep_ratio,
+        selector_gradient_interval=args.selector_gradient_interval,
+        selector_mask_start_step=args.selector_mask_start_step,
+        selector_only=args.selector_only,
+        selector_checkpoint=args.selector_checkpoint,
+        selector_teacher_mode=args.selector_teacher_mode,
+        selector_signed_temperature=args.selector_signed_temperature,
+        selector_counterfactual_interval=args.selector_counterfactual_interval,
+        selector_counterfactual_weight=args.selector_counterfactual_weight,
+        selector_counterfactual_scale=args.selector_counterfactual_scale,
+        selector_counterfactual_tile_h=args.selector_counterfactual_tile_h,
+        selector_counterfactual_tile_w=args.selector_counterfactual_tile_w,
+        selector_counterfactual_physical=args.selector_counterfactual_physical,
+        selector_teacher_timesteps=args.selector_teacher_timesteps,
+        selector_teacher_seed=args.selector_teacher_seed,
+        selector_counterfactual_dump_dir=args.selector_counterfactual_dump_dir,
+        selector_counterfactual_replicate=args.selector_counterfactual_replicate,
+        selector_counterfactual_sweep_all=args.selector_counterfactual_sweep_all,
+        selector_counterfactual_replays=args.selector_counterfactual_replays,
+        selector_counterfactual_scales=args.selector_counterfactual_scales,
+        selector_counterfactual_abstain_eps=args.selector_counterfactual_abstain_eps,
+        selector_counterfactual_noise_seed=args.selector_counterfactual_noise_seed,
+        selector_counterfactual_latent_index=args.selector_counterfactual_latent_index,
+        selector_counterfactual_jsonl_dir=args.selector_counterfactual_jsonl_dir,
+        selector_teacher_disp_scale=args.selector_teacher_disp_scale,
+        selector_teacher_disp_normalize=args.selector_teacher_disp_normalize,
+        selector_ranking_loss_weight=args.selector_ranking_loss_weight,
+        selector_ranking_margin=args.selector_ranking_margin,
+        selector_ranking_max_pairs=args.selector_ranking_max_pairs,
+        selector_critical_token_mode=args.selector_critical_token_mode,
+        selector_critical_token_dilation=args.selector_critical_token_dilation,
+        selector_long_horizon_weights=args.selector_long_horizon_weights,
     )
 
     if args.full_ckpt:
@@ -851,6 +2524,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         f"condition_mode={args.trajectory_condition_mode}",
         f"auto_eval={bool(args.auto_eval)}",
     )
+    # Selector architectures consume different amounts of RNG during model
+    # construction. Reset here so held-out runs compare identical data order,
+    # timesteps, and trajectory noise.
+    random.seed(process_seed)
+    np.random.seed(process_seed % (2**32))
+    torch.manual_seed(process_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(process_seed)
     launch_training_task(dataset, model, model_logger, args=args, save_steps=args.save_steps)
     return 0
 

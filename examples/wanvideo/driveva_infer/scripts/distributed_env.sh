@@ -1,6 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+driveva_resolve_python() {
+  if [ -n "${PYTHON:-}" ]; then
+    export PYTHON
+    return
+  fi
+
+  # Prefer the active non-base environment. Callers can always select a
+  # dedicated runtime explicitly with PYTHON=/path/to/python.
+  if [ -n "${CONDA_PREFIX:-}" ] && [ "${CONDA_DEFAULT_ENV:-}" != "base" ] && [ -x "${CONDA_PREFIX}/bin/python" ]; then
+    PYTHON="${CONDA_PREFIX}/bin/python"
+  fi
+
+  PYTHON="${PYTHON:-python}"
+  export PYTHON
+}
+
 driveva_setup_distributed_env() {
   if [ -n "${MLP_ROLE_INDEX:-}" ]; then export RANK="${RANK:-$MLP_ROLE_INDEX}"; fi
   if [ -n "${MLP_WORKER_0_HOST:-}" ]; then export MASTER_ADDR="${MASTER_ADDR:-$MLP_WORKER_0_HOST}"; fi
@@ -62,13 +78,14 @@ driveva_setup_distributed_env() {
 driveva_launch_torchrun() {
   local entrypoint="$1"
   shift
+  local python_bin="${PYTHON:-python}"
 
   if [ -z "${TOTAL_PROCESSES:-}" ]; then
     driveva_setup_distributed_env
   fi
 
   if [ "${NUM_NODES}" -gt 1 ]; then
-    torchrun \
+    "${python_bin}" -m torch.distributed.run \
       --nnodes "${NUM_NODES}" \
       --node_rank "${NODE_RANK}" \
       --nproc_per_node "${GPUS_PER_NODE}" \
@@ -76,9 +93,12 @@ driveva_launch_torchrun() {
       --master_port "${MASTER_PORT}" \
       "${entrypoint}" "$@"
   else
-    torchrun \
-      --standalone \
+    "${python_bin}" -m torch.distributed.run \
+      --nnodes 1 \
+      --node_rank 0 \
       --nproc_per_node "${GPUS_PER_NODE}" \
+      --master_addr "${MASTER_ADDR}" \
+      --master_port "${MASTER_PORT}" \
       "${entrypoint}" "$@"
   fi
 }

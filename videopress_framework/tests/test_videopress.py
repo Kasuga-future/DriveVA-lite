@@ -3,13 +3,15 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from evaluation.evaluator import Evaluator, SceneSample
 from videopress.core.budget import TokenBudget, budget_stats, resolve_budget
 from videopress.core.context import TokenContext
-from videopress.core.domain import LastHistoryDomain
+from videopress.core.domain import LastHistoryDomain, build_domain
 from videopress.core.layout import build_driveva_layout, decode_video_index, get_last_history_range
+from videopress.core.retention import HISTORY_RETENTION_POLICIES
 from videopress.core.runtime import InjectionPoint
 from videopress.adapters import DriveVAAdapter
 from videopress.operators import KVPruneOperator, MeanReplaceOperator, ZeroMaskOperator
@@ -47,6 +49,89 @@ def test_budget_and_dual_ratios():
     assert stats["eligible_keep_ratio"] == 0.5
 
 
+@pytest.mark.parametrize(
+    ("policy", "expected_k", "expected_per_latent"),
+    [
+        ("drop_previous_keep_last_100", 390, [0, 390]),
+        ("drop_previous_keep_last_50", 195, [0, 195]),
+        ("joint_keep_50", 390, None),
+        ("joint_keep_25", 195, None),
+        ("per_latent_keep_50", 390, [195, 195]),
+        # 390 * 0.25 is 97.5, so each independent quota rounds to 98.
+        ("per_latent_keep_25", 196, [98, 98]),
+    ],
+)
+def test_six_history_retention_policies(policy, expected_k, expected_per_latent):
+    layout = build_driveva_layout(
+        f=3, h=15, w=26, num_cond_latents=2, traj_len=3, traj_prefix_len=1
+    )
+    press = build_press(
+        {
+            "name": "scorer_press",
+            "retention_policy": policy,
+            "scorer": {"name": "token_norm"},
+            "operator": {"name": "zero"},
+            "injection_point": "video_input",
+        }
+    )
+    domain = build_domain(press.domain, layout, "cpu")
+    tokens = torch.arange(1, layout.total_length + 1, dtype=torch.float32).view(1, -1, 1)
+    ctx = TokenContext(tokens=tokens, layout=layout, domain=domain)
+    result = press.apply(ctx)
+    assert set(HISTORY_RETENTION_POLICIES) == {
+        "drop_previous_keep_last_100",
+        "drop_previous_keep_last_50",
+        "joint_keep_50",
+        "joint_keep_25",
+        "per_latent_keep_50",
+        "per_latent_keep_25",
+    }
+    assert domain.name == "history"
+    assert domain.n_candidate == 780
+    assert result.selection.K == expected_k
+    assert result.metadata["effective_history_kept"] == [expected_k]
+    assert torch.count_nonzero(result.output[:, layout.history_video.as_slice()]) == expected_k
+    selected_per_latent = result.metadata["selected_history_latent_counts"][0]
+    if expected_per_latent is not None:
+        assert selected_per_latent == expected_per_latent
+    else:
+        assert sum(selected_per_latent) == expected_k
+
+
+def test_retention_policy_rejects_wrong_history_count():
+    press = build_press(
+        {
+            "retention_policy": "per_latent_keep_50",
+            "scorer": "token_norm",
+            "operator": "zero",
+        }
+    )
+    layout = build_driveva_layout(3, 2, 2, 1, 0, 0)
+    ctx = TokenContext(
+        tokens=torch.ones(1, layout.total_length, 2),
+        layout=layout,
+        domain=build_domain("history", layout, "cpu"),
+    )
+    with pytest.raises(ValueError, match="exactly 2 history latents"):
+        press.apply(ctx)
+
+
+def test_effective_retention_counts_protected_previous_history():
+    ctx = make_context()
+    result = build_press(
+        {
+            "domain": "last_history",
+            "scorer": "token_norm",
+            "selector": "topk",
+            "operator": "zero",
+            "budget": {"type": "ratio", "value": 0.5, "reference": "eligible"},
+        }
+    ).apply(ctx)
+    assert result.metadata["selected_history_latent_counts"] == [[0, 2]]
+    assert result.metadata["effective_history_latent_kept_counts"] == [[4, 2]]
+    assert result.metadata["effective_history_keep_ratio"] == [0.75]
+
+
 def test_random_is_deterministic_and_seeded():
     ctx = make_context()
     first = RandomScorer(seed=0).score(ctx)
@@ -64,16 +149,19 @@ def test_topk_is_stable_on_ties_and_exact_k():
     assert selection.keep_global_indices.shape == (1, 2)
 
 
-def test_zero_and_mean_preserve_protected_tokens():
+def test_zero_clears_unselected_domain_and_preserves_protected_tokens():
     ctx = make_context()
     scores = TokenNormScorer().score(ctx)
     selection = TopKSelector().select(scores, ctx.domain, 2, ctx)
     zero = ZeroMaskOperator().apply(ctx, selection).output
     mean = MeanReplaceOperator().apply(ctx, selection).output
     protected = torch.where(ctx.domain.protected_mask)[0]
-    assert torch.equal(ctx.tokens[:, protected], zero[:, protected])
+    assert torch.equal(zero[:, protected], ctx.tokens[:, protected])
     assert torch.equal(ctx.tokens[:, protected], mean[:, protected])
     assert torch.equal(zero[:, selection.keep_global_indices[0]], ctx.tokens[:, selection.keep_global_indices[0]])
+    dropped = ctx.domain.candidate_mask.clone()
+    dropped[selection.keep_global_indices[0]] = False
+    assert torch.count_nonzero(zero[:, dropped]) == 0
 
 
 def test_action_attention_shape_and_finite():

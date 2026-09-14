@@ -16,6 +16,10 @@ from ..core.context import TokenContext
 from ..core.domain import build_domain
 from ..core.layout import build_driveva_layout
 from ..core.plan import validate_protocol
+from ..core.persistence import (
+    CrossLayerSelectionStore,
+    HiddenSequencePersistenceController,
+)
 from ..core.runtime import InjectionPoint
 from .wan_attention import canonicalize_wan_qkv, restore_wan_qkv
 
@@ -280,30 +284,101 @@ class DriveVAAdapter:
 
     def _install_kv_hooks(self, pipe, runtime) -> None:
         hooks = []
+        persistence = getattr(runtime.press, "cross_layer_persistence", None)
+        persistence_enabled = bool(getattr(persistence, "enabled", False))
+        hidden_sequence_enabled = bool(
+            persistence_enabled
+            and getattr(persistence, "mode", "kv_only") == "hidden_sequence"
+        )
+        if persistence_enabled:
+            runtime._cross_layer_selection_store = CrossLayerSelectionStore()
+        runtime._driveva_hidden_sequence_hooks = []
         for model_name in ("dit", "dit2"):
             model = getattr(pipe, model_name, None)
             if model is None or not hasattr(model, "blocks"):
                 continue
+            if hidden_sequence_enabled:
+                attribute = "_tokenpress_hidden_sequence_controller"
+                had_controller = hasattr(model, attribute)
+                previous_controller = getattr(model, attribute, None)
+                setattr(
+                    model,
+                    attribute,
+                    HiddenSequencePersistenceController(
+                        runtime,
+                        model_name,
+                        persistence,
+                    ),
+                )
+                runtime._driveva_hidden_sequence_hooks.append(
+                    (model, attribute, had_controller, previous_controller)
+                )
             for layer_idx, block in enumerate(model.blocks):
                 attention = getattr(block, "self_attn", None)
                 if attention is None or not hasattr(attention, "attn"):
                     continue
 
-                def hook(q, k, v, *, layer_idx=None, _layer_idx=layer_idx, _attention=attention):
+                def hook(
+                    q,
+                    k,
+                    v,
+                    *,
+                    layer_idx=None,
+                    _layer_idx=layer_idx,
+                    _attention=attention,
+                    _model_name=model_name,
+                    _model=model,
+                ):
                     if runtime.press is None or runtime.layout is None:
                         raise RuntimeError("SELF_ATTN_KV hook requires an active layout and press")
                     scorer = getattr(runtime.press, "scorer", None)
                     requested_layer = getattr(scorer, "layer", None)
                     effective_layer = _layer_idx if layer_idx is None else layer_idx
-                    if requested_layer is not None and int(requested_layer) != int(effective_layer):
-                        return q, k, v
+                    reuse_persistent_selection = False
+                    observe_only = False
+                    if requested_layer is not None:
+                        source_layer = int(requested_layer)
+                        current_layer = int(effective_layer)
+                        if current_layer < source_layer:
+                            observation_layers = getattr(
+                                scorer, "observation_layers", lambda: ()
+                            )()
+                            if current_layer not in observation_layers:
+                                return q, k, v
+                            observe_only = True
+                        if current_layer > source_layer:
+                            if not persistence_enabled or not persistence.includes(
+                                source_layer, current_layer
+                            ):
+                                return q, k, v
+                            if hidden_sequence_enabled:
+                                # The residual stream is already physically
+                                # shorter after the source block, so downstream
+                                # attention needs no second K/V gather.
+                                return q, k, v
+                            reuse_persistent_selection = True
                     num_heads = int(getattr(_attention, "num_heads", 0))
                     q_c, q_flat = canonicalize_wan_qkv(q, num_heads)
                     k_c, _ = canonicalize_wan_qkv(k, num_heads)
                     v_c, _ = canonicalize_wan_qkv(v, num_heads)
                     dummy_tokens = q_c.transpose(1, 2).reshape(q_c.shape[0], q_c.shape[2], -1)
+                    context_tokens = dummy_tokens
+                    if bool(getattr(scorer, "uses_pre_block_hidden", False)):
+                        pre_block = getattr(_model, "_tokenpress_pre_block_hidden", None)
+                        pre_block_layer = getattr(_model, "_tokenpress_pre_block_layer", None)
+                        if pre_block is None or int(pre_block_layer) != int(effective_layer):
+                            raise RuntimeError(
+                                "learned selector requested pre-block hidden state, but the "
+                                f"model did not expose layer {effective_layer}"
+                            )
+                        if pre_block.shape[:2] != dummy_tokens.shape[:2]:
+                            raise RuntimeError(
+                                "pre-block hidden shape does not match attention sequence: "
+                                f"{tuple(pre_block.shape)} vs {tuple(dummy_tokens.shape)}"
+                            )
+                        context_tokens = pre_block
                     configured, resolved, overridden, domain = self._resolve_domain_for_device(
-                        runtime, runtime.layout, dummy_tokens.device
+                        runtime, runtime.layout, context_tokens.device
                     )
                     metadata = self._sample_metadata(runtime)
                     metadata.update(self._domain_metadata(configured, resolved, domain, overridden))
@@ -311,11 +386,11 @@ class DriveVAAdapter:
                         {
                             "injection_point": InjectionPoint.SELF_ATTN_KV.value,
                             "post_rope": True,
-                            "model_name": model_name,
+                            "model_name": _model_name,
                         }
                     )
                     context = self.create_context(
-                        dummy_tokens,
+                        context_tokens,
                         runtime.layout,
                         domain,
                         scene_token=runtime.current_scene or "",
@@ -332,7 +407,71 @@ class DriveVAAdapter:
                         metadata=metadata,
                     )
                     runtime.current_context = context
-                    result = runtime.execute_press(context)
+                    if observe_only:
+                        observe = getattr(scorer, "observe", None)
+                        if observe is None:
+                            raise RuntimeError(
+                                "scorer declared observation layers without observe(ctx)"
+                            )
+                        observe(context)
+                        return q, k, v
+                    if reuse_persistent_selection:
+                        record = runtime._cross_layer_selection_store.recall(
+                            context,
+                            _model_name,
+                            int(requested_layer),
+                        )
+                        result = runtime.execute_persistent_selection(
+                            context,
+                            record.selection,
+                            source_layer=record.source_layer,
+                        )
+                    else:
+                        result = runtime.execute_press(context)
+                        persists = bool(
+                            persistence is not None
+                            and persistence.persists_beyond(int(effective_layer))
+                        )
+                        if persists:
+                            if result.selection is None:
+                                raise RuntimeError(
+                                    "cross-layer persistence requires a press selection"
+                                )
+                            runtime._cross_layer_selection_store.remember(
+                                context,
+                                _model_name,
+                                int(effective_layer),
+                                result.selection,
+                            )
+                            result.metadata.update(
+                                {
+                                    "cross_layer_persistent": True,
+                                    "cross_layer_persistence_mode": getattr(
+                                        persistence, "mode", "kv_only"
+                                    ),
+                                    "persistent_selection_reused": False,
+                                    "selection_source_layer": int(effective_layer),
+                                    "selection_applied_layer": int(effective_layer),
+                                }
+                            )
+                        elif persistence is not None:
+                            # Cross-layer persistence is OFF for this press, so the
+                            # source-layer selection is applied exactly once and
+                            # nothing downstream reuses it.  Record that explicitly
+                            # instead of leaving the run indistinguishable from a
+                            # persistent one (audit 2026-09-12, BUG-13).
+                            result.metadata.update(
+                                {
+                                    "cross_layer_persistent": False,
+                                    "cross_layer_persistence_mode": "one_shot",
+                                    "cross_layer_persistence_configured": bool(
+                                        persistence_enabled
+                                    ),
+                                    "persistent_selection_reused": False,
+                                    "selection_source_layer": int(effective_layer),
+                                    "selection_applied_layer": int(effective_layer),
+                                }
+                            )
                     # Some physical presses (notably SimilarityMerge) emit
                     # their own metadata instead of going through
                     # ScorerPress.  Keep the resolved candidate range on the
@@ -425,3 +564,18 @@ class DriveVAAdapter:
                 except AttributeError:
                     pass
         runtime._driveva_hooks = []
+        for model, attribute, had_controller, previous_controller in getattr(
+            runtime, "_driveva_hidden_sequence_hooks", []
+        ):
+            if had_controller:
+                setattr(model, attribute, previous_controller)
+            else:
+                try:
+                    delattr(model, attribute)
+                except AttributeError:
+                    pass
+        runtime._driveva_hidden_sequence_hooks = []
+        persistence_store = getattr(runtime, "_cross_layer_selection_store", None)
+        if persistence_store is not None:
+            persistence_store.clear()
+        runtime._cross_layer_selection_store = None

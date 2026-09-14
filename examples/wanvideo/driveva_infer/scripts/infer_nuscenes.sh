@@ -6,6 +6,10 @@ DRIVEVA_INFER_DIR="${DRIVEVA_INFER_DIR:-"$(cd "${SCRIPT_DIR}/.." && pwd)"}"
 REPO_ROOT="${REPO_ROOT:-"$(cd "${DRIVEVA_INFER_DIR}/../../.." && pwd)"}"
 CONFIG="${CONFIG:-${NUSCENES_INFER_CONFIG:-"${DRIVEVA_INFER_DIR}/configs/nuscenes.yaml"}}"
 
+# shellcheck source=/dev/null
+source "${DRIVEVA_INFER_DIR}/scripts/distributed_env.sh"
+driveva_resolve_python
+
 if [ ! -f "${CONFIG}" ]; then
   echo "[driveva] config not found: ${CONFIG}" >&2
   exit 1
@@ -15,8 +19,6 @@ export REPO_ROOT DRIVEVA_INFER_DIR CONFIG
 config_exports="$("${PYTHON:-python}" "${DRIVEVA_INFER_DIR}/scripts/load_yaml_config.py" "${CONFIG}")"
 eval "${config_exports}"
 
-# shellcheck source=/dev/null
-source "${DRIVEVA_INFER_DIR}/scripts/distributed_env.sh"
 driveva_setup_distributed_env
 
 export PYTHONPATH="${REPO_ROOT}:${DRIVEVA_INFER_DIR}:${REPO_ROOT}/third_party:${REPO_ROOT}/third_party/nuscenes-devkit/python-sdk:${PYTHONPATH:-}"

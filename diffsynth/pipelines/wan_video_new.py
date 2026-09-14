@@ -80,7 +80,7 @@ class WanVideoPipeline(BasePipeline):
         ]
         self.post_units = []
         self.model_fn = model_fn_wan_video
-    
+
     def _ensure_traj_dim(self, traj: torch.Tensor, dim: int = 3) -> torch.Tensor:
         """Ensure trajectory has the requested last-dimension size by slicing or padding with zeros."""
         if traj.shape[-1] == dim:
@@ -307,8 +307,8 @@ class WanVideoPipeline(BasePipeline):
             ulysses_degree=dist.get_world_size(),
         )
         torch.cuda.set_device(dist.get_rank())
-            
-            
+
+
     def enable_usp(self):
         from xfuser.core.distributed import get_sequence_parallel_world_size
         from ..distributed.xdit_context_parallel import usp_attn_forward, usp_dit_forward
@@ -348,7 +348,7 @@ class WanVideoPipeline(BasePipeline):
                 if model_config.origin_file_pattern in redirect_dict and model_config.model_id != redirect_dict[model_config.origin_file_pattern]:
                     print(f"To avoid repeatedly downloading model files, ({model_config.model_id}, {model_config.origin_file_pattern}) is redirected to ({redirect_dict[model_config.origin_file_pattern]}, {model_config.origin_file_pattern}). You can use `redirect_common_files=False` to disable file redirection.")
                     model_config.model_id = redirect_dict[model_config.origin_file_pattern]
-        
+
         # Initialize pipeline
         pipe = WanVideoPipeline(device=device, torch_dtype=torch_dtype)
         if use_usp: pipe.initialize_usp()
@@ -368,7 +368,7 @@ class WanVideoPipeline(BasePipeline):
                 local_model_path=local_model_path,
                 skip_download=True,
             )
-        
+
         # Download and load models
         model_manager = ModelManager()
         for model_config in model_configs:
@@ -378,7 +378,7 @@ class WanVideoPipeline(BasePipeline):
                 device=model_config.offload_device or device,
                 torch_dtype=model_config.offload_dtype or torch_dtype
             )
-        
+
         # Load models
         pipe.text_encoder = model_manager.fetch_model("wan_video_text_encoder")
         dit = model_manager.fetch_model("wan_video_dit", index=2)
@@ -429,13 +429,24 @@ class WanVideoPipeline(BasePipeline):
         self._ensure_scheduler_training_state()
 
         return_loss_breakdown = bool(inputs.pop("return_loss_breakdown", False))
+        capture_training_replay = bool(inputs.pop("capture_training_replay", False))
+        forced_timestep = inputs.pop("forced_training_timestep", None)
+        forced_traj_noise = inputs.pop("forced_trajectory_noise", None)
+        fixed_traj_noise_seed = inputs.pop("fixed_trajectory_noise_seed", None)
         num_train_steps = int(self.scheduler.num_train_timesteps)
         max_timestep_boundary = int(float(inputs.get("max_timestep_boundary", 1.0)) * num_train_steps)
         min_timestep_boundary = int(float(inputs.get("min_timestep_boundary", 0.0)) * num_train_steps)
         max_timestep_boundary = max(1, min(max_timestep_boundary, num_train_steps))
         min_timestep_boundary = max(0, min(min_timestep_boundary, max_timestep_boundary - 1))
-        timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
-        timestep = self.scheduler.timesteps[timestep_id].to(dtype=self.torch_dtype, device=self.device)
+        if forced_timestep is None:
+            timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
+            timestep = self.scheduler.timesteps[timestep_id].to(dtype=self.torch_dtype, device=self.device)
+        else:
+            timestep = torch.as_tensor(
+                forced_timestep, device=self.device, dtype=self.torch_dtype
+            ).reshape(-1)
+            if timestep.numel() != 1:
+                raise ValueError("forced_training_timestep must contain exactly one value")
 
         inputs["latents"] = self.scheduler.add_noise(inputs["input_latents"], inputs["noise"], timestep)
         training_target = self.scheduler.training_target(inputs["input_latents"], inputs["noise"], timestep)
@@ -494,7 +505,25 @@ class WanVideoPipeline(BasePipeline):
             else:
                 vel_norm = None
 
-            traj_noise = torch.randn_like(traj_norm)
+            if forced_traj_noise is not None:
+                traj_noise = torch.as_tensor(
+                    forced_traj_noise, device=traj_norm.device, dtype=traj_norm.dtype
+                )
+            elif fixed_traj_noise_seed is not None:
+                traj_noise = self.generate_noise(
+                    tuple(traj_norm.shape),
+                    seed=int(fixed_traj_noise_seed),
+                    rand_device=inputs.get("rand_device", self.device),
+                    device=traj_norm.device,
+                    torch_dtype=traj_norm.dtype,
+                )
+            else:
+                traj_noise = torch.randn_like(traj_norm)
+            if traj_noise.shape != traj_norm.shape:
+                raise ValueError(
+                    f"forced_trajectory_noise shape {tuple(traj_noise.shape)} "
+                    f"does not match trajectory {tuple(traj_norm.shape)}"
+                )
             traj_noisy = self.scheduler.add_noise(traj_norm, traj_noise, timestep)
             traj_noisy = torch.clamp(traj_noisy, min=-1, max=1)
 
@@ -531,8 +560,16 @@ class WanVideoPipeline(BasePipeline):
             traj_target = self.scheduler.training_target(traj_norm, traj_noise, timestep)
             inputs["return_traj_pred"] = True
 
+        self._last_training_timestep = timestep.detach().clone()
+        if capture_training_replay:
+            self._last_trajectory_noise = (
+                None if traj_target is None else traj_noise.detach().clone()
+            )
+
         inputs.setdefault("traj_postprocess", False)
         inputs.setdefault("pipe", self)
+        inputs["capture_history_tokens"] = bool(inputs.get("capture_history_tokens", False))
+        inputs["capture_planning_graph"] = bool(inputs.get("capture_planning_graph", False))
         noise_pred = self.model_fn(**inputs, timestep=timestep)
 
         if isinstance(noise_pred, dict):
@@ -581,6 +618,23 @@ class WanVideoPipeline(BasePipeline):
                 "trajectory_loss": (
                     traj_loss * traj_loss_weight * trajectory_loss_scale * loss_weight
                 ).detach(),
+                "trajectory_loss_unweighted": (
+                    traj_loss * traj_loss_weight * trajectory_loss_scale
+                ).detach(),
+                # Exposed so the counterfactual teacher can also measure the
+                # *displacement* of the predicted plan, not only the change of a
+                # scalar MSE.  Displacement is a geometric, unsigned target and
+                # is far less sensitive to which residual direction a tile
+                # perturbation happens to project onto (review 2026-09-11 P3).
+                "trajectory_pred": (
+                    traj_pred.detach() if torch.is_tensor(traj_pred) else None
+                ),
+                "trajectory_prefix_len": int(inputs.get("traj_prefix_len", 0) or 0),
+                # Kept attached only when an online gradient teacher requests it.
+                "planning_loss_for_teacher": (
+                    traj_loss * traj_loss_weight * trajectory_loss_scale
+                    if bool(inputs.get("capture_planning_graph", False)) else None
+                ),
                 "lr_weight": loss_weight.detach(),
                 "trajectory_loss_weight": float(traj_loss_weight),
                 "video_loss_scale": float(video_loss_scale),
@@ -653,7 +707,7 @@ class WanVideoPipeline(BasePipeline):
     ):
         # Scheduler
         self.scheduler.set_timesteps(num_inference_steps, denoising_strength=denoising_strength, shift=sigma_shift)
-        
+
         # Inputs
         inputs_posi = {
             "prompt": prompt,
@@ -765,7 +819,7 @@ class WanVideoPipeline(BasePipeline):
             if timestep.item() < switch_DiT_boundary * self.scheduler.num_train_timesteps and self.dit2 is not None and not models["dit"] is self.dit2:
                 self.load_models_to_device(self.in_iteration_models_2)
                 models["dit"] = self.dit2
-                
+
             # Timestep
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
 
@@ -894,7 +948,7 @@ class WanVideoUnit_NoiseInitializer(PipelineUnit):
         if vace_reference_image is not None:
             noise = torch.concat((noise[:, :, -f:], noise[:, :, :-f]), dim=2)
         return {"noise": noise}
-    
+
 
 
 class WanVideoUnit_InputVideoEmbedder(PipelineUnit):
@@ -970,7 +1024,7 @@ class WanVideoUnit_ImageEmbedder(PipelineUnit):
         msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
         msk = msk.view(1, msk.shape[1] // 4, 4, height//8, width//8)
         msk = msk.transpose(1, 2)[0]
-        
+
         y = pipe.vae.encode([vae_input.to(dtype=pipe.torch_dtype, device=pipe.device)], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)[0]
         y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
         y = torch.concat([msk, y])
@@ -1000,7 +1054,7 @@ class WanVideoUnit_ImageEmbedderCLIP(PipelineUnit):
                 clip_context = torch.concat([clip_context, pipe.image_encoder.encode_image([end_image])], dim=1)
         clip_context = clip_context.to(dtype=pipe.torch_dtype, device=pipe.device)
         return {"clip_feature": clip_context}
-    
+
 
 
 class WanVideoUnit_ImageEmbedderVAE(PipelineUnit):
@@ -1027,7 +1081,7 @@ class WanVideoUnit_ImageEmbedderVAE(PipelineUnit):
         msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
         msk = msk.view(1, msk.shape[1] // 4, 4, height//8, width//8)
         msk = msk.transpose(1, 2)[0]
-        
+
         y = pipe.vae.encode([vae_input.to(dtype=pipe.torch_dtype, device=pipe.device)], device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)[0]
         y = y.to(dtype=pipe.torch_dtype, device=pipe.device)
         y = torch.concat([msk, y])
@@ -1166,21 +1220,21 @@ class WanVideoUnit_VACE(PipelineUnit):
                 vace_video = torch.zeros((1, 3, num_frames, height, width), dtype=pipe.torch_dtype, device=pipe.device)
             else:
                 vace_video = pipe.preprocess_video(vace_video)
-            
+
             if vace_video_mask is None:
                 vace_video_mask = torch.ones_like(vace_video)
             else:
                 vace_video_mask = pipe.preprocess_video(vace_video_mask, min_value=0, max_value=1)
-            
+
             inactive = vace_video * (1 - vace_video_mask) + 0 * vace_video_mask
             reactive = vace_video * vace_video_mask + 0 * (1 - vace_video_mask)
             inactive = pipe.vae.encode(inactive, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
             reactive = pipe.vae.encode(reactive, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
             vace_video_latents = torch.concat((inactive, reactive), dim=1)
-            
+
             vace_mask_latents = rearrange(vace_video_mask[0,0], "T (H P) (W Q) -> 1 (P Q) T H W", P=8, Q=8)
             vace_mask_latents = torch.nn.functional.interpolate(vace_mask_latents, size=((vace_mask_latents.shape[2] + 3) // 4, vace_mask_latents.shape[3], vace_mask_latents.shape[4]), mode='nearest-exact')
-            
+
             if vace_reference_image is None:
                 pass
             else:
@@ -1194,14 +1248,14 @@ class WanVideoUnit_VACE(PipelineUnit):
                 for j in range(f):
                     new_vace_ref_images.append(vace_reference_image[0, :, j:j+1])
                 vace_reference_image = new_vace_ref_images
-                
+
                 vace_reference_latents = pipe.vae.encode(vace_reference_image, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
                 vace_reference_latents = torch.concat((vace_reference_latents, torch.zeros_like(vace_reference_latents)), dim=1)
                 vace_reference_latents = [u.unsqueeze(0) for u in vace_reference_latents]
 
                 vace_video_latents = torch.concat((*vace_reference_latents, vace_video_latents), dim=2)
                 vace_mask_latents = torch.concat((torch.zeros_like(vace_mask_latents[:, :, :f]), vace_mask_latents), dim=2)
-            
+
             vace_context = torch.concat((vace_video_latents, vace_mask_latents), dim=1)
             return {"vace_context": vace_context, "vace_scale": vace_scale}
         else:
@@ -1309,7 +1363,7 @@ class WanVideoPostUnit_AnimateInpaint(PipelineUnit):
             input_params=("animate_inpaint_video", "animate_mask_video", "input_image", "tiled", "tile_size", "tile_stride"),
             onload_model_names=("vae",)
         )
-        
+
     def get_i2v_mask(self, lat_t, lat_h, lat_w, mask_len=1, mask_pixel_values=None, device="cuda"):
         if mask_pixel_values is None:
             msk = torch.zeros(1, (lat_t-1) * 4 + 1, lat_h, lat_w, device=device)
@@ -1329,18 +1383,18 @@ class WanVideoPostUnit_AnimateInpaint(PipelineUnit):
         bg_pixel_values = pipe.preprocess_video(animate_inpaint_video)
         y_reft = pipe.vae.encode(bg_pixel_values, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)[0].to(dtype=pipe.torch_dtype, device=pipe.device)
         _, lat_t, lat_h, lat_w = y_reft.shape
-        
+
         ref_pixel_values = pipe.preprocess_video([input_image])
         ref_latents = pipe.vae.encode(ref_pixel_values, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
         mask_ref = self.get_i2v_mask(1, lat_h, lat_w, 1, device=pipe.device)
         y_ref = torch.concat([mask_ref, ref_latents[0]]).to(dtype=torch.bfloat16, device=pipe.device)
-        
+
         mask_pixel_values = 1 - pipe.preprocess_video(animate_mask_video, max_value=1, min_value=0)
         mask_pixel_values = rearrange(mask_pixel_values, "b c t h w -> (b t) c h w")
         mask_pixel_values = torch.nn.functional.interpolate(mask_pixel_values, size=(lat_h, lat_w), mode='nearest')
         mask_pixel_values = rearrange(mask_pixel_values, "(b t) c h w -> b t c h w", b=1)[:,:,0]
         msk_reft = self.get_i2v_mask(lat_t, lat_h, lat_w, 0, mask_pixel_values=mask_pixel_values, device=pipe.device)
-        
+
         y_reft = torch.concat([msk_reft, y_reft]).to(dtype=torch.bfloat16, device=pipe.device)
         y = torch.concat([y_ref, y_reft], dim=1).unsqueeze(0)
         return {"y": y}
@@ -1371,7 +1425,7 @@ class TeaCache:
         self.rel_l1_thresh = rel_l1_thresh
         self.previous_residual = None
         self.previous_hidden_states = None
-        
+
         self.coefficients_dict = {
             "Wan2.1-T2V-1.3B": [-5.21862437e+04, 9.23041404e+03, -5.28275948e+02, 1.36987616e+01, -4.99875664e-02],
             "Wan2.1-T2V-14B": [-3.03318725e+05, 4.90537029e+04, -2.65530556e+03, 5.87365115e+01, -3.15583525e-01],
@@ -1423,7 +1477,7 @@ class TemporalTiler_BCTHW:
         x = torch.ones((length,))
         if border_width == 0:
             return x
-        
+
         shift = 0.5
         if not left_bound:
             x[:border_width] = (torch.arange(border_width) + shift) / border_width
@@ -1436,7 +1490,7 @@ class TemporalTiler_BCTHW:
         t = self.build_1d_mask(T, is_bound[0], is_bound[1], border_width[0])
         mask = repeat(t, "T -> 1 1 T 1 1")
         return mask
-    
+
     def run(self, model_fn, sliding_window_size, sliding_window_stride, computation_device, computation_dtype, model_kwargs, tensor_names, batch_size=None):
         tensor_names = [tensor_name for tensor_name in tensor_names if model_kwargs.get(tensor_name) is not None]
         tensor_dict = {tensor_name: model_kwargs[tensor_name] for tensor_name in tensor_names}
@@ -1480,15 +1534,15 @@ def model_fn_wan2_2_5b_longcat(
     集成了 Self-Attention 和 Cross-Attention 的条件帧优化
     """
     B, C, T, H, W = latents.shape
-    
+
     # 1. 注入历史潜在向量
     if longcat_latents is not None:
         latents[:, :, :longcat_latents.shape[2]] = longcat_latents
         num_cond_latents = longcat_latents.shape[2]
     else:
         num_cond_latents = 0
-    
-    
+
+
     # 3. 调用 DiT 模型
     output = dit(
         latents,
@@ -1498,7 +1552,7 @@ def model_fn_wan2_2_5b_longcat(
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
     )
-    
+
     output = -output
     output = output.to(latents.dtype)
     return output
@@ -1533,6 +1587,13 @@ def model_fn_wan_video(
     pipe=None,
     traj_postprocess: bool = True,
     target_fps: Optional[float] = None,
+    history_token_mask: Optional[torch.Tensor] = None,
+    counterfactual_history_token_mask: Optional[torch.Tensor] = None,
+    counterfactual_layer: Optional[int] = None,
+    counterfactual_physical_prune: bool = False,
+    counterfactual_latent_index: int = 0,
+    capture_history_tokens: bool = False,
+    selector_layer: int = 15,
     **kwargs,
 ):
 
@@ -1546,8 +1607,8 @@ def model_fn_wan_video(
     #         longcat_latents=longcat_latents,
     #         use_gradient_checkpointing=use_gradient_checkpointing,
     #         use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-    #     ) 
-    
+    #     )
+
     if sliding_window_size is not None and sliding_window_stride is not None:
         model_kwargs = dict(
             dit=dit,
@@ -1583,7 +1644,7 @@ def model_fn_wan_video(
             use_gradient_checkpointing=use_gradient_checkpointing,
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
         )
-        
+
     if use_unified_sequence_parallel:
         import torch.distributed as dist
         from xfuser.core.distributed import (get_sequence_parallel_rank,
@@ -1606,7 +1667,7 @@ def model_fn_wan_video(
     #     t = dit.time_embedding(sinusoidal_embedding_1d(dit.freq_dim, timestep))
     #     t_mod = dit.time_projection(t).unflatten(1, (6, dit.dim))
         B, C, T, H, W = latents.shape
-    
+
     # 1. 注入历史潜在向量
     if longcat_latents is not None:
         latents[:, :, :longcat_latents.shape[2]] = longcat_latents
@@ -1658,18 +1719,26 @@ def model_fn_wan_video(
             clip_feature = clip_feature.to(dit_dtype)
         clip_embdding = dit.img_emb(clip_feature)
         context = torch.cat([clip_embdding, context], dim=1)
-    
+
     # Camera control
     x = dit.patchify(x)
-    
+
     # Animate
     if pose_latents is not None and face_pixel_values is not None:
         x, motion_vec = animate_adapter.after_patch_embedding(x, pose_latents, face_pixel_values)
-    
+
     # Patchify
     f, h, w = x.shape[2:]
     x = rearrange(x, 'b c f h w -> b (f h w) c').contiguous()
-    
+    num_cond_tokens = int(num_cond_latents * h * w) if num_cond_latents > 0 else 0
+    if num_cond_tokens > 0 and history_token_mask is not None:
+        mask = history_token_mask[:, :num_cond_tokens].to(device=x.device, dtype=x.dtype).unsqueeze(-1)
+        x[:, :num_cond_tokens] = x[:, :num_cond_tokens] * mask
+    if pipe is not None and capture_history_tokens:
+        # Never let a failed/empty capture reuse tensors from an earlier batch.
+        pipe._last_history_tokens = None
+        pipe._last_token_positions = None
+
     traj_len = 0
     if traj_tokens is not None:
         traj_len = traj_tokens.shape[1]
@@ -1731,13 +1800,40 @@ def model_fn_wan_video(
         traj_freqs = torch.polar(torch.ones_like(traj_freqs), traj_freqs).to(dtype=freqs.dtype)
         traj_freqs = traj_freqs.view(traj_len, 1, -1)
         freqs = torch.cat([freqs, traj_freqs], dim=0)
-    
+
+    # TokenPress can shorten the residual sequence after a selected source
+    # block.  Keep this integration duck-typed so the clean DriveVA model does
+    # not depend on the optional evaluation framework.
+    hidden_sequence_controller = getattr(
+        dit, "_tokenpress_hidden_sequence_controller", None
+    )
+    if hidden_sequence_controller is not None:
+        incompatible = []
+        if tea_cache is not None:
+            incompatible.append("TeaCache")
+        if vace_context is not None:
+            incompatible.append("VACE")
+        if use_unified_sequence_parallel:
+            incompatible.append("unified sequence parallel")
+        if use_gradient_checkpointing or use_gradient_checkpointing_offload:
+            incompatible.append("gradient checkpointing")
+        if pose_latents is not None or face_pixel_values is not None:
+            incompatible.append("Animate")
+        if incompatible:
+            raise NotImplementedError(
+                "TokenPress hidden-sequence persistence is not implemented with "
+                + ", ".join(incompatible)
+            )
+        hidden_sequence_controller.begin_forward(
+            x, freqs, t_mod, num_blocks=len(dit.blocks)
+        )
+
     # TeaCache
     if tea_cache is not None:
         tea_cache_update = tea_cache.check(dit, x, t_mod)
     else:
         tea_cache_update = False
-        
+
     if vace_context is not None:
         vace_x = x[:, :-traj_len] if traj_len > 0 else x
         vace_freqs = freqs[:-traj_len] if traj_len > 0 else freqs
@@ -1746,7 +1842,7 @@ def model_fn_wan_video(
             use_gradient_checkpointing=use_gradient_checkpointing,
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload
         )
-    
+
     # blocks
     if use_unified_sequence_parallel:
         if dist.is_initialized() and dist.get_world_size() > 1:
@@ -1762,11 +1858,66 @@ def model_fn_wan_video(
                 return module(*inputs)
             return custom_forward
         # Count tokens that belong to clean conditioned history frames.
-        num_cond_tokens = 0
-        if num_cond_latents > 0:
-            # Each latent frame contributes h * w video patch tokens.
-            num_cond_tokens = num_cond_latents * h * w
+        # Each latent frame contributes h * w video patch tokens.
+        counterfactual_keep = None
+        counterfactual_original_length = None
+        # Which conditioned history latent the counterfactual intervention (and
+        # the history-token capture) applies to, counted back from the newest
+        # history latent: 0 == newest (the historical default), 1 == the one
+        # before it, ...  The spatial patch grid is shared by every latent, so
+        # the tile membership computed outside this function is valid for all of
+        # them; only the token *range* changes (route-temporal-key-set probe,
+        # 2026-09-11).
+        cf_latent_index = int(counterfactual_latent_index)
+        if num_cond_latents > 0 and not (
+            0 <= cf_latent_index <= num_cond_latents - 1
+        ):
+            raise ValueError(
+                "counterfactual_latent_index "
+                f"{cf_latent_index} is out of range for "
+                f"{num_cond_latents} conditioned history latents"
+            )
         for block_id, block in enumerate(dit.blocks):
+            if capture_history_tokens and block_id == int(selector_layer):
+                if pipe is None:
+                    raise RuntimeError("capture_history_tokens requires pipe")
+                if num_cond_latents <= 0:
+                    raise RuntimeError("selector teacher requires conditioned history latents")
+                # Earlier history remains protected.  Train the selector only
+                # over the requested history latent; the default (index 0) is
+                # the most recent history latent, which is the deployment
+                # candidate domain (390 tokens at 480x832).
+                candidate_start = int(
+                    (num_cond_latents - 1 - cf_latent_index) * h * w
+                )
+                candidate_end = int((num_cond_latents - cf_latent_index) * h * w)
+                history_tokens = x[:, candidate_start:candidate_end].detach().requires_grad_(True)
+                x = torch.cat(
+                    [x[:, :candidate_start], history_tokens, x[:, candidate_end:]],
+                    dim=1,
+                )
+                pipe._last_history_tokens = history_tokens
+                r_idx = torch.arange(h, device=x.device).repeat_interleave(w)
+                c_idx = torch.arange(w, device=x.device).repeat(h)
+                # Temporal coordinate = index of this latent inside the latent
+                # sequence.  For the default newest latent with two conditioned
+                # latents this is exactly the previous constant 1.0.
+                t_idx = torch.full_like(
+                    r_idx, int(num_cond_latents - 1 - cf_latent_index)
+                )
+                denom = torch.tensor(
+                    [1, max(h - 1, 1), max(w - 1, 1)],
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+                pipe._last_token_positions = (
+                    torch.stack([t_idx, r_idx, c_idx], dim=-1).to(x.dtype) / denom
+                )
+
+            # The SELF_ATTN_KV adapter uses this exact pre-block residual when
+            # a learned selector requests hidden features instead of Q/K/V.
+            dit._tokenpress_pre_block_hidden = x
+            dit._tokenpress_pre_block_layer = int(block_id)
             # Block
             if use_gradient_checkpointing_offload:
                 with torch.autograd.graph.save_on_cpu():
@@ -1783,7 +1934,7 @@ def model_fn_wan_video(
                 )
             else:
                 x = block(x, context, t_mod, freqs)
-            
+
             # VACE
             if vace_context is not None and block_id in vace.vace_layers_mapping:
                 current_vace_hint = vace_hints[vace.vace_layers_mapping[block_id]]
@@ -1796,10 +1947,98 @@ def model_fn_wan_video(
                     current_vace_hint = torch.chunk(current_vace_hint, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
                     current_vace_hint = torch.nn.functional.pad(current_vace_hint, (0, 0, 0, chunks[0].shape[1] - current_vace_hint.shape[1]), value=0)
                 x = x + current_vace_hint * vace_scale
-            
+
             # Animate
             if pose_latents is not None and face_pixel_values is not None:
                 x = animate_adapter.after_transformer_block(block_id, x, motion_vec)
+            if (
+                counterfactual_history_token_mask is not None
+                and block_id == int(counterfactual_layer)
+            ):
+                if num_cond_latents <= 0:
+                    raise RuntimeError("counterfactual mask requires conditioned history latents")
+                if not 0 <= int(counterfactual_latent_index) <= num_cond_latents - 1:
+                    raise ValueError(
+                        "counterfactual_latent_index "
+                        f"{int(counterfactual_latent_index)} is out of range for "
+                        f"{num_cond_latents} conditioned history latents"
+                    )
+                candidate_start = int(
+                    (num_cond_latents - 1 - int(counterfactual_latent_index)) * h * w
+                )
+                candidate_end = int(
+                    (num_cond_latents - int(counterfactual_latent_index)) * h * w
+                )
+                mask = counterfactual_history_token_mask.to(
+                    device=x.device, dtype=x.dtype
+                )
+                if mask.ndim == 1:
+                    mask = mask.unsqueeze(0)
+                expected = (x.shape[0], candidate_end - candidate_start)
+                if tuple(mask.shape) != expected:
+                    raise ValueError(
+                        f"counterfactual mask shape {tuple(mask.shape)} != {expected}"
+                    )
+                if counterfactual_physical_prune:
+                    keep_rows = []
+                    prefix = torch.arange(candidate_start, device=x.device)
+                    suffix = torch.arange(candidate_end, x.shape[1], device=x.device)
+                    for row in range(x.shape[0]):
+                        selected = mask[row].bool().nonzero(as_tuple=False).flatten()
+                        keep_rows.append(
+                            torch.cat([prefix, selected + candidate_start, suffix])
+                        )
+                    counterfactual_keep = torch.stack(keep_rows)
+                    counterfactual_original_length = int(x.shape[1])
+
+                    def gather_sequence(tensor):
+                        view = counterfactual_keep.view(
+                            counterfactual_keep.shape[0],
+                            counterfactual_keep.shape[1],
+                            *((1,) * (tensor.ndim - 2)),
+                        )
+                        index = view.expand(
+                            counterfactual_keep.shape[0],
+                            counterfactual_keep.shape[1],
+                            *tensor.shape[2:],
+                        )
+                        return torch.gather(tensor, 1, index)
+
+                    x = gather_sequence(x)
+                    if freqs.ndim == 3:
+                        freqs = freqs.unsqueeze(0).expand(x.shape[0], -1, -1, -1)
+                    freqs = gather_sequence(freqs)
+                    if t_mod.ndim == 4:
+                        t_mod = gather_sequence(t_mod)
+                    elif t_mod.ndim != 3:
+                        raise ValueError(
+                            f"unsupported t_mod rank for counterfactual pruning: {t_mod.ndim}"
+                        )
+                else:
+                    x = torch.cat(
+                        [
+                            x[:, :candidate_start],
+                            x[:, candidate_start:candidate_end] * mask.unsqueeze(-1),
+                            x[:, candidate_end:],
+                        ],
+                        dim=1,
+                    )
+            if hidden_sequence_controller is not None:
+                x, freqs, t_mod = hidden_sequence_controller.after_block(
+                    block_id, x, freqs, t_mod
+                )
+        if counterfactual_keep is not None:
+            restored = x.new_zeros(
+                (x.shape[0], counterfactual_original_length, x.shape[2])
+            )
+            restored.scatter_(
+                1, counterfactual_keep.unsqueeze(-1).expand_as(x), x
+            )
+            x = restored
+        if hidden_sequence_controller is not None:
+            x = hidden_sequence_controller.finish_forward(x)
+        dit._tokenpress_pre_block_hidden = None
+        dit._tokenpress_pre_block_layer = None
         if tea_cache is not None:
             tea_cache.store(x)
 

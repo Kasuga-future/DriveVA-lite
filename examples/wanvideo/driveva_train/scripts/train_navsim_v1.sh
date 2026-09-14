@@ -7,6 +7,10 @@ REPO_ROOT="${REPO_ROOT:-"$(cd "${DRIVEVA_TRAIN_DIR}/../../.." && pwd)"}"
 DRIVEVA_INFER_DIR="${DRIVEVA_INFER_DIR:-"${REPO_ROOT}/examples/wanvideo/driveva_infer"}"
 CONFIG="${CONFIG:-${NAVSIM_TRAIN_CONFIG:-"${DRIVEVA_TRAIN_DIR}/configs/navsim_v1.yaml"}}"
 
+# shellcheck source=/dev/null
+source "${DRIVEVA_INFER_DIR}/scripts/distributed_env.sh"
+driveva_resolve_python
+
 if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
   export MAX_SCENES="${MAX_SCENES:-8}"
   export NUM_EPOCHS="${NUM_EPOCHS:-1}"
@@ -25,8 +29,6 @@ export REPO_ROOT DRIVEVA_TRAIN_DIR DRIVEVA_INFER_DIR CONFIG
 config_exports="$("${PYTHON:-python}" "${DRIVEVA_INFER_DIR}/scripts/load_yaml_config.py" "${CONFIG}")"
 eval "${config_exports}"
 
-# shellcheck source=/dev/null
-source "${DRIVEVA_INFER_DIR}/scripts/distributed_env.sh"
 driveva_setup_distributed_env
 
 export PYTHONPATH="${REPO_ROOT}:${DRIVEVA_TRAIN_DIR}:${DRIVEVA_INFER_DIR}:${REPO_ROOT}/third_party:${REPO_ROOT}/third_party/nuscenes-devkit/python-sdk:${PYTHONPATH:-}"
@@ -52,6 +54,7 @@ args=(
   --target_fps "${TARGET_FPS}"
   --frame_interval "${FRAME_INTERVAL}"
   --learning_rate "${LR}"
+  --seed "${SEED:-20260910}"
   --num_epochs "${NUM_EPOCHS}"
   --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"
   --dataset_num_workers "${DATASET_NUM_WORKERS}"
@@ -71,6 +74,25 @@ args=(
   --trajectory_condition_mode "${TRAJECTORY_CONDITION_MODE}"
   --max_timestep_boundary "${MAX_TIMESTEP_BOUNDARY}"
   --min_timestep_boundary "${MIN_TIMESTEP_BOUNDARY}"
+  --selector-warmup-steps "${SELECTOR_WARMUP_STEPS}"
+  --selector-layer "${SELECTOR_LAYER}"
+  --selector-loss-weight "${SELECTOR_LOSS_WEIGHT}"
+  --selector-input-variant "${SELECTOR_INPUT_VARIANT}"
+  --selector-feature-mode "${SELECTOR_FEATURE_MODE:-all}"
+  --selector-keep-schedule "${SELECTOR_KEEP_SCHEDULE}"
+  --selector-teacher-keep-ratio "${SELECTOR_TEACHER_KEEP_RATIO}"
+  --selector-gradient-interval "${SELECTOR_GRADIENT_INTERVAL}"
+  --selector-mask-start-step "${SELECTOR_MASK_START_STEP}"
+  --selector-teacher-mode "${SELECTOR_TEACHER_MODE:-gradient_abs}"
+  --selector-signed-temperature "${SELECTOR_SIGNED_TEMPERATURE:-1.0}"
+  --selector-counterfactual-interval "${SELECTOR_COUNTERFACTUAL_INTERVAL:-4}"
+  --selector-counterfactual-weight "${SELECTOR_COUNTERFACTUAL_WEIGHT:-1.0}"
+  --selector-counterfactual-scale "${SELECTOR_COUNTERFACTUAL_SCALE:-0.05}"
+  --selector-counterfactual-tile-h "${SELECTOR_COUNTERFACTUAL_TILE_H:-3}"
+  --selector-counterfactual-tile-w "${SELECTOR_COUNTERFACTUAL_TILE_W:-4}"
+  --selector-teacher-timesteps "${SELECTOR_TEACHER_TIMESTEPS:-}"
+  --selector-counterfactual-dump-dir "${SELECTOR_COUNTERFACTUAL_DUMP_DIR:-}"
+  --selector-counterfactual-replicate "${SELECTOR_COUNTERFACTUAL_REPLICATE:-0}"
   --auto_eval_ckpt_kind "${AUTO_EVAL_CKPT_KIND}"
   --infer_all_output_root "${INFER_ALL_OUTPUT_ROOT}"
 )
@@ -78,16 +100,44 @@ args=(
 if [[ -n "${FULL_CKPT:-}" ]]; then args+=(--full_ckpt "${FULL_CKPT}"); fi
 if [[ -n "${CACHE_PATH:-}" ]]; then args+=(--cache_path "${CACHE_PATH}"); fi
 if [[ -n "${TRAIN_LOG_NAMES:-}" ]]; then args+=(--train_log_names "${TRAIN_LOG_NAMES}"); fi
+if [[ -n "${TRAIN_SCENE_MANIFEST:-}" ]]; then args+=(--train_scene_manifest "${TRAIN_SCENE_MANIFEST}"); fi
+if [[ -n "${FORBIDDEN_SCENE_MANIFEST:-}" ]]; then args+=(--forbidden_scene_manifest "${FORBIDDEN_SCENE_MANIFEST}"); fi
+if [[ "${ALLOW_MISSING_ROUTE:-0}" == "1" ]]; then args+=(--allow_missing_route); fi
+args+=(--windows_per_scene "${WINDOWS_PER_SCENE:-1}")
 if [[ -n "${MAX_SCENES:-}" ]]; then args+=(--max_scenes "${MAX_SCENES}"); fi
 if [[ -n "${LORA_CHECKPOINT:-}" ]]; then args+=(--lora_checkpoint "${LORA_CHECKPOINT}"); fi
+if [[ -n "${SELECTOR_CHECKPOINT:-}" ]]; then args+=(--selector-checkpoint "${SELECTOR_CHECKPOINT}"); fi
+if [[ -n "${SELECTOR_TEACHER_SEED:-}" ]]; then args+=(--selector-teacher-seed "${SELECTOR_TEACHER_SEED}"); fi
 if [[ -n "${GRADIENT_CLIP_NORM:-}" ]]; then args+=(--gradient_clip_norm "${GRADIENT_CLIP_NORM}"); fi
 
 if [[ "${USE_CACHE_ONLY:-0}" == "1" ]]; then args+=(--use_cache_only); fi
 if [[ "${FORCE_CACHE_COMPUTATION:-0}" == "1" ]]; then args+=(--force_cache_computation); fi
 if [[ "${SKIP_MISSING_FILES:-0}" == "1" ]]; then args+=(--skip_missing_files); fi
+if [[ "${FIND_UNUSED_PARAMETERS:-1}" == "1" ]]; then
+  args+=(--find_unused_parameters)
+else
+  args+=(--no_find_unused_parameters)
+fi
 if [[ "${PRINT_NAVSIM_TOKENS:-0}" == "1" ]]; then args+=(--print_navsim_tokens); fi
 if [[ "${SURROUND_VIEW:-0}" == "1" ]]; then args+=(--surround_view); fi
 if [[ "${USE_TRAJECTORY:-1}" == "1" ]]; then args+=(--use_trajectory); fi
+if [[ "${ENABLE_ONLINE_SELECTOR:-0}" == "1" ]]; then args+=(--enable-online-selector); fi
+if [[ "${SELECTOR_ONLY:-0}" == "1" ]]; then args+=(--selector-only); fi
+if [[ "${SELECTOR_COUNTERFACTUAL_PHYSICAL:-0}" == "1" ]]; then args+=(--selector-counterfactual-physical); fi
+if [[ "${SELECTOR_COUNTERFACTUAL_SWEEP_ALL:-0}" == "1" ]]; then args+=(--selector-counterfactual-sweep-all); fi
+args+=(--selector-counterfactual-replays "${SELECTOR_COUNTERFACTUAL_REPLAYS:-1}")
+if [[ -n "${SELECTOR_COUNTERFACTUAL_SCALES:-}" ]]; then args+=(--selector-counterfactual-scales "${SELECTOR_COUNTERFACTUAL_SCALES}"); fi
+if [[ -n "${SELECTOR_COUNTERFACTUAL_ABSTAIN_EPS:-}" ]]; then args+=(--selector-counterfactual-abstain-eps "${SELECTOR_COUNTERFACTUAL_ABSTAIN_EPS}"); fi
+if [[ -n "${SELECTOR_COUNTERFACTUAL_NOISE_SEED:-}" ]]; then args+=(--selector-counterfactual-noise-seed "${SELECTOR_COUNTERFACTUAL_NOISE_SEED}"); fi
+if [[ -n "${DRIVEVA_RUN_ID:-}" ]]; then args+=(--run-id "${DRIVEVA_RUN_ID}"); fi
+if [[ -n "${SELECTOR_TEACHER_DISP_SCALE:-}" ]]; then args+=(--selector-teacher-disp-scale "${SELECTOR_TEACHER_DISP_SCALE}"); fi
+if [[ -n "${SELECTOR_TEACHER_DISP_NORMALIZE:-}" ]]; then args+=(--selector-teacher-disp-normalize "${SELECTOR_TEACHER_DISP_NORMALIZE}"); fi
+if [[ -n "${SELECTOR_RANKING_LOSS_WEIGHT:-}" ]]; then args+=(--selector-ranking-loss-weight "${SELECTOR_RANKING_LOSS_WEIGHT}"); fi
+if [[ -n "${SELECTOR_RANKING_MARGIN:-}" ]]; then args+=(--selector-ranking-margin "${SELECTOR_RANKING_MARGIN}"); fi
+if [[ -n "${SELECTOR_RANKING_MAX_PAIRS:-}" ]]; then args+=(--selector-ranking-max-pairs "${SELECTOR_RANKING_MAX_PAIRS}"); fi
+if [[ -n "${SELECTOR_CRITICAL_TOKEN_MODE:-}" ]]; then args+=(--selector-critical-token-mode "${SELECTOR_CRITICAL_TOKEN_MODE}"); fi
+if [[ -n "${SELECTOR_CRITICAL_TOKEN_DILATION:-}" ]]; then args+=(--selector-critical-token-dilation "${SELECTOR_CRITICAL_TOKEN_DILATION}"); fi
+if [[ -n "${SELECTOR_LONG_HORIZON_WEIGHTS:-}" ]]; then args+=(--selector-long-horizon-weights "${SELECTOR_LONG_HORIZON_WEIGHTS}"); fi
 if [[ "${USE_GRADIENT_CHECKPOINTING:-1}" == "1" ]]; then
   args+=(--use_gradient_checkpointing 1)
 else

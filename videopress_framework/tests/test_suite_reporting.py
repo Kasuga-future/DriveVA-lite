@@ -1,6 +1,8 @@
 import json
 
-from evaluation.statistics import aggregate_suite, write_suite_tables
+import pytest
+
+from evaluation.statistics import aggregate_records, aggregate_suite, write_suite_tables
 from evaluation.visualization import generate_suite_visualizations
 
 
@@ -82,3 +84,148 @@ def test_multi_round_statistics_and_visualizations(tmp_path):
     assert {"pdm_by_method", "latency_by_method", "compression_ratios", "pdm_vs_latency", "round_stability", "summary_table"} <= set(plots)
     assert all((tmp_path / "visualizations" / f"{name}.png").is_file() for name in plots)
 
+
+def test_record_aggregation_excludes_invalid_placeholders_and_uses_true_k_extrema():
+    rows = [
+        {
+            "valid": True,
+            "pdm": 0.8,
+            "K": 100,
+            "metadata": {"dynamic_n_kept_min": 80, "dynamic_n_kept_max": 120},
+        },
+        {
+            "valid": True,
+            "pdm": 0.6,
+            "K": 200,
+            "metadata": {"dynamic_n_kept_min": 140, "dynamic_n_kept_max": 240},
+        },
+        {
+            "valid": False,
+            "pdm": 0.0,
+            "K": 0,
+            "metadata": {"dynamic_n_kept_min": 0, "dynamic_n_kept_max": 0},
+        },
+    ]
+    summary = aggregate_records(rows)
+    assert summary["n_scenes"] == 3
+    assert summary["valid_scenes"] == 2
+    assert summary["pdm"] == 0.7
+    assert summary["K_mean"] == 150.0
+    assert summary["dynamic_K_min"] == 80.0
+    assert summary["dynamic_K_max"] == 240.0
+
+
+
+def _make_run_with_persistence(root, name, end_layer, pdm, *, threshold=0.4):
+    """One run whose press carries an explicit cross-layer persistence block."""
+
+    run = root / name
+    run.mkdir(parents=True)
+    (run / "records.jsonl").write_text(
+        json.dumps(
+            {
+                "scene_token": "scene-a",
+                "press_name": "scorer_press",
+                "scorer": "learned_planning_selector",
+                "selector": "threshold",
+                "operator": "kv_prune",
+                "domain": "last_history",
+                "K": 2,
+                "n_candidate": 4,
+                "pdm": pdm,
+                "valid": True,
+                "metadata": {},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (run / "summary.json").write_text(
+        json.dumps(
+            {
+                "mode": "physical",
+                "backend": "synthetic",
+                "press": {
+                    "name": "scorer_press",
+                    "domain": "last_history",
+                    "scorer": {"name": "learned_planning_selector", "layer": 15},
+                    "selector": {"name": "threshold", "threshold": threshold},
+                    "operator": {"name": "kv_prune"},
+                    "cross_layer_persistence": {
+                        "enabled": True,
+                        "end_layer": end_layer,
+                        "mode": "hidden_sequence",
+                    },
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return run
+
+
+def test_suite_refuses_to_pool_two_interventions_under_one_method_name(tmp_path):
+    """A method NAME is not a unique key for the intervention.
+
+    `physical_<scorer>_<mode>_persistent_layer_<NN>` is built from
+    scorer/mode/layer only, so an arm with `end_layer == source_layer` (which
+    silently disables cross-layer persistence) collides with the true-persistence
+    arm of the same name.  Pooling them would merge two different experiments, so
+    the aggregator must refuse instead.
+    """
+
+    plain = _make_run_with_persistence(tmp_path, "run_plain", None, 0.90)
+    early = _make_run_with_persistence(tmp_path, "run_early_stop", 15, 0.50)
+    shared_name = "physical_learned_planning_selector_hidden_persistent_layer_15"
+    manifest = {
+        "suite_name": "collision",
+        "runs": [
+            {"round": 0, "method": shared_name, "protocol": "physical", "output_dir": str(plain.relative_to(tmp_path))},
+            {"round": 1, "method": shared_name, "protocol": "physical", "output_dir": str(early.relative_to(tmp_path))},
+        ],
+    }
+    (tmp_path / "suite_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    try:
+        aggregate_suite(tmp_path)
+    except ValueError as exc:
+        assert "DIFFERENT interventions" in str(exc)
+    else:
+        raise AssertionError("two different interventions must not be pooled by name")
+
+
+def test_suite_pools_rounds_of_the_same_intervention(tmp_path):
+    """The guard must not break the legitimate case: same intervention, 2 rounds."""
+
+    first = _make_run_with_persistence(tmp_path, "run_r0", None, 0.90)
+    second = _make_run_with_persistence(tmp_path, "run_r1", None, 0.70)
+    name = "physical_learned_planning_selector_hidden_persistent_layer_15"
+    manifest = {
+        "suite_name": "legit",
+        "runs": [
+            {"round": 0, "method": name, "protocol": "physical", "output_dir": str(first.relative_to(tmp_path))},
+            {"round": 1, "method": name, "protocol": "physical", "output_dir": str(second.relative_to(tmp_path))},
+        ],
+    }
+    (tmp_path / "suite_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    summary = aggregate_suite(tmp_path)
+    assert len(summary["method_rows"]) == 1
+    assert summary["method_rows"][0]["rounds"] == 2
+
+
+def test_suite_identity_includes_selector_parameters(tmp_path):
+    first = _make_run_with_persistence(tmp_path, "run_t04", None, 0.90, threshold=0.4)
+    second = _make_run_with_persistence(tmp_path, "run_t05", None, 0.70, threshold=0.5)
+    name = "physical_learned_planning_selector_hidden_persistent_layer_15"
+    manifest = {
+        "suite_name": "threshold-collision",
+        "runs": [
+            {"round": 0, "method": name, "protocol": "physical", "output_dir": str(first.relative_to(tmp_path))},
+            {"round": 1, "method": name, "protocol": "physical", "output_dir": str(second.relative_to(tmp_path))},
+        ],
+    }
+    (tmp_path / "suite_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="DIFFERENT interventions"):
+        aggregate_suite(tmp_path)

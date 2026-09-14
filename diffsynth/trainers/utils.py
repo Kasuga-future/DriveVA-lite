@@ -309,9 +309,6 @@ def launch_training_task(
     if num_workers > 0:
         dataloader_kwargs["prefetch_factor"] = 2
     dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
-    updates_per_epoch = max(math.ceil(len(dataloader) / gradient_accumulation_steps), 1)
-    total_steps = max(num_epochs * updates_per_epoch, 1)
-
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
         kwargs_handlers=[
@@ -319,6 +316,12 @@ def launch_training_task(
             InitProcessGroupKwargs(timeout=timedelta(seconds=max(ddp_timeout_seconds, 1))),
         ],
     )
+    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    # ``accelerator.prepare`` shards the dataloader.  Computing total_steps
+    # before this point over-counted by world_size, so cosine/linear schedules
+    # never reached their registered endpoint and progress logs were wrong.
+    updates_per_epoch = max(math.ceil(len(dataloader) / gradient_accumulation_steps), 1)
+    total_steps = max(num_epochs * updates_per_epoch, 1)
     if accelerator.is_main_process:
         print(
             "[train] setup:",
@@ -330,9 +333,8 @@ def launch_training_task(
             f"lr_scheduler={scheduler_type}",
             f"warmup_steps={warmup_steps}",
             f"grad_accum={gradient_accumulation_steps}",
+            f"world_size={accelerator.num_processes}",
         )
-
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     unwrapped_model = accelerator.unwrap_model(model)
     if hasattr(unwrapped_model, "init_ema"):
         if use_ema:
@@ -350,12 +352,16 @@ def launch_training_task(
             unwrapped_model.init_ema(enabled=False)
 
     step_id = 0
+    metrics_fp = None
+    if bool(getattr(args, "enable_online_selector", False)) and accelerator.is_main_process:
+        metrics_fp = open(os.path.join(str(getattr(args, "output_path", ".")), "selector_metrics.jsonl"), "a", encoding="utf-8")
     optimizer.zero_grad()
     last_log = time.perf_counter()
     for epoch_id in range(num_epochs):
         progress = tqdm(dataloader, disable=not accelerator.is_main_process, desc=f"epoch {epoch_id}")
         for data in progress:
             with accelerator.accumulate(model):
+                step_wall_start = time.perf_counter()
                 current_lr = learning_rate * _lr_factor(
                     step_id,
                     total_steps,
@@ -366,15 +372,177 @@ def launch_training_task(
                 for group in optimizer.param_groups:
                     group["lr"] = current_lr
 
-                output = model(data)
+                output = model(data, global_step=step_id)
                 if isinstance(output, dict):
                     loss = output["loss"]
                     video_loss = _to_float(output.get("video_loss"))
                     traj_loss = _to_float(output.get("trajectory_loss"))
+                    selector_loss = _to_float(output.get("selector_bce"))
+                    selector_total_loss = _to_float(output.get("selector_total_loss"))
+                    selector_ranking_loss = _to_float(output.get("selector_ranking_loss"))
+                    selector_pairwise_accuracy = _to_float(output.get("selector_pairwise_accuracy"))
+                    selector_ndcg_at_k = _to_float(output.get("selector_ndcg_at_k"))
+                    selector_protected_token_count = _to_float(
+                        output.get("selector_protected_token_count")
+                    )
+                    keep_ratio = _to_float(output.get("current_keep_ratio"))
+                    grad_score_mean = _to_float(output.get("gradient_score_mean"))
+                    grad_score_std = _to_float(output.get("gradient_score_std"))
+                    grad_score_max = _to_float(output.get("gradient_score_max"))
+                    grad_nonzero = _to_float(output.get("gradient_score_nonzero_ratio"))
+                    topk_count = _to_float(output.get("gradient_topk_count"))
+                    overlap = _to_float(output.get("selector_topk_overlap_gradient", output.get("selector_topk_overlap")))
+                    teacher_ms = _to_float(output.get("gradient_teacher_time_ms"))
+                    pos_logit = _to_float(output.get("selector_positive_logit_mean"))
+                    neg_logit = _to_float(output.get("selector_negative_logit_mean"))
+                    counterfactual_delta = _to_float(output.get("counterfactual_relative_delta"))
+                    counterfactual_target = _to_float(output.get("counterfactual_helpful_target"))
+                    counterfactual_confidence = _to_float(output.get("counterfactual_confidence"))
+                    counterfactual_group_logit = _to_float(output.get("counterfactual_group_logit"))
+                    counterfactual_group_index = _to_float(output.get("counterfactual_group_index"))
+                    counterfactual_timestep_mean = _to_float(
+                        output.get("counterfactual_timestep_mean")
+                    )
+                    counterfactual_timestep_min = _to_float(
+                        output.get("counterfactual_timestep_min")
+                    )
+                    counterfactual_timestep_max = _to_float(
+                        output.get("counterfactual_timestep_max")
+                    )
+                    counterfactual_group_probability_mean = _to_float(
+                        output.get("counterfactual_group_probability_mean")
+                    )
+                    counterfactual_group_probability_std = _to_float(
+                        output.get("counterfactual_group_probability_std")
+                    )
+                    counterfactual_probability_mean = _to_float(
+                        output.get("counterfactual_probability_mean")
+                    )
+                    counterfactual_measured_delta = _to_float(
+                        output.get("counterfactual_measured_delta")
+                    )
+                    counterfactual_baseline_loss = _to_float(
+                        output.get("counterfactual_baseline_loss_unweighted")
+                    )
+                    counterfactual_masked_loss = _to_float(
+                        output.get("counterfactual_masked_loss_unweighted")
+                    )
+                    counterfactual_control_mask_delta = _to_float(
+                        output.get("counterfactual_control_mask_delta")
+                    )
+                    counterfactual_control_mask_delta_max = _to_float(
+                        output.get("counterfactual_control_mask_delta_max")
+                    )
+                    counterfactual_control_identity_delta = _to_float(
+                        output.get("counterfactual_control_identity_delta")
+                    )
+                    counterfactual_control_identity_loss = _to_float(
+                        output.get("counterfactual_control_identity_loss")
+                    )
+                    counterfactual_traj_disp_mean = _to_float(
+                        output.get("counterfactual_traj_disp_mean")
+                    )
+                    counterfactual_traj_disp_relative = _to_float(
+                        output.get("counterfactual_traj_disp_relative")
+                    )
+                    counterfactual_traj_endpoint_disp = _to_float(
+                        output.get("counterfactual_traj_endpoint_disp")
+                    )
+                    counterfactual_traj_disp_long_horizon = _to_float(
+                        output.get("counterfactual_traj_disp_long_horizon")
+                    )
+                    counterfactual_traj_disp_long_horizon_relative = _to_float(
+                        output.get("counterfactual_traj_disp_long_horizon_relative")
+                    )
+                    counterfactual_replays = _to_float(output.get("counterfactual_replays"))
+                    counterfactual_sign_agreement_mean = _to_float(
+                        output.get("counterfactual_sign_agreement_mean")
+                    )
+                    counterfactual_mean_delta = _to_float(
+                        output.get("counterfactual_mean_delta")
+                    )
+                    counterfactual_replay_std_mean = _to_float(
+                        output.get("counterfactual_replay_std_mean")
+                    )
+                    counterfactual_single_delta_std = _to_float(
+                        output.get("counterfactual_single_delta_std")
+                    )
+                    counterfactual_mean_delta_std = _to_float(
+                        output.get("counterfactual_mean_delta_std")
+                    )
+                    counterfactual_removal_count_mean = _to_float(
+                        output.get("counterfactual_removal_count_mean")
+                    )
+                    counterfactual_abstain_ratio = _to_float(
+                        output.get("counterfactual_abstain_ratio")
+                    )
+                    counterfactual_measured_delta_single = _to_float(
+                        output.get("counterfactual_measured_delta_single")
+                    )
+                    counterfactual_control_mask_loss_first = _to_float(
+                        output.get("counterfactual_control_mask_loss_first")
+                    )
+                    counterfactual_control_mask_loss_repeat = _to_float(
+                        output.get("counterfactual_control_mask_loss_repeat")
+                    )
+                    counterfactual_displacement_mean = _to_float(
+                        output.get("counterfactual_displacement_mean")
+                    )
+                    counterfactual_displacement_target_mean = _to_float(
+                        output.get("counterfactual_displacement_target_mean")
+                    )
+                    counterfactual_supervised_tokens = _to_float(
+                        output.get("counterfactual_supervised_tokens")
+                    )
+                    selector_bce_unweighted = _to_float(
+                        output.get("selector_bce_unweighted")
+                    )
                 else:
                     loss = output
                     video_loss = None
                     traj_loss = None
+                    selector_loss = None
+                    selector_total_loss = selector_ranking_loss = None
+                    selector_pairwise_accuracy = selector_ndcg_at_k = None
+                    selector_protected_token_count = None
+                    keep_ratio = None
+                    grad_score_mean = None
+                    grad_score_std = grad_score_max = grad_nonzero = topk_count = overlap = teacher_ms = pos_logit = neg_logit = None
+                    counterfactual_delta = counterfactual_target = counterfactual_confidence = None
+                    counterfactual_group_logit = counterfactual_group_index = None
+                    counterfactual_timestep_mean = None
+                    counterfactual_timestep_min = None
+                    counterfactual_timestep_max = None
+                    counterfactual_group_probability_mean = None
+                    counterfactual_group_probability_std = None
+                    counterfactual_probability_mean = None
+                    counterfactual_measured_delta = None
+                    counterfactual_baseline_loss = None
+                    counterfactual_masked_loss = None
+                    counterfactual_control_mask_delta = None
+                    counterfactual_control_mask_delta_max = None
+                    counterfactual_control_identity_delta = None
+                    counterfactual_control_identity_loss = None
+                    counterfactual_traj_disp_mean = None
+                    counterfactual_traj_disp_relative = None
+                    counterfactual_traj_endpoint_disp = None
+                    counterfactual_traj_disp_long_horizon = None
+                    counterfactual_traj_disp_long_horizon_relative = None
+                    counterfactual_replays = None
+                    counterfactual_sign_agreement_mean = None
+                    counterfactual_mean_delta = None
+                    counterfactual_replay_std_mean = None
+                    counterfactual_single_delta_std = None
+                    counterfactual_mean_delta_std = None
+                    counterfactual_removal_count_mean = None
+                    counterfactual_abstain_ratio = None
+                    counterfactual_measured_delta_single = None
+                    counterfactual_control_mask_loss_first = None
+                    counterfactual_control_mask_loss_repeat = None
+                    counterfactual_displacement_mean = None
+                    counterfactual_displacement_target_mean = None
+                    counterfactual_supervised_tokens = None
+                    selector_bce_unweighted = None
 
                 accelerator.backward(loss)
                 if gradient_clip_norm is not None and accelerator.sync_gradients:
@@ -396,11 +564,76 @@ def launch_training_task(
                             f"loss={_to_float(loss):.6f} "
                             f"video_loss={video_loss if video_loss is not None else 'n/a'} "
                             f"traj_loss={traj_loss if traj_loss is not None else 'n/a'} "
+                            f"selector_bce={selector_loss if selector_loss is not None else 'n/a'} "
+                            f"keep_ratio={keep_ratio if keep_ratio is not None else 'n/a'} "
+                            f"gradient_score_mean={grad_score_mean if grad_score_mean is not None else 'n/a'} "
                             f"lr={current_lr:.6e} "
                             f"elapsed_s={elapsed:.2f}"
                         )
+                    if metrics_fp is not None and accelerator.is_main_process:
+                        metrics_fp.write(json.dumps({
+                            "run_id": getattr(args, "run_id", None),
+                            "global_step": step_id, "driveva_total_loss": _to_float(loss),
+                            "trajectory_loss": traj_loss, "selector_bce": selector_loss,
+                            "selector_total_loss": selector_total_loss,
+                            "selector_ranking_loss": selector_ranking_loss,
+                            "selector_pairwise_accuracy": selector_pairwise_accuracy,
+                            "selector_ndcg_at_k": selector_ndcg_at_k,
+                            "selector_protected_token_count": selector_protected_token_count,
+                            "gradient_score_mean": grad_score_mean, "gradient_score_std": grad_score_std,
+                            "gradient_score_max": grad_score_max, "gradient_score_nonzero_ratio": grad_nonzero,
+                            "gradient_topk_count": topk_count, "selector_topk_overlap_gradient": overlap,
+                            "gradient_teacher_time_ms": teacher_ms,
+                            "selector_positive_logit_mean": pos_logit, "selector_negative_logit_mean": neg_logit,
+                            "counterfactual_relative_delta": counterfactual_delta,
+                            "counterfactual_helpful_target": counterfactual_target,
+                            "counterfactual_confidence": counterfactual_confidence,
+                            "counterfactual_group_logit": counterfactual_group_logit,
+                            "counterfactual_group_index": counterfactual_group_index,
+                            "counterfactual_timestep_mean": counterfactual_timestep_mean,
+                            "counterfactual_timestep_min": counterfactual_timestep_min,
+                            "counterfactual_timestep_max": counterfactual_timestep_max,
+                            "counterfactual_group_probability_mean": counterfactual_group_probability_mean,
+                            "counterfactual_group_probability_std": counterfactual_group_probability_std,
+                            "counterfactual_probability_mean": counterfactual_probability_mean,
+                            "counterfactual_measured_delta": counterfactual_measured_delta,
+                            "counterfactual_baseline_loss_unweighted": counterfactual_baseline_loss,
+                            "counterfactual_masked_loss_unweighted": counterfactual_masked_loss,
+                            "counterfactual_control_mask_delta": counterfactual_control_mask_delta,
+                            "counterfactual_control_mask_delta_max": counterfactual_control_mask_delta_max,
+                            "counterfactual_control_identity_delta": counterfactual_control_identity_delta,
+                            "counterfactual_control_identity_loss": counterfactual_control_identity_loss,
+                            "counterfactual_traj_disp_mean": counterfactual_traj_disp_mean,
+                            "counterfactual_traj_disp_relative": counterfactual_traj_disp_relative,
+                            "counterfactual_traj_endpoint_disp": counterfactual_traj_endpoint_disp,
+                            "counterfactual_traj_disp_long_horizon": counterfactual_traj_disp_long_horizon,
+                            "counterfactual_traj_disp_long_horizon_relative": counterfactual_traj_disp_long_horizon_relative,
+                            "counterfactual_replays": counterfactual_replays,
+                            "counterfactual_sign_agreement_mean": counterfactual_sign_agreement_mean,
+                            "counterfactual_mean_delta": counterfactual_mean_delta,
+                            "counterfactual_replay_std_mean": counterfactual_replay_std_mean,
+                            "counterfactual_single_delta_std": counterfactual_single_delta_std,
+                            "counterfactual_mean_delta_std": counterfactual_mean_delta_std,
+                            "counterfactual_removal_count_mean": counterfactual_removal_count_mean,
+                            "counterfactual_abstain_ratio": counterfactual_abstain_ratio,
+                            "counterfactual_measured_delta_single": counterfactual_measured_delta_single,
+                            "counterfactual_control_mask_loss_first": counterfactual_control_mask_loss_first,
+                            "counterfactual_control_mask_loss_repeat": counterfactual_control_mask_loss_repeat,
+                            "counterfactual_displacement_mean": counterfactual_displacement_mean,
+                            "counterfactual_displacement_target_mean": counterfactual_displacement_target_mean,
+                            "counterfactual_supervised_tokens": counterfactual_supervised_tokens,
+                            "selector_bce_unweighted": selector_bce_unweighted,
+                            "step_wall_time_ms": (time.perf_counter() - step_wall_start) * 1000.0,
+                        }) + "\n")
+                        metrics_fp.flush()
 
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
 
     model_logger.on_training_end(accelerator, model, save_steps)
+    if metrics_fp is not None:
+        metrics_fp.close()
+    # Explicitly tear down distributed state.  Relying on interpreter shutdown
+    # emits a ProcessGroupNCCL warning and can leave peers blocked on some
+    # kernel/NCCL combinations.
+    accelerator.end_training()

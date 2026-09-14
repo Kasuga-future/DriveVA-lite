@@ -1,5 +1,6 @@
 # Python caches
 __pycache__/
+build/
 *.py[cod]
 *.pyo
 *.pyd
@@ -7,12 +8,15 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .ipynb_checkpoints/
+*.egg-info/
 
 # Virtual environments
 .venv/
 venv/
 env/
 ENV/
+envs/
+.cache
 
 # OS/editor files
 .DS_Store
@@ -27,6 +31,9 @@ __MACOSX/
 data/
 models/
 outputs/
+/data
+/models
+/outputs
 eval_results/
 logs/
 wandb/
@@ -48,3 +55,32 @@ checkpoints/*
 *.avi
 *.mov
 *.webm
+
+# External runtime repositories are stored on NVMe and linked here.
+third_party/nuplan-devkit
+third_party/nuscenes-devkit
+third_party/navsim-v1.1
+
+# Local experiment notes and generated VideoPress analyses.
+/press.md
+/videopress_framework/reports/
+
+# One-off experiment launchers/configurations remain local and are not part of
+# the reusable framework history.
+/videopress_framework/scripts/*.sh
+/videopress_framework/scripts/*_202609*.py
+/videopress_framework/scripts/analyze_*.py
+/videopress_framework/scripts/audit_claims_table.py
+/videopress_framework/scripts/audit_code_claims.py
+/videopress_framework/scripts/audit_dead_zone.py
+/videopress_framework/scripts/audit_label_variants.py
+/videopress_framework/scripts/audit_official_test.py
+/videopress_framework/scripts/audit_probe_stats.py
+/videopress_framework/scripts/audit_within_scene_ci.py
+/videopress_framework/scripts/dead_zone_signal_check.py
+/videopress_framework/scripts/label_variant_comparison.py
+/videopress_framework/scripts/build_test_derived_mini_split.py
+/videopress_framework/configs/press/history_*.yaml
+/videopress_framework/configs/press/physical_*.yaml
+/videopress_framework/configs/scene_filters/
+/videopress_framework/tests/test_candidate_pool_analysis.py

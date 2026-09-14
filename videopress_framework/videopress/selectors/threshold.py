@@ -25,6 +25,8 @@ class ThresholdSelector(TokenSelector):
     def select_from_order(self, order: torch.Tensor, scores: torch.Tensor, domain, K: int | None = None, ctx=None) -> SelectionResult:
         if order.ndim != 2 or order.shape != scores.shape:
             raise ValueError("frozen ranking must have the same shape as scores")
+        if K is not None and not 0 <= int(K) <= domain.n_candidate:
+            raise ValueError(f"K={K} outside [0, {domain.n_candidate}]")
         keep_mask = scores >= self.threshold
         if K is not None:
             # Threshold selection is allowed to return fewer tokens, but an explicit
@@ -32,13 +34,20 @@ class ThresholdSelector(TokenSelector):
             rank_mask = torch.zeros_like(keep_mask)
             rank_mask.scatter_(1, order[:, :K], True)
             keep_mask &= rank_mask
+        proposed = keep_mask.sum(dim=1)
+        actual_k = int(proposed.max().item()) if proposed.numel() else 0
+        # Physical tensors must remain rectangular. For a multi-sample batch,
+        # conservatively fill rows below the largest proposed count with their
+        # next-best tokens instead of failing or dropping another sample's
+        # threshold-qualified tokens. Batch size one is bit-identical.
+        rectangular_mask = torch.zeros_like(keep_mask)
+        if actual_k:
+            rectangular_mask.scatter_(1, order[:, :actual_k], True)
+        keep_mask = rectangular_mask
         keep_local_rows, drop_local_rows = [], []
         for row in keep_mask:
             keep_local_rows.append(torch.where(row)[0])
             drop_local_rows.append(torch.where(~row)[0])
-        lengths = {int(row.numel()) for row in keep_local_rows}
-        if len(lengths) > 1:
-            raise ValueError("ThresholdSelector needs equal keep counts across a batch")
         keep_local = torch.stack(keep_local_rows) if keep_local_rows else scores.new_empty((0, 0), dtype=torch.long)
         drop_local = torch.stack(drop_local_rows) if drop_local_rows else scores.new_empty((0, 0), dtype=torch.long)
         candidate = domain.candidate_indices
@@ -47,5 +56,14 @@ class ThresholdSelector(TokenSelector):
             drop_candidate_indices=drop_local,
             keep_global_indices=candidate[keep_local],
             K=int(keep_local.shape[1]),
-            metadata={"selector": self.name, "threshold": self.threshold},
+            metadata={
+                "selector": self.name,
+                "threshold": self.threshold,
+                "dynamic": True,
+                "proposed_K_per_batch": proposed.detach().cpu().tolist(),
+                "actual_K": actual_k,
+                "batch_conservative_fill": bool(
+                    proposed.numel() and not torch.all(proposed == actual_k)
+                ),
+            },
         )

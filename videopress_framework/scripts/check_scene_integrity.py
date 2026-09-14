@@ -196,6 +196,48 @@ def _check_event_runtime(
         except (TypeError, ValueError):
             errors.append(f"{location}: invalid candidate range metadata")
 
+    retention_policy = last.get("retention_policy")
+    if retention_policy is not None:
+        try:
+            history = int(n_history)
+            candidates = int(n_candidate)
+            per_latent = int(last["history_latent_token_count"])
+            effective_counts = last["effective_history_latent_kept_counts"]
+            if str(resolved) not in {"history", "all_history"}:
+                errors.append(f"{location}: retention policy requires history domain, got {resolved!r}")
+            if candidates != history or history != 2 * per_latent:
+                errors.append(
+                    f"{location}: retention policy requires two complete history latents; "
+                    f"history={history} candidate={candidates} per_latent={per_latent}"
+                )
+            if not isinstance(effective_counts, list) or len(effective_counts) != 1:
+                errors.append(f"{location}: invalid per-latent retention counts")
+            else:
+                counts = [int(value) for value in effective_counts[0]]
+                expected = None
+                if retention_policy == "drop_previous_keep_last_100":
+                    expected = [0, per_latent]
+                elif retention_policy == "drop_previous_keep_last_50":
+                    expected = [0, int(round(per_latent * 0.5))]
+                elif retention_policy == "per_latent_keep_50":
+                    expected = [int(round(per_latent * 0.5))] * 2
+                elif retention_policy == "per_latent_keep_25":
+                    expected = [int(round(per_latent * 0.25))] * 2
+                elif retention_policy == "joint_keep_50":
+                    if sum(counts) != int(round(history * 0.5)):
+                        errors.append(f"{location}: joint_keep_50 counts are {counts}")
+                elif retention_policy == "joint_keep_25":
+                    if sum(counts) != int(round(history * 0.25)):
+                        errors.append(f"{location}: joint_keep_25 counts are {counts}")
+                else:
+                    errors.append(f"{location}: unknown retention policy {retention_policy!r}")
+                if expected is not None and counts != expected:
+                    errors.append(
+                        f"{location}: retention policy {retention_policy} expected {expected}, got {counts}"
+                    )
+        except (KeyError, TypeError, ValueError) as exc:
+            errors.append(f"{location}: invalid retention-policy metadata: {exc}")
+
     selection_operator = str(last.get("operator", ""))
     if selection_operator != "kv_merge" and last.get("selection_candidate_valid") is not True:
         errors.append(f"{location}: selection_candidate_valid is not true")

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import time
 from typing import Any, Iterator, Optional
@@ -101,6 +101,13 @@ class VideoPressRuntime:
         self.events = []
         self.artifacts = {}
         self.selector_latency_ms = 0.0
+        scorer = getattr(self.press, "scorer", None)
+        reset_observations = getattr(scorer, "reset_observations", None)
+        if reset_observations is not None:
+            reset_observations()
+        persistence_store = getattr(self, "_cross_layer_selection_store", None)
+        if persistence_store is not None:
+            persistence_store.clear()
 
     def set_layout(self, layout) -> None:
         self.layout = layout
@@ -148,6 +155,13 @@ class VideoPressRuntime:
         model_name = ctx.metadata.get("model_name") if isinstance(ctx.metadata, dict) else None
         if model_name is not None:
             signature = f"{signature}:model={model_name}"
+        candidate = ctx.domain.candidate_indices
+        candidate_start = int(candidate.min().item()) if candidate.numel() else -1
+        candidate_end = int(candidate.max().item()) + 1 if candidate.numel() else -1
+        signature = (
+            f"{signature}:domain={ctx.domain.name}:n={ctx.domain.n_candidate}:"
+            f"range={candidate_start}-{candidate_end}"
+        )
         layer_idx = ctx.layer_idx
         if layer_idx is None:
             layer_idx = getattr(scorer, "layer", None)
@@ -248,6 +262,26 @@ class VideoPressRuntime:
         self.record_result(ctx, result)
         return result
 
+    def execute_persistent_selection(self, ctx, selection, *, source_layer: int):
+        """Apply a previously scored selection without charging selector time."""
+
+        if self.press is None or not hasattr(self.press, "apply_with_selection"):
+            raise RuntimeError("active press cannot reuse a cross-layer selection")
+        result = self.press.apply_with_selection(ctx, None, selection)
+        result.metadata.update(
+            {
+                "cross_layer_persistent": True,
+                "persistent_selection_reused": True,
+                "selection_source_layer": int(source_layer),
+                "selection_applied_layer": ctx.layer_idx,
+            }
+        )
+        result.metadata.setdefault("timing", {})
+        result.metadata["timing"]["selector_latency_ms"] = 0.0
+        self._annotate_result_identity_and_selection(ctx, result)
+        self.record_result(ctx, result)
+        return result
+
     @staticmethod
     def _annotate_result_identity_and_selection(ctx, result) -> None:
         """Attach auditable scene/domain/selection facts to one result.
@@ -310,8 +344,29 @@ class VideoPressRuntime:
         )
 
     def record_result(self, ctx, result) -> CompressionEvent:
+        """Journal an audit snapshot without retaining activation tensors."""
+
         point = getattr(self.press, "injection_point", InjectionPoint.VIDEO_INPUT)
         point = InjectionPoint.parse(point).value
+        event_result = replace(
+            result,
+            output=None,
+            # Q/K/V are live operator outputs, not audit artifacts. Retaining
+            # them once per layer defeats the memory goal of persistent K/V
+            # pruning. The returned result below remains untouched for the
+            # active attention call.
+            aux={},
+        )
+        event_context = replace(
+            ctx,
+            # A zero-width view preserves batch/sequence shape for audit code
+            # without allocating storage or synchronizing the CUDA stream.
+            tokens=ctx.tokens.new_empty((ctx.batch_size, ctx.layout.total_length, 0)),
+            q=None,
+            k=None,
+            v=None,
+            trajectory_pred=None,
+        )
         event = CompressionEvent(
             key=CompressionEventKey(
                 scene_token=str(ctx.scene_token),
@@ -319,8 +374,8 @@ class VideoPressRuntime:
                 layer_idx=ctx.layer_idx,
                 injection_point=point,
             ),
-            result=result,
-            context=ctx,
+            result=event_result,
+            context=event_context,
         )
         self.events.append(event)
         self.last_result = result

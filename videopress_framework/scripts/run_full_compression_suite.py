@@ -41,6 +41,10 @@ from evaluation.visualization import generate_suite_visualizations
 from scripts.evaluate_press import make_synthetic_cohort, synthetic_metrics, synthetic_predict
 from videopress.factory import build_press
 from videopress.objectives import TrajectoryObjective
+from videopress.core.retention import (
+    HISTORY_RETENTION_POLICIES,
+    apply_history_retention_policy,
+)
 
 
 def parse_args(argv=None):
@@ -60,6 +64,12 @@ def parse_args(argv=None):
         help="optional comma-separated method names; default runs the complete suite",
     )
     parser.add_argument("--skip-plots", action="store_true", help="write tables but do not import matplotlib")
+    parser.add_argument(
+        "--retention-policy",
+        choices=tuple(HISTORY_RETENTION_POLICIES),
+        default=None,
+        help="apply one of the six two-history-latent deletion policies",
+    )
     return parser.parse_args(argv)
 
 
@@ -73,6 +83,8 @@ def _press_config(
     seed: int = 0,
     scope: str = "scene",
     name: str = "scorer_press",
+    domain: str = "last_history",
+    cross_layer_persistence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if name == "noop":
         return {"name": "noop"}
@@ -80,7 +92,7 @@ def _press_config(
         return {
             "name": name,
             "injection_point": "self_attn_kv",
-            "domain": "last_history",
+            "domain": domain,
             "feature": "tokens",
             "budget": {"type": "ratio", "value": 0.5, "reference": "eligible"},
         }
@@ -92,18 +104,109 @@ def _press_config(
     operator_section = {"name": operator}
     if operator_options:
         operator_section.update(operator_options)
-    return {
+    config = {
         "name": name,
         "injection_point": "video_input" if mode == "causal" else "self_attn_kv",
-        "domain": "last_history",
+        "domain": domain,
         "scorer": scorer_section,
         "selector": {"name": "topk"},
         "operator": operator_section,
         "budget": {"type": "ratio", "value": 0.5, "reference": "eligible"},
     }
+    if cross_layer_persistence is not None:
+        config["cross_layer_persistence"] = dict(cross_layer_persistence)
+    return config
 
 
-def method_specs(round_seed: int) -> list[dict[str, Any]]:
+def persistent_attention_vnorm_spec(
+    start_layer: int,
+    *,
+    domain: str = "last_history",
+    keep_ratio: float = 0.5,
+    end_layer: int | None = None,
+    persistence_mode: str = "kv_only",
+    persistence_enabled: bool = True,
+    name: str | None = None,
+    scorer_name: str = "action_attention_vnorm",
+    selector_config: dict[str, Any] | None = None,
+    scorer_options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build one physical action-aware persistent or one-shot method."""
+
+    start_layer = int(start_layer)
+    if start_layer < 0:
+        raise ValueError("persistent start_layer must be non-negative")
+    if not 0.0 <= float(keep_ratio) <= 1.0:
+        raise ValueError("persistent keep_ratio must be within [0, 1]")
+    if end_layer is not None and int(end_layer) < start_layer:
+        raise ValueError("persistent end_layer cannot precede start_layer")
+    persistence_mode = str(persistence_mode).strip().lower()
+    if persistence_mode not in {"kv_only", "hidden_sequence"}:
+        raise ValueError("persistence_mode must be kv_only or hidden_sequence")
+    persistence_enabled = bool(persistence_enabled)
+    if not persistence_enabled:
+        if end_layer is not None:
+            raise ValueError("one-shot pruning does not accept end_layer")
+        if persistence_mode != "kv_only":
+            raise ValueError("one-shot pruning only supports persistence_mode=kv_only")
+    mode_label = "kv" if persistence_mode == "kv_only" else "hidden"
+    scorer_name = str(scorer_name).strip().lower()
+    scorer_label = {
+        "action_attention_vnorm": "attention_vnorm",
+        "action_attention_vnorm_temporal": "attention_vnorm_temporal",
+        "action_contribution_stability": "contribution_stability",
+    }.get(scorer_name, scorer_name)
+    requested_scorer_options = dict(scorer_options or {})
+    feature_layer = requested_scorer_options.get("feature_layer")
+    if feature_layer is not None and int(feature_layer) != start_layer:
+        scorer_label = f"{scorer_label}_feature_{int(feature_layer):02d}"
+    selector_config = dict(selector_config or {"name": "topk"})
+    selector_label = {
+        "adaptive_mass": "_adaptive",
+        "history_threshold": "_history_threshold",
+        "history_quota": "_history_quota",
+    }.get(selector_config.get("name"), "")
+    persistence_label = "persistent" if persistence_enabled else "one_shot"
+    method_name = name or (
+        f"physical_{scorer_label}{selector_label}_{mode_label}_{persistence_label}_layer_{start_layer:02d}"
+    )
+    resolved_scorer_options = {
+        "layer": start_layer,
+        "action_mode": "mean",
+        **requested_scorer_options,
+    }
+    if scorer_name in {"action_attention_vnorm", "action_attention_vnorm_temporal"}:
+        resolved_scorer_options.setdefault("head_mode", "mean")
+    press = _press_config(
+        mode="physical",
+        scorer=scorer_name,
+        operator="kv_prune",
+        domain=domain,
+        scorer_options=resolved_scorer_options,
+        cross_layer_persistence={
+            "enabled": persistence_enabled,
+            "end_layer": end_layer,
+            "mode": persistence_mode,
+        },
+    )
+    press["selector"] = selector_config
+    press["budget"] = {
+        "type": "ratio",
+        # Adaptive selection needs the full candidate count as its safe
+        # fallback; fixed Top-K continues to use keep_ratio exactly.
+        "value": 1.0
+        if selector_config.get("name") in {"adaptive_mass", "history_threshold"}
+        else float(keep_ratio),
+        "reference": "eligible",
+    }
+    return {"name": method_name, "mode": "physical", "press": press}
+
+
+def method_specs(
+    round_seed: int,
+    domain: str = "last_history",
+    retention_policy: str | None = None,
+) -> list[dict[str, Any]]:
     """Return the method matrix for one round.
 
     Scorer seeds are round-specific for Random controls.  The data seed and
@@ -189,6 +292,16 @@ def method_specs(round_seed: int) -> list[dict[str, Any]]:
                 scorer_options={"reduction": "l2"},
             ),
         },
+        {
+            "name": "causal_planning_gradient_input_zero",
+            "mode": "causal",
+            "gradient": True,
+            "press": _press_config(
+                mode="causal",
+                scorer="planning_gradient_input",
+                operator="zero",
+            ),
+        },
     ]
     physical = [
         {"name": "physical_no_press", "mode": "physical", "press": _press_config(mode="physical", name="noop")},
@@ -222,13 +335,36 @@ def method_specs(round_seed: int) -> list[dict[str, Any]]:
                 scorer_options={"layer": 15, "head_mode": "mean", "action_mode": "mean"},
             ),
         },
+        persistent_attention_vnorm_spec(
+            15,
+            domain=domain,
+            name="physical_attention_vnorm_kv_prune_persistent",
+        ),
         {
             "name": "physical_similarity_merge",
             "mode": "physical",
             "press": _press_config(mode="physical", name="similarity_merge"),
         },
     ]
-    return causal + physical
+    specs = causal + physical
+    if retention_policy is not None:
+        # Similarity merge constructs groups rather than a Top-K selection and
+        # cannot honor the six exact per-latent quotas. Other perturbation
+        # controls remain useful and retain their explicit operator metadata.
+        specs = [
+            spec
+            for spec in specs
+            if spec["press"].get("name") != "similarity_merge"
+        ]
+    for spec in specs:
+        if spec["press"].get("name") != "noop":
+            if retention_policy is None:
+                spec["press"]["domain"] = domain
+            else:
+                spec["press"] = apply_history_retention_policy(
+                    spec["press"], retention_policy
+                )
+    return specs
 
 
 def _gradient_forward(tokens: torch.Tensor, ctx):
@@ -311,10 +447,14 @@ def run_suite(args) -> tuple[Path, dict[str, Any]]:
         "rounds": int(args.rounds),
         "max_scenes": int(args.max_scenes),
         "seed_base": int(args.seed_base),
+        "retention_policy": args.retention_policy,
         "methods": [],
         "runs": [],
     }
-    all_method_names = [spec["name"] for spec in method_specs(args.seed_base)]
+    all_method_names = [
+        spec["name"]
+        for spec in method_specs(args.seed_base, retention_policy=args.retention_policy)
+    ]
     manifest["methods"] = all_method_names if selected is None else [name for name in all_method_names if name in selected]
     if not manifest["methods"]:
         raise ValueError("--methods did not select a known method")
@@ -323,7 +463,11 @@ def run_suite(args) -> tuple[Path, dict[str, Any]]:
     evaluator = Evaluator(PROJECT_ROOT)
     for round_index in range(int(args.rounds)):
         round_seed = int(args.seed_base) + round_index
-        specs = [spec for spec in method_specs(round_seed) if spec["name"] in manifest["methods"]]
+        specs = [
+            spec
+            for spec in method_specs(round_seed, retention_policy=args.retention_policy)
+            if spec["name"] in manifest["methods"]
+        ]
         for spec in specs:
             run_dir = suite_root / f"round_{round_index:02d}" / spec["name"]
             config = _build_config(

@@ -54,6 +54,13 @@ def resolve_budget(budget: TokenBudget, layout: TokenLayout, domain: TokenDomain
         if not value.is_integer():
             raise ValueError("absolute token budget must be an integer")
         k = int(value)
+    elif budget.reference in {"each_history", "per_history_latent"}:
+        if domain.name not in {"history", "all_history"}:
+            raise ValueError("reference=each_history requires domain=history/all_history")
+        if domain.n_candidate != layout.history_video.length:
+            raise ValueError("reference=each_history requires the complete history domain")
+        per_latent = int(round(layout.tokens_per_latent * float(budget.value)))
+        k = per_latent * layout.num_cond_latents
     else:
         k = int(round(_reference_count(budget.reference, layout, domain) * float(budget.value)))
     if k < 0 or k > domain.n_candidate:
@@ -75,4 +82,46 @@ def budget_stats(layout: TokenLayout, domain: TokenDomain, kept: int) -> dict:
         "n_kept": int(kept),
         "history_keep_ratio": (float(kept) / n_history) if n_history else None,
         "eligible_keep_ratio": (float(kept) / n_eligible) if n_eligible else None,
+    }
+
+
+def history_retention_stats(layout: TokenLayout, domain: TokenDomain, keep_global_indices) -> dict:
+    """Report selected and effectively preserved tokens for every history latent.
+
+    Protected history positions are effectively preserved even though they are
+    not part of ``SelectionResult.K``.  Reporting both values avoids the old
+    ambiguity where last-history 50% looked like total-history 25%.
+    """
+
+    import torch
+
+    if not torch.is_tensor(keep_global_indices) or keep_global_indices.ndim != 2:
+        raise ValueError("keep_global_indices must have shape [B,K]")
+    device = keep_global_indices.device
+    selected = torch.zeros(
+        (keep_global_indices.shape[0], layout.total_length), dtype=torch.bool, device=device
+    )
+    if keep_global_indices.numel():
+        selected.scatter_(1, keep_global_indices.long(), True)
+    protected = domain.protected_mask.to(device).unsqueeze(0).expand_as(selected)
+    effective = selected | protected
+    selected_counts = []
+    effective_counts = []
+    for latent_index in range(layout.num_cond_latents):
+        frame = layout.frame_range(latent_index)
+        selected_counts.append(selected[:, frame.start : frame.end].sum(dim=1))
+        effective_counts.append(effective[:, frame.start : frame.end].sum(dim=1))
+    selected_matrix = torch.stack(selected_counts, dim=1) if selected_counts else selected.new_zeros((selected.shape[0], 0), dtype=torch.long)
+    effective_matrix = torch.stack(effective_counts, dim=1) if effective_counts else selected.new_zeros((selected.shape[0], 0), dtype=torch.long)
+    denominator = float(layout.tokens_per_latent)
+    return {
+        "history_latent_token_count": int(layout.tokens_per_latent),
+        "selected_history_latent_counts": selected_matrix.detach().cpu().tolist(),
+        "selected_history_latent_ratios": (selected_matrix.float() / denominator).detach().cpu().tolist(),
+        "effective_history_latent_kept_counts": effective_matrix.detach().cpu().tolist(),
+        "effective_history_latent_keep_ratios": (effective_matrix.float() / denominator).detach().cpu().tolist(),
+        "effective_history_kept": effective_matrix.sum(dim=1).detach().cpu().tolist(),
+        "effective_history_keep_ratio": (
+            effective_matrix.sum(dim=1).float() / float(max(1, layout.history_video.length))
+        ).detach().cpu().tolist(),
     }

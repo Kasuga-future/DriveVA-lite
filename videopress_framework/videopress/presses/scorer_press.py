@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..core.budget import budget_stats, resolve_budget
+from ..core.budget import budget_stats, history_retention_stats, resolve_budget
+from ..core.persistence import CrossLayerPersistence
 from ..core.registry import register_press
 from ..core.result import CompressionResult
 from ..core.runtime import InjectionPoint
@@ -24,6 +25,8 @@ class ScorerPress(BaseVideoPress):
         domain=None,
         injection_point: InjectionPoint | str = InjectionPoint.VIDEO_INPUT,
         random_scope: str | None = None,
+        retention_policy: str | None = None,
+        cross_layer_persistence=None,
     ):
         self.scorer = scorer
         self.selector = selector
@@ -32,6 +35,31 @@ class ScorerPress(BaseVideoPress):
         self.domain = domain
         self.injection_point = InjectionPoint.parse(injection_point)
         self.random_scope = None if random_scope is None else str(random_scope)
+        self.retention_policy = None if retention_policy is None else str(retention_policy)
+        self.cross_layer_persistence = CrossLayerPersistence.from_config(
+            cross_layer_persistence
+        )
+        if self.cross_layer_persistence.enabled:
+            source_layer = getattr(self.scorer, "layer", None)
+            if self.injection_point is not InjectionPoint.SELF_ATTN_KV:
+                raise ValueError(
+                    "cross-layer persistence requires injection_point=self_attn_kv"
+                )
+            if source_layer is None or int(source_layer) < 0:
+                raise ValueError(
+                    "cross-layer persistence requires a non-negative scorer.layer"
+                )
+            # Rejects enabled=True with end_layer == scorer.layer instead of
+            # silently downgrading it to a one-shot prune that still claims
+            # `cross_layer_persistent: True` (audit 2026-09-12, BUG-13).
+            self.cross_layer_persistence.validate_for(int(source_layer))
+            if (
+                self.cross_layer_persistence.mode == "hidden_sequence"
+                and getattr(self.operator, "name", None) != "kv_prune"
+            ):
+                raise ValueError(
+                    "hidden-sequence persistence currently requires operator=kv_prune"
+                )
 
     def score(self, ctx):
         scores = self.scorer.score(ctx)
@@ -59,8 +87,15 @@ class ScorerPress(BaseVideoPress):
             "injection_point": self.injection_point.value,
             "budget": {"type": self.budget.type, "value": self.budget.value, "reference": self.budget.reference},
             **budget_stats(ctx.layout, ctx.domain, selection.K),
+            **history_retention_stats(ctx.layout, ctx.domain, selection.keep_global_indices),
+            "selection_metadata": dict(selection.metadata),
             **operator_result.metadata,
         }
+        if self.retention_policy is not None:
+            metadata["retention_policy"] = self.retention_policy
+        score_diagnostics = ctx.metadata.get("score_diagnostics")
+        if isinstance(score_diagnostics, dict):
+            metadata["score_diagnostics"] = dict(score_diagnostics)
         return CompressionResult(
             output=operator_result.output,
             scores=scores,
@@ -87,4 +122,6 @@ class ScorerPress(BaseVideoPress):
             "budget": {"type": self.budget.type, "value": self.budget.value, "reference": self.budget.reference},
             "domain": getattr(self.domain, "name", self.domain),
             "random_scope": self.random_scope,
+            "retention_policy": self.retention_policy,
+            "cross_layer_persistence": self.cross_layer_persistence.to_dict(),
         }

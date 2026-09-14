@@ -1702,6 +1702,13 @@ def _resolve_driveva_feature_builders():
 
 def _build_scene_loader(SceneLoader: Any, SensorConfig: Any, args: argparse.Namespace, scene_filter: Any):
     sensor_config = SensorConfig.build_all_sensors(include=True)
+    # DriveVA consumes camera frames and ego state only. The released NAVSIM
+    # sensor bundle used here has no MergedPointCloud files, so the direct
+    # AgentInput path must not ask the loader to materialize unused lidar.
+    # Scene.from_scene_dict_list currently ignores lidar, which previously hid
+    # this failure whenever future targets or nuScenes metrics were enabled.
+    if hasattr(sensor_config, "lidar_pc"):
+        sensor_config.lidar_pc = False
     init_sig = inspect.signature(SceneLoader.__init__)
     if "sensor_blobs_path" in init_sig.parameters:
         loader = SceneLoader(

@@ -6,6 +6,10 @@ DRIVEVA_INFER_DIR="${DRIVEVA_INFER_DIR:-"$(cd "${SCRIPT_DIR}/.." && pwd)"}"
 REPO_ROOT="${REPO_ROOT:-"$(cd "${DRIVEVA_INFER_DIR}/../../.." && pwd)"}"
 CONFIG="${CONFIG:-${NAVSIM_INFER_CONFIG:-"${DRIVEVA_INFER_DIR}/configs/navsim_v1.yaml"}}"
 
+# shellcheck source=/dev/null
+source "${DRIVEVA_INFER_DIR}/scripts/distributed_env.sh"
+driveva_resolve_python
+
 if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
   export MAX_EVAL_TOKENS="${MAX_EVAL_TOKENS:-64}"
   export PRINT_ALIGNMENT_PARAMS="${PRINT_ALIGNMENT_PARAMS:-1}"
@@ -20,15 +24,28 @@ if [ ! -f "${CONFIG}" ]; then
 fi
 
 export REPO_ROOT DRIVEVA_INFER_DIR CONFIG
+# Do not accidentally reuse dataset paths exported by another project. Set
+# DRIVEVA_KEEP_DATA_ENV=1 when intentionally overriding the config externally.
+if [[ "${DRIVEVA_KEEP_DATA_ENV:-0}" != "1" ]]; then
+  unset NAVSIM_LOG_PATH NAVSIM_SENSOR_BLOBS_PATH NAVSIM_METRIC_CACHE_PATH
+  unset NUPLAN_MAPS_ROOT NUPLAN_DATA_ROOT
+fi
 config_exports="$("${PYTHON:-python}" "${DRIVEVA_INFER_DIR}/scripts/load_yaml_config.py" "${CONFIG}")"
 eval "${config_exports}"
-# shellcheck source=/dev/null
-source "${DRIVEVA_INFER_DIR}/scripts/distributed_env.sh"
 driveva_setup_distributed_env
 
 export PYTHONPATH="${REPO_ROOT}:${DRIVEVA_INFER_DIR}:${REPO_ROOT}/third_party:${REPO_ROOT}/third_party/nuscenes-devkit/python-sdk:${PYTHONPATH:-}"
 export NUPLAN_MAPS_ROOT
 export NUPLAN_DATA_ROOT
+
+# Reuse the migrated NVMe-backed caches and keep runtime artifacts off the
+# system cache directory.
+export HF_HOME="${HF_HOME:-${REPO_ROOT}/.cache/huggingface}"
+export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HOME}/hub}"
+export TORCH_HOME="${TORCH_HOME:-${REPO_ROOT}/.cache/torch}"
+export MPLCONFIGDIR="${MPLCONFIGDIR:-${REPO_ROOT}/.cache/matplotlib}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${REPO_ROOT}/.cache/xdg}"
+mkdir -p "${HF_HOME}" "${HUGGINGFACE_HUB_CACHE}" "${TORCH_HOME}" "${MPLCONFIGDIR}" "${XDG_CACHE_HOME}"
 
 mkdir -p "${DRIVEVA_TMPDIR}"
 export TMPDIR="${TMPDIR:-${DRIVEVA_TMPDIR}}"

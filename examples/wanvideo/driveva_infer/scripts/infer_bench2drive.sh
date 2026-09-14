@@ -6,6 +6,10 @@ DRIVEVA_INFER_DIR="${DRIVEVA_INFER_DIR:-"$(cd "${SCRIPT_DIR}/.." && pwd)"}"
 REPO_ROOT="${REPO_ROOT:-"$(cd "${DRIVEVA_INFER_DIR}/../../.." && pwd)"}"
 CONFIG="${CONFIG:-${B2D_INFER_CONFIG:-"${DRIVEVA_INFER_DIR}/configs/bench2drive.yaml"}}"
 
+# shellcheck source=/dev/null
+source "${DRIVEVA_INFER_DIR}/scripts/distributed_env.sh"
+driveva_resolve_python
+
 if [[ "${SMOKE_TEST:-0}" == "1" ]]; then
   export MAX_SCENES="${MAX_SCENES:-8}"
   export SAVE_VIZ="${SAVE_VIZ:-0}"
@@ -20,8 +24,6 @@ fi
 export REPO_ROOT DRIVEVA_INFER_DIR CONFIG
 config_exports="$("${PYTHON:-python}" "${DRIVEVA_INFER_DIR}/scripts/load_yaml_config.py" "${CONFIG}")"
 eval "${config_exports}"
-# shellcheck source=/dev/null
-source "${DRIVEVA_INFER_DIR}/scripts/distributed_env.sh"
 driveva_setup_distributed_env
 
 export PYTHONPATH="${REPO_ROOT}:${DRIVEVA_INFER_DIR}:${PYTHONPATH:-}"
