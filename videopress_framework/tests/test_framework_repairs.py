@@ -44,6 +44,7 @@ from videopress.selectors import (
     AdaptiveSpatialMassSelector,
     FutureQuotaSelector,
     FutureThresholdSelector,
+    HistoryGuidedFutureSelector,
     HistoryQuotaSelector,
     HistoryThresholdSelector,
     ProtectedTokenSelector,
@@ -243,6 +244,50 @@ def test_future_quota_enforces_independent_per_latent_counts():
     assert result.metadata["quota_near_to_far"] == [2, 1]
     with pytest.raises(ValueError, match="does not match"):
         FutureQuotaSelector([0.5, 0.25]).select(scores, domain, K=4, ctx=ctx)
+
+
+def test_history_guided_future_copies_same_latent_positions():
+    layout = build_driveva_layout(4, 2, 2, 2, 3, 1)
+    domain = build_domain("all_video", layout, "cpu")
+    ctx = TokenContext(
+        tokens=torch.zeros(1, layout.total_length, 1), layout=layout, domain=domain
+    )
+    # History local scores: oldest keeps locals 0,2; newest keeps locals 1,3.
+    history_scores = torch.tensor([[0.9, 0.4, 0.7, 0.1, 0.2, 0.9, 0.3, 0.8]])
+    scores = torch.cat([history_scores, torch.zeros(1, 8)], dim=1)
+    result = HistoryGuidedFutureSelector([0.5, 0.8]).select(scores, domain, K=None, ctx=ctx)
+    near = layout.frame_range(2).start
+    far = layout.frame_range(3).start
+    assert result.keep_global_indices.tolist() == [
+        [0, 2, 5, 7, near + 0, near + 2, far + 1, far + 3]
+    ]
+    assert result.metadata["future_mapping"] == "same_latent"
+    assert result.metadata["proposed_K_per_history_latent"] == [[2, 2]]
+    assert result.metadata["proposed_K_per_future_latent"] == [[2, 2]]
+
+
+def test_history_guided_future_supports_union_and_intersection():
+    layout = build_driveva_layout(4, 2, 2, 2, 3, 1)
+    domain = build_domain("all_video", layout, "cpu")
+    ctx = TokenContext(
+        tokens=torch.zeros(1, layout.total_length, 1), layout=layout, domain=domain
+    )
+    history_scores = torch.tensor([[0.9, 0.4, 0.7, 0.1, 0.8, 0.1, 0.2, 0.3]])
+    scores = torch.cat([history_scores, torch.zeros(1, 8)], dim=1)
+    union = HistoryGuidedFutureSelector([0.5, 0.5], future_mapping="union_history").select(
+        scores, domain, K=None, ctx=ctx
+    )
+    near = layout.frame_range(2).start
+    # Oldest keeps 0,2; newest keeps 0.  Union is {0,2} on both future latents.
+    assert union.metadata["proposed_K_per_future_latent"] == [[2, 2]]
+    assert near + 0 in union.keep_global_indices[0].tolist()
+    assert near + 2 in union.keep_global_indices[0].tolist()
+
+    intersection = HistoryGuidedFutureSelector(
+        [0.5, 0.5], future_mapping="intersection_history"
+    ).select(scores, domain, K=None, ctx=ctx)
+    # Only local 0 is selected by both history latents.
+    assert intersection.metadata["proposed_K_per_future_latent"] == [[1, 1]]
 
 
 def test_future_threshold_rejects_history_domain():
@@ -1300,6 +1345,40 @@ def test_future_learned_sweep_uses_future_selector_and_position_mode(tmp_path):
         "type": "ratio",
         "value": 1.0,
         "reference": "eligible",
+    }
+
+
+def test_history_guided_future_method_builder(tmp_path):
+    checkpoint = tmp_path / "selector.safetensors"
+    checkpoint.touch()
+    args = SimpleNamespace(
+        history_guided_future_mapping="same_latent",
+        history_guided_layer=15,
+        history_guided_feature_layer=None,
+        history_guided_thresholds="0.05,0.40",
+        persistent_learned_checkpoint=checkpoint,
+        persistent_feature_layer=None,
+        persistent_skip_baseline=True,
+        methods=None,
+        retention_policy=None,
+        domain="last_history",
+    )
+    specs = _method_specs_for_run(args, round_seed=7)
+    assert [spec["name"] for spec in specs] == [
+        "physical_history_guided_future_same_latent_hidden_persistent_layer_15"
+    ]
+    press = specs[0]["press"]
+    assert press["domain"] == "all_video"
+    assert press["selector"] == {
+        "name": "history_guided_future",
+        "thresholds": [0.05, 0.40],
+        "future_mapping": "same_latent",
+    }
+    assert press["scorer"]["all_video_history_only"] is True
+    assert press["cross_layer_persistence"] == {
+        "enabled": True,
+        "end_layer": None,
+        "mode": "hidden_sequence",
     }
 
 

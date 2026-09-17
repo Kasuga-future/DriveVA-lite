@@ -864,6 +864,43 @@ def test_runtime_scorer_loads_training_checkpoint_and_scores_last_history(tmp_pa
     assert ((scores > 0) & (scores < 1)).all()
 
 
+def test_history_only_all_video_scorer_reuses_history_scores(tmp_path) -> None:
+    from safetensors.torch import save_file
+
+    network = RuntimeSelector(token_dim=8, hidden_dim=256, position_dim=64)
+    checkpoint = tmp_path / "selector.safetensors"
+    save_file(
+        {f"selector.{key}": value for key, value in network.state_dict().items()},
+        checkpoint,
+    )
+    layout = build_driveva_layout(
+        f=4, h=2, w=2, num_cond_latents=2, traj_len=2, traj_prefix_len=1
+    )
+    tokens = torch.randn(1, layout.total_length, 8)
+    history_ctx = TokenContext(
+        tokens=tokens,
+        layout=layout,
+        domain=build_domain("history", layout, "cpu"),
+    )
+    all_video_ctx = TokenContext(
+        tokens=tokens,
+        layout=layout,
+        domain=build_domain("all_video", layout, "cpu"),
+    )
+    plain_scorer = LearnedPlanningSelectorScorer(
+        str(checkpoint), layer=15, token_dim=8
+    )
+    scorer = LearnedPlanningSelectorScorer(
+        str(checkpoint), layer=15, token_dim=8, all_video_history_only=True
+    )
+    history_scores = plain_scorer.score(history_ctx)
+    all_scores = scorer.score(all_video_ctx)
+    history_len = int(layout.history_video.length)
+    assert all_scores.shape == (1, layout.video.length)
+    torch.testing.assert_close(all_scores[:, :history_len], history_scores)
+    assert torch.count_nonzero(all_scores[:, history_len:]) == 0
+
+
 def test_runtime_scorer_preserves_per_sample_conditions_in_a_batch() -> None:
     layout = build_driveva_layout(
         f=3, h=2, w=2, num_cond_latents=2, traj_len=2, traj_prefix_len=1

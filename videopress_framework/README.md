@@ -537,3 +537,32 @@ hard prune was not near-lossless and the zero-shot history selector did not
 beat matched random. See
 `outputs/future_poc64_report_20260917.md` before starting a future-selector
 training run.
+
+### History-guided future compression
+
+Early future video latents are noise-dominated, so selecting them with a
+history-trained scorer is close to random.  The history-guided path instead
+runs the selector on history only and copies the retained spatial positions to
+future latents:
+
+```bash
+python scripts/run_official_navsim_press.py \
+  --history-guided-future-mapping union_history \
+  --history-guided-layer 15 \
+  --history-guided-thresholds 0.05,0.40 \
+  --persistent-learned-checkpoint <history-trained-selector.safetensors> \
+  --max-eval-tokens 1 --poc-test-derived \
+  --output-root outputs/history_guided_future_smoke
+```
+
+Supported `--history-guided-future-mapping` values are `same_latent`,
+`reverse_latent`, `nearest_history`, `oldest_history`, `union_history`,
+`intersection_history`, and `majority_history`.  `same_latent` copies the
+history mask one-to-one (`future latent 0 <- history latent 0`), which doubles
+physical deletion when history and future have equal candidate counts.
+`union_history` keeps a future position when either history latent keeps it.
+
+Current 1024-scene POC conclusion: direct `same_latent` doubles compression but
+costs about 2.8 PDM points, and the safer `union_history` still costs about 1.2
+PDM points.  This is not yet a deployable near-lossless future Press.  See
+`outputs/history_guided_future_poc1024_report_20260917.md`.

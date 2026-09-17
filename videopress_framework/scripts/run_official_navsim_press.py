@@ -639,6 +639,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--history-guided-future-mapping",
+        choices=(
+            "same_latent",
+            "reverse_latent",
+            "nearest_history",
+            "oldest_history",
+            "union_history",
+            "intersection_history",
+            "majority_history",
+        ),
+        default=None,
+        help=(
+            "enable history-mask-to-future compression; selects future tokens "
+            "at the local positions selected by the history thresholds"
+        ),
+    )
+    parser.add_argument(
+        "--history-guided-layer",
+        type=int,
+        default=15,
+        help="source/compression layer for --history-guided-future-mapping",
+    )
+    parser.add_argument(
+        "--history-guided-feature-layer",
+        type=int,
+        default=None,
+        help="optional learned feature-read layer for history-guided compression",
+    )
+    parser.add_argument(
+        "--history-guided-thresholds",
+        default="0.05,0.40",
+        help="oldest,newest history thresholds for history-guided future mapping",
+    )
+    parser.add_argument(
         "--retention-policy",
         choices=tuple(HISTORY_RETENTION_POLICIES),
         default=None,
@@ -1076,6 +1110,85 @@ def _method_specs_for_run(args: argparse.Namespace, round_seed: int) -> list[dic
                 },
             ),
         ] + _pre_dit_learned_specs(args, round_seed, pre_dit_spec, baseline))
+    guided_mapping = getattr(args, "history_guided_future_mapping", None)
+    if guided_mapping is not None:
+        if getattr(args, "methods", None):
+            raise ValueError(
+                "--history-guided-future-mapping cannot be combined with --methods"
+            )
+        if args.retention_policy is not None:
+            raise ValueError(
+                "--history-guided-future-mapping is not compatible with "
+                "--retention-policy"
+            )
+        learned_checkpoint = (
+            getattr(args, "persistent_learned_checkpoint", None)
+            or getattr(args, "dynamic_selector_checkpoint", None)
+        )
+        if learned_checkpoint is None:
+            raise ValueError(
+                "--history-guided-future-mapping requires "
+                "--persistent-learned-checkpoint"
+            )
+        layer = int(getattr(args, "history_guided_layer", 15))
+        if layer < 0 or layer >= 30:
+            raise ValueError("--history-guided-layer must be within [0, 29]")
+        feature_layer = getattr(args, "history_guided_feature_layer", None)
+        if feature_layer is None:
+            feature_layer = getattr(args, "persistent_feature_layer", None)
+        feature_layer = int(layer if feature_layer is None else feature_layer)
+        if feature_layer < 0 or feature_layer > layer:
+            raise ValueError(
+                "--history-guided-feature-layer must be in [0, --history-guided-layer]"
+            )
+        thresholds = _parse_float_list(
+            getattr(args, "history_guided_thresholds", "0.05,0.40"),
+            "--history-guided-thresholds",
+        )
+        if len(thresholds) != 2 or any(
+            value < 0.0 or value > 1.0 for value in thresholds
+        ):
+            raise ValueError(
+                "--history-guided-thresholds needs two values within [0, 1] "
+                "in oldest,newest order"
+            )
+        baseline = next(
+            spec
+            for spec in method_specs(round_seed, domain="all_video")
+            if spec["name"] == "physical_no_press"
+        )
+        guided_name = (
+            "physical_history_guided_future_"
+            f"{str(guided_mapping).lower()}_hidden_persistent_layer_{layer:02d}"
+        )
+        press = {
+            "name": "scorer_press",
+            "injection_point": "self_attn_kv",
+            "domain": "all_video",
+            "scorer": {
+                "name": "learned_planning_selector",
+                "layer": layer,
+                "feature_layer": feature_layer,
+                "checkpoint": str(Path(learned_checkpoint).expanduser().resolve()),
+                "all_video_history_only": True,
+            },
+            "selector": {
+                "name": "history_guided_future",
+                "thresholds": thresholds,
+                "future_mapping": str(guided_mapping).lower(),
+            },
+            "operator": {"name": "kv_prune"},
+            "budget": {"type": "ratio", "value": 1.0, "reference": "eligible"},
+            "cross_layer_persistence": {
+                "enabled": True,
+                "end_layer": None,
+                "mode": "hidden_sequence",
+            },
+        }
+        specs = [] if getattr(args, "persistent_skip_baseline", False) else [baseline]
+        specs.append({"name": guided_name, "mode": "physical", "press": press})
+        return specs
+
     c4_checkpoint = getattr(args, "c4_replica_triad_checkpoint", None)
     if c4_checkpoint is not None:
         conflicts = (

@@ -78,10 +78,22 @@ class ScorerPress(BaseVideoPress):
 
     def apply_with_selection(self, ctx, scores, selection) -> CompressionResult:
         operator_result = self.operator.apply(ctx, selection)
-        if str(ctx.domain.name).startswith("future"):
+        domain_name = str(ctx.domain.name)
+        if domain_name.startswith("future"):
             latent_retention = future_retention_stats(
                 ctx.layout, ctx.domain, selection.keep_global_indices
             )
+        elif domain_name in {"all_video", "video"}:
+            # History-guided future presses select both temporal halves; report
+            # both so the two-times compression factor is auditable.
+            latent_retention = {
+                **history_retention_stats(
+                    ctx.layout, ctx.domain, selection.keep_global_indices
+                ),
+                **future_retention_stats(
+                    ctx.layout, ctx.domain, selection.keep_global_indices
+                ),
+            }
         else:
             latent_retention = history_retention_stats(
                 ctx.layout, ctx.domain, selection.keep_global_indices

@@ -1,6 +1,7 @@
 from .base import TokenSelector
 from .adaptive_mass import AdaptiveMassSelector
 from .adaptive_spatial_mass import AdaptiveSpatialMassSelector
+from .history_guided import HistoryGuidedFutureSelector
 from .history_topk import HistoryTopKSelector
 from .history_budget import (
     FutureQuotaSelector,
@@ -18,6 +19,7 @@ __all__ = [
     "AdaptiveSpatialMassSelector",
     "FutureQuotaSelector",
     "FutureThresholdSelector",
+    "HistoryGuidedFutureSelector",
     "HistoryQuotaSelector",
     "HistoryThresholdSelector",
     "HistoryTopKSelector",

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 import math
 
 import torch
 from torch import nn
 
+from ..core.domain import build_domain
 from ..core.registry import register_scorer
 from .base import TokenScorer
 
@@ -152,6 +154,7 @@ class LearnedPlanningSelectorScorer(TokenScorer):
         action_mode: str | None = None,
         feature_mode: str = "all",
         future_position_mode: str = "storage",
+        all_video_history_only: bool = False,
     ):
         self.checkpoint = str(Path(checkpoint).expanduser().resolve())
         self.layer = int(layer)
@@ -171,6 +174,7 @@ class LearnedPlanningSelectorScorer(TokenScorer):
             raise ValueError(
                 "future_position_mode must be 'storage' or 'history_compatible'"
             )
+        self.all_video_history_only = bool(all_video_history_only)
         path = Path(self.checkpoint)
         if not path.is_file():
             raise FileNotFoundError(f"learned selector checkpoint not found: {path}")
@@ -323,7 +327,7 @@ class LearnedPlanningSelectorScorer(TokenScorer):
         return positions.unsqueeze(0).expand(ctx.batch_size, -1, -1)
 
     @torch.no_grad()
-    def _score_network(self, ctx):
+    def _score_candidate_network(self, ctx):
         candidate = ctx.candidate_tokens()
         if candidate.shape[-1] != self.network.token_proj[1].in_features:
             raise ValueError(
@@ -348,6 +352,52 @@ class LearnedPlanningSelectorScorer(TokenScorer):
             "compression_source_layer": self.layer,
         }
         return scores
+
+    @torch.no_grad()
+    def _score_network(self, ctx):
+        """Return scores aligned to ``ctx.domain.candidate_indices``.
+
+        ``all_video_history_only`` is used by history-guided future
+        compression: the learned network is evaluated only on the complete
+        history domain, then its scores are padded with zeros to the
+        ``all_video`` candidate length.  The guided selector transfers the
+        history mask to future positions; future scores are intentionally not
+        used because early future latents are still noise and would make the
+        selector equivalent to random.
+        """
+
+        if not self.all_video_history_only:
+            return self._score_candidate_network(ctx)
+        if ctx.domain.name not in {"all_video", "video"}:
+            raise ValueError(
+                "all_video_history_only requires an all_video/video domain, "
+                f"got {ctx.domain.name!r}"
+            )
+        history_domain = build_domain("history", ctx.layout, ctx.tokens.device)
+        history_ctx = replace(ctx, domain=history_domain)
+        history_scores = self._score_candidate_network(history_ctx)
+        full = ctx.tokens.new_zeros(
+            (ctx.batch_size, ctx.domain.n_candidate), dtype=history_scores.dtype
+        )
+        history_len = int(ctx.layout.history_video.length)
+        if ctx.domain.n_candidate < history_len:
+            raise ValueError(
+                "all_video_history_only received a domain shorter than history"
+            )
+        full[:, :history_len] = history_scores.to(full.dtype)
+        ctx.metadata["score_diagnostics"] = {
+            "checkpoint": self.checkpoint,
+            "all_video_history_only": True,
+            "history_score_mean": float(history_scores.mean().item()),
+            "history_score_std": float(history_scores.std().item()),
+            "condition_source": "ego_velocity_and_prompt_command",
+            "diffusion_timestep": 0.0
+            if ctx.diffusion_rank is None
+            else float(ctx.diffusion_rank),
+            "feature_layer": self.feature_layer,
+            "compression_source_layer": self.layer,
+        }
+        return full
 
     @torch.no_grad()
     def observe(self, ctx) -> None:
@@ -391,6 +441,7 @@ class LearnedPlanningSelectorScorer(TokenScorer):
             "action_mode": self.action_mode,
             "feature_mode": self.feature_mode,
             "future_position_mode": self.future_position_mode,
+            "all_video_history_only": self.all_video_history_only,
         }
 
     def signature(self) -> str:
@@ -404,4 +455,6 @@ class LearnedPlanningSelectorScorer(TokenScorer):
             )
         if self.future_position_mode != "storage":
             signature += f":future_position_mode={self.future_position_mode}"
+        if self.all_video_history_only:
+            signature += ":all_video_history_only=True"
         return signature

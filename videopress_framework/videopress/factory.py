@@ -45,6 +45,7 @@ from .selectors import (
     AdaptiveSpatialMassSelector,
     FutureQuotaSelector,
     FutureThresholdSelector,
+    HistoryGuidedFutureSelector,
     HistoryQuotaSelector,
     HistoryThresholdSelector,
     HistoryTopKSelector,
@@ -69,7 +70,7 @@ def _register_builtin_aliases() -> None:
     # intentionally explicit so configuration names remain stable.
     _ = (NoPress, ScorerPress, SimilarityMergePress, RegisterBottleneckPress, RandomScorer, TokenNormScorer,
          ActionAttentionScorer, ActionAttentionVNormScorer, ActionAttentionVNormTemporalScorer, ActionContributionStabilityScorer, GradientNormScorer,
-         GradientInputScorer, PlanningGradientInputScorer, LearnedPlanningSelectorScorer, AdaptiveMassSelector, AdaptiveSpatialMassSelector, FutureQuotaSelector, FutureThresholdSelector, HistoryQuotaSelector, HistoryThresholdSelector, HistoryTopKSelector, ProtectedTokenSelector, TopKSelector, ThresholdSelector, ZeroMaskOperator,
+         GradientInputScorer, PlanningGradientInputScorer, LearnedPlanningSelectorScorer, AdaptiveMassSelector, AdaptiveSpatialMassSelector, FutureQuotaSelector, FutureThresholdSelector, HistoryGuidedFutureSelector, HistoryQuotaSelector, HistoryThresholdSelector, HistoryTopKSelector, ProtectedTokenSelector, TopKSelector, ThresholdSelector, ZeroMaskOperator,
          MeanReplaceOperator, ShuffleOperator, ShuffleAllOperator,
          ShuffleDroppedOperator, ShuffleKeptOperator, KVPruneOperator, HiddenPruneOperator,
          HiddenTokenMergeOperator, KVMergeOperator, ComposedPress)

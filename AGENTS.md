@@ -1,16 +1,20 @@
 # AGENTS.md — DriveVA-lite Video Token Compression 交接文件
 
-> 最后更新：2026-09-17 19:35 CST
-> 当前分支：`main`，当前 HEAD：`7c42cee`（Develop dynamic VideoPress selection and validation）
-> 当前工作区：25 个 modified + 5 个 untracked，另加本文件（见 §6）
-> 当前主任务：Future token compression 的 Phase F0 已打通（官方 runner `future_video` /
-> `future_latent_i`、future 阈值/quota selector、learned selector future positions、
-> random persistent scorer）。Phase F2 零样本迁移做了 64-scene POC：future 硬删在
-> 相近保留率下显著掉 PDM，history-trained learned selector 未优于 matched random。
-> 当前结论是 **不要立即开始 future selector 全量训练**，先补 Phase F1 的 future
-> oracle/上界分析；若 oracle 也没有结构冗余，则停止 hard future prune。
+> 最后更新：2026-09-17 21:05 CST
+> 当前分支：`main`，当前 HEAD：`c0625c9`（已按用户要求把当前进度提交为 2 个 commit）
+> 当前工作区：9 个 modified + 2 个 untracked（history-guided future 新代码，见 §6）
+> 当前主任务：Future token compression 已有两条路线：
+> 1. future 直接 select：Phase F0 已打通，64/1024-scene POC 显示噪声上选 future 与随机
+>    接近且 hard prune 明显掉 PDM；
+> 2. **history-guided future select（用户 2026-09-17 提出的新主线）**：history selector
+>    只在 history 上打分，保留位置复制到 future。已实现 `HistoryGuidedFutureSelector`、
+>    `all_video_history_only` scorer 和 runner CLI，并完成 1024-scene POC。
+>    结论：`same_latent` 直接同位置复制把压缩近似乘 2，但 ΔPDM `−0.0280`；
+>    `union_history` 较稳但仍 ΔPDM `−0.0121`，**尚未 near-lossless**。
+>    下一步是在此机制上找安全 frontier（调阈值/keep cap），不要立即训练 future selector。
 > **资源约束（用户 2026-09-17 明确要求）**：任何实验/agent 任务最多同时占用
 > **4 张 GPU**，超过 4 个进程必须排队。
+> **提交约束**：已实现代码暂不自动 commit；用户要求阶段性成果后再 commit。
 >
 > **维护要求（强制）**：以后每个 agent 会话结束前，必须更新本文件：
 > 1. 更新顶部“最后更新 / HEAD / 工作区”；
@@ -452,6 +456,49 @@ Layer 15 + `hidden_sequence` + `kv_prune`，learned checkpoint 为当前 history
 
 ---
 
+### 2026-09-17 — History-guided future compression（用户新主线）
+
+**动机**：future token 早期仍是纯噪声，直接对 future 打分接近随机；用户提出若 future
+同一位置编码的 history token 被保留，则 future 同位置也更值得保留，从而把压缩近似乘 2。
+
+**已实现代码**：
+
+- `HistoryGuidedFutureSelector`：在 `all_video` 上先用 `[oldest,newest]` history 阈值选
+  history，再把历史局部 spatial mask 映射到 future；支持 `same_latent`、
+  `reverse_latent`、`nearest_history`、`oldest_history`、`union_history`、
+  `intersection_history`、`majority_history`。
+- `LearnedPlanningSelectorScorer(all_video_history_only=True)`：只在 history 子域跑
+  learned network，future 分数置零，确保 future 噪声不参与选择。
+- runner：`--history-guided-future-mapping`、`--history-guided-layer`、
+  `--history-guided-thresholds`。
+
+**1024-scene POC**（4-rank，`--max-eval-tokens 256`，每 rank 256 个不同场景，共 1024
+个 paired 场景；NoPress PDM `0.911205`，接近全量 `0.909839`；仍不是 full 7,876）：
+
+| Arm | PDM | ΔPDM vs NoPress | 95% CI | K/1560 | hidden | latency | zero candidate/NoPress |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| NoPress | 0.9112 | — | — | — | 1569 | 586.4 | 30 / 30 |
+| history best (full-run matched) | 0.9073 | −0.0039 | [−0.0082, −0.0005] | 489.6 | 1291.9 | 569.3 | 34 / 30 |
+| `union_history` | 0.8991 | −0.0121 | [−0.0201, −0.0043] | 1148.9 | 1197.7 | 556.4 | 44 / 30 |
+| `same_latent` | 0.8832 | −0.0280 | [−0.0395, −0.0169] | 988.9 | 1038.1 | 537.6 | 49 / 30 |
+
+**结论**：
+
+- 用户直觉作为 selection prior 成立一部分：复制 history 位置比在 future 噪声上选更
+  可控，且 `union_history` 比直接 future hard select 的 POC 曲线更好；
+- 但“同位置复制 => 压缩乘 2”在这一版阈值下 **不是 near-lossless**：
+  `same_latent` 额外丢约 2.8 PDM 点，`union_history` 额外丢约 1.2 点；
+- 相对 history best，同一组 1024 场景下 `union_history` 多省约 13 ms、少约 94 个
+  hidden token，但多掉约 0.8 PDM 点；
+- 因此下一步应做 history-guided threshold / future keep-ratio 的 frontier sweep，
+  而不是直接训练 future selector 或全量部署。
+
+产物：`outputs/history_guided_future_poc1024_report_20260917.md`、
+`outputs/hgf_poc64_*_20260918/`、`outputs/hgf_poc256_union_history_20260918/`、
+`outputs/hgf_poc1024_same_latent_20260918/`。
+
+---
+
 ## 5. 当前框架能力矩阵
 
 | 能力 | 状态 | 说明 |
@@ -465,6 +512,7 @@ Layer 15 + `hidden_sequence` + `kv_prune`，learned checkpoint 为当前 history
 | Learned planning selector | 部署已支持 future；训练仍只支持 history | 部署 `_positions()` 支持 storage / history_compatible future 模式；训练 capture/mask/teacher 未扩展 |
 | history 双 latent threshold/quota | 已实现 | `history_threshold`、`history_quota` 只对 history |
 | future 双 latent threshold/quota | 已实现 | `future_threshold`、`future_quota`，顺序固定 near-to-far |
+| history-guided future mask transfer | 已实现 | `history_guided_future` selector、`all_video_history_only` scorer、runner CLI；1024-scene POC 尚未 near-lossless |
 | future domain 官方 runner | **已开放** | `--domain future_video/future_latent_0/future_latent_1` 可用 |
 | future latent 单独 domain/budget | **已实现** | `future_latent_i`、`each_future` reference 已加入并有测试 |
 | future online selector 训练 | **未实现** | `capture_history_tokens` / `history_token_mask` / `counterfactual_latent_index` 仍只覆盖 history |
@@ -475,47 +523,29 @@ Layer 15 + `hidden_sequence` + `kv_prune`，learned checkpoint 为当前 history
 
 ## 6. 当前工作区未提交状态（2026-09-17）
 
-`git status`：`main @ 7c42cee`，25 个 modified + 5 个 untracked。当前工作区仍包含历史实验改动与本次 future-domain 改动，切换/提交前必须逐 diff review。
+`git status`：`main @ c0625c9`，9 个 modified + 2 个 untracked（不含已排除的 one-off `pre_dit_gpu_smoke.py` 外，它仍为 untracked 但不会提交）。用户要求后续不自动 commit。
 
-### 6.1 Modified（需要 review / commit）
+### 6.1 Modified（history-guided future 新代码，尚未 commit）
 
 ```text
-M diffsynth/pipelines/wan_video_new.py
-M diffsynth/trainers/utils.py
-M examples/wanvideo/driveva_train/scripts/train_navsim_v1.sh
-M examples/wanvideo/driveva_train/train_navsim_v1.py
+M AGENTS.md
 M videopress_framework/README.md
-M videopress_framework/scripts/run_full_compression_suite.py
 M videopress_framework/scripts/run_official_navsim_press.py
 M videopress_framework/tests/test_framework_repairs.py
 M videopress_framework/tests/test_online_selector.py
-M videopress_framework/tests/test_videopress.py
-M videopress_framework/videopress/__init__.py
-M videopress_framework/videopress/adapters/driveva.py
-M videopress_framework/videopress/core/budget.py
-M videopress_framework/videopress/core/domain.py
-M videopress_framework/videopress/core/plan.py
 M videopress_framework/videopress/factory.py
-M videopress_framework/videopress/operators/__init__.py
-M videopress_framework/videopress/operators/merge.py
-M videopress_framework/videopress/presses/__init__.py
-M videopress_framework/videopress/presses/merge_press.py
 M videopress_framework/videopress/presses/scorer_press.py
 M videopress_framework/videopress/scorers/learned_selector.py
 M videopress_framework/videopress/selectors/__init__.py
-M videopress_framework/videopress/selectors/history_budget.py
-M videopress_framework/videopress/training/online_selector.py
 ```
 
-### 6.2 Untracked（新文件）
+### 6.2 Untracked（不自动提交；`history_guided.py` 属核心源码）
 
 ```text
-?? AGENTS.md
 ?? videopress_framework/scripts/pre_dit_gpu_smoke.py
-?? videopress_framework/tests/test_pre_dit_selection.py
-?? videopress_framework/videopress/operators/hidden_prune.py
-?? videopress_framework/videopress/presses/learnable_merge.py
+?? videopress_framework/videopress/selectors/history_guided.py
 ```
+
 这些改动主要覆盖：
 
 - `BLOCK_INPUT` / pre-DiT hidden pruning；
@@ -1021,3 +1051,25 @@ MPLCONFIGDIR=/tmp/driveva_mpl \
   3. 只有 F1 oracle 明显优于 matched random 且高保留率近无损，才扩展训练侧
      future capture/mask/counterfactual range 并启动同监督 future selector（F3）；
   4. 任何 full 7,876 结果都要 paired CI、extreme/zero tail、latency 一起看。
+
+### 2026-09-17 — History-guided future compression POC
+
+- 用户指出之前理解的偏差：future 初始是噪声，直接对 future select 近似随机；正确方向是
+  用 history 的保留下位置指导 future。已按此构建：
+  - `HistoryGuidedFutureSelector`（`all_video` 上先选 history，再复制 mask 到 future）；
+  - `LearnedPlanningSelectorScorer(all_video_history_only=True)`（只在 history 子域打分）；
+  - runner `--history-guided-future-mapping` / `--history-guided-layer` /
+    `--history-guided-thresholds`。
+- 已测试 mapping：`same_latent`、`reverse_latent`、`nearest_history`、`oldest_history`、
+  `union_history`、`intersection_history`、`majority_history`。
+- 1024-scene paired POC（4-rank，每个 rank 256 个不同场景；NoPress PDM `0.911205`）：
+  - `same_latent`：K=988.9，hidden=1038.1，ΔPDM `−0.0280`，CI `[−0.0395, −0.0169]`；
+  - `union_history`：K=1148.9，hidden=1197.7，ΔPDM `−0.0121`，CI `[−0.0201, −0.0043]`；
+  - 同场景 history-best 参考：ΔPDM `−0.0039`，hidden=1291.9；`union_history` 额外省约
+    13 ms / 94 tokens，但多掉约 0.8 PDM 点。
+- 结论：history-guided prior 比直接在 noise 上选更可控，但当前阈值下 **不是
+  near-lossless**；不能直接上“压缩乘 2”。下一步做 threshold / future keep-ratio
+  frontier sweep，而非 future selector 训练。
+- 新增报告：`outputs/history_guided_future_poc1024_report_20260917.md`。
+- 测试：`199 passed`（增加 history-guided selector、runner、scorer 测试）。
+- 说明：本次没有自动再 commit；用户已明确后续阶段性成果后再要求 commit。
