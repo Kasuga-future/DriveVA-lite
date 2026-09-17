@@ -331,5 +331,72 @@ def test_similarity_merge_preserves_reversible_groups():
     assert result.aux["q"].shape[2] == ctx.layout.total_length
     assert result.aux["k"].shape[2] == ctx.domain.n_protected + 2
     assert result.aux["v"].shape[2] == ctx.domain.n_protected + 2
-    assert result.mapping.source_groups is not None
-    assert sum(len(group) for group in result.mapping.source_groups) == ctx.layout.total_length
+    # The tensor plan deliberately no longer materialises a Python
+    # ``source_groups`` list (1373 nested lists per forward was the CPU
+    # bottleneck); the same coverage property is carried by input_to_output.
+    assert result.mapping.source_groups is None
+    inverse = result.mapping.input_to_output[0]
+    assert int((inverse < 0).sum()) == 0
+    assert int(inverse.max()) == result.aux["k"].shape[2] - 1
+    counts = torch.bincount(inverse, minlength=result.aux["k"].shape[2])
+    assert int(counts.sum()) == ctx.layout.total_length
+    assert int(counts.min()) >= 1
+
+
+def test_future_domains_are_storage_order_near_to_far():
+    layout = build_driveva_layout(f=4, h=8, w=10, num_cond_latents=2, traj_len=2, traj_prefix_len=1)
+    future = build_domain("future_video", layout, "cpu")
+    assert future.name == "future_video"
+    assert future.n_candidate == layout.future_video.length == 2 * layout.tokens_per_latent
+    assert future.candidate_indices.tolist()[:3] == [
+        layout.future_video.start,
+        layout.future_video.start + 1,
+        layout.future_video.start + 2,
+    ]
+
+    near = build_domain("future_latent_0", layout, "cpu")
+    far = build_domain("future_latent_1", layout, "cpu")
+    assert near.candidate_indices.tolist() == list(
+        range(layout.frame_range(2).start, layout.frame_range(2).end)
+    )
+    assert far.candidate_indices.tolist() == list(
+        range(layout.frame_range(3).start, layout.frame_range(3).end)
+    )
+
+
+def test_future_budget_each_future_reference():
+    layout = build_driveva_layout(f=4, h=8, w=10, num_cond_latents=2, traj_len=2, traj_prefix_len=1)
+    domain = build_domain("future_video", layout, "cpu")
+    budget = TokenBudget("ratio", 0.5, "each_future")
+    assert resolve_budget(budget, layout, domain) == layout.tokens_per_latent
+
+
+def test_future_physical_zero_preserves_history_and_clears_future():
+    layout = build_driveva_layout(f=4, h=8, w=10, num_cond_latents=2, traj_len=2, traj_prefix_len=1)
+    tokens = torch.arange(1, layout.total_length + 1, dtype=torch.float32).view(1, -1, 1)
+    ctx = TokenContext(
+        tokens=tokens,
+        layout=layout,
+        domain=build_domain("future_video", layout, "cpu"),
+    )
+    result = build_press(
+        {
+            "domain": "future_video",
+            "scorer": "token_norm",
+            "selector": "topk",
+            "operator": "zero",
+            "budget": {"type": "ratio", "value": 0.25, "reference": "eligible"},
+        }
+    ).apply(ctx)
+    assert result.selection.K == layout.future_video.length // 4
+    selected = result.selection.keep_global_indices
+    assert int(selected.min()) >= layout.future_video.start
+    assert int(selected.max()) < layout.future_video.end
+    dropped_future = torch.ones(layout.future_video.length, dtype=torch.bool)
+    dropped_future[selected[0] - layout.future_video.start] = False
+    dropped_global = torch.where(dropped_future)[0] + layout.future_video.start
+    assert torch.count_nonzero(result.output[0, dropped_global, 0]) == 0
+    assert torch.equal(
+        result.output[0, layout.history_video.start : layout.history_video.end],
+        tokens[0, layout.history_video.start : layout.history_video.end],
+    )

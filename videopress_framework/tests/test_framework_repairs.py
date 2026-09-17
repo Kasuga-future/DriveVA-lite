@@ -42,6 +42,8 @@ from videopress.scorers import (
 from videopress.selectors import (
     AdaptiveMassSelector,
     AdaptiveSpatialMassSelector,
+    FutureQuotaSelector,
+    FutureThresholdSelector,
     HistoryQuotaSelector,
     HistoryThresholdSelector,
     ProtectedTokenSelector,
@@ -208,6 +210,53 @@ def test_history_quota_enforces_independent_per_latent_counts():
     with pytest.raises(ValueError, match="does not match"):
         HistoryQuotaSelector([0.5, 0.25]).select(
             scores, ctx.domain, K=4, ctx=ctx
+        )
+
+
+def test_future_threshold_applies_independent_near_far_thresholds():
+    layout = build_driveva_layout(4, 2, 2, 2, 3, 1)
+    domain = build_domain("future_video", layout, "cpu")
+    tokens = torch.zeros(1, layout.total_length, 1)
+    ctx = TokenContext(tokens=tokens, layout=layout, domain=domain)
+    scores = torch.tensor([[0.6, 0.4, 0.9, 0.1, 0.7, 0.85, 0.2, 0.95]])
+    result = FutureThresholdSelector([0.5, 0.8]).select(
+        scores, domain, K=domain.n_candidate, ctx=ctx
+    )
+    assert result.K == 4
+    assert result.keep_global_indices.tolist() == [[8, 10, 13, 15]]
+    assert result.metadata["thresholds_near_to_far"] == [0.5, 0.8]
+    assert result.metadata["latent_order"] == "near_to_far"
+
+
+def test_future_quota_enforces_independent_per_latent_counts():
+    layout = build_driveva_layout(4, 2, 2, 2, 3, 1)
+    domain = build_domain("future_video", layout, "cpu")
+    tokens = torch.zeros(1, layout.total_length, 1)
+    ctx = TokenContext(tokens=tokens, layout=layout, domain=domain)
+    scores = torch.arange(8, dtype=torch.float32).view(1, -1)
+    result = FutureQuotaSelector([0.5, 0.25]).select(
+        scores, domain, K=3, ctx=ctx
+    )
+    near = layout.frame_range(2).start
+    far = layout.frame_range(3).start
+    assert result.keep_global_indices.tolist() == [[near + 3, near + 2, far + 3]]
+    assert result.metadata["quota_near_to_far"] == [2, 1]
+    with pytest.raises(ValueError, match="does not match"):
+        FutureQuotaSelector([0.5, 0.25]).select(scores, domain, K=4, ctx=ctx)
+
+
+def test_future_threshold_rejects_history_domain():
+    layout = build_driveva_layout(4, 2, 2, 2, 3, 1)
+    domain = build_domain("history", layout, "cpu")
+    ctx = TokenContext(
+        tokens=torch.zeros(1, layout.total_length, 1), layout=layout, domain=domain
+    )
+    with pytest.raises(ValueError, match="domain=future_video"):
+        FutureThresholdSelector([0.5, 0.5]).select(
+            torch.ones(1, domain.n_candidate),
+            domain,
+            K=domain.n_candidate,
+            ctx=ctx,
         )
 
 
@@ -1208,6 +1257,93 @@ def test_learned_sweep_decouples_feature_and_compression_layers(tmp_path):
         "value": 552,
         "reference": "eligible",
     }
+
+
+def test_future_learned_sweep_uses_future_selector_and_position_mode(tmp_path):
+    checkpoint = tmp_path / "selector.safetensors"
+    checkpoint.touch()
+    args = SimpleNamespace(
+        persistent_layer_sweep="15",
+        methods=None,
+        persistent_keep_ratio=1.0,
+        persistent_end_layer=None,
+        persistent_mode="hidden_sequence",
+        persistent_oneshot=False,
+        persistent_skip_baseline=True,
+        persistent_scorer="learned_planning_selector",
+        persistent_learned_checkpoint=checkpoint,
+        persistent_feature_layer=15,
+        persistent_selector="future_threshold",
+        per_future_latent_thresholds="0.05,0.40",
+        per_future_latent_keep_ratios=None,
+        persistent_future_position_mode="history_compatible",
+        retention_policy=None,
+        domain="future_video",
+    )
+    specs = _method_specs_for_run(args, round_seed=7)
+    assert [spec["name"] for spec in specs] == [
+        "physical_learned_planning_selector_future_threshold_hidden_persistent_layer_15"
+    ]
+    press = specs[0]["press"]
+    assert press["domain"] == "future_video"
+    assert press["selector"] == {
+        "name": "future_threshold",
+        "thresholds": [0.05, 0.40],
+    }
+    assert press["scorer"]["future_position_mode"] == "history_compatible"
+    assert press["cross_layer_persistence"] == {
+        "enabled": True,
+        "end_layer": None,
+        "mode": "hidden_sequence",
+    }
+    assert press["budget"] == {
+        "type": "ratio",
+        "value": 1.0,
+        "reference": "eligible",
+    }
+
+
+def test_future_retention_policy_is_rejected_by_method_builder(tmp_path):
+    args = SimpleNamespace(
+        persistent_layer_sweep="15",
+        methods=None,
+        persistent_keep_ratio=0.5,
+        persistent_end_layer=None,
+        persistent_mode="hidden_sequence",
+        persistent_oneshot=False,
+        persistent_skip_baseline=True,
+        persistent_scorer="action_attention_vnorm",
+        persistent_selector="topk",
+        retention_policy="joint_keep_50",
+        domain="future_video",
+    )
+    with pytest.raises(ValueError, match="history-only"):
+        _method_specs_for_run(args, round_seed=7)
+
+
+def test_persistent_random_scorer_gets_seed_and_no_action_mode():
+    args = SimpleNamespace(
+        persistent_layer_sweep="15",
+        methods=None,
+        persistent_keep_ratio=0.5,
+        persistent_end_layer=None,
+        persistent_mode="hidden_sequence",
+        persistent_oneshot=False,
+        persistent_skip_baseline=True,
+        persistent_scorer="random",
+        persistent_selector="topk",
+        retention_policy=None,
+        domain="future_video",
+    )
+    specs = _method_specs_for_run(args, round_seed=7)
+    assert [spec["name"] for spec in specs] == [
+        "physical_random_hidden_persistent_layer_15"
+    ]
+    scorer = specs[0]["press"]["scorer"]
+    assert scorer["name"] == "random"
+    assert scorer["seed"] == 108
+    assert scorer["scope"] == "scene"
+    assert "action_mode" not in scorer
 
 
 def test_promising_full_matrix_is_fixed_and_auditable():

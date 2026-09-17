@@ -347,6 +347,107 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--pre-dit-token-matrix",
+        action="store_true",
+        help=(
+            "run a true block-0-input history-token pruning pilot: no-press, "
+            "equal-budget random controls, fixed TokenNorm, and dynamic "
+            "TokenNorm selection"
+        ),
+    )
+    parser.add_argument(
+        "--pre-dit-token-matrix-profile",
+        choices=("main", "conservative"),
+        default="main",
+        help=(
+            "pre-DiT pilot profile: 'main' tests 50/75 percent plus adaptive K; "
+            "'conservative' isolates the 90/95 percent quality cliff"
+        ),
+    )
+    parser.add_argument(
+        "--pre-dit-token-methods",
+        default=None,
+        help=(
+            "optional comma-separated subset of the selected pre-DiT matrix; "
+            "intended for independent multi-GPU shards"
+        ),
+    )
+    parser.add_argument(
+        "--pre-dit-merge-matrix",
+        action="store_true",
+        help=(
+            "pre-DiT merge-vs-prune matrix at an identical output sequence "
+            "length: no-press, random top-K prune, random-grouping merge and "
+            "similarity merge all emit the same number of tokens"
+        ),
+    )
+    parser.add_argument(
+        "--pre-dit-merge-keep-ratio",
+        type=float,
+        default=0.5,
+        help="candidate keep ratio shared by every arm of --pre-dit-merge-matrix",
+    )
+    parser.add_argument(
+        "--pre-dit-register-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "optional RegisterBottleneck weights for the learnable-merge arm of "
+            "--pre-dit-merge-matrix; omitted means a fresh (untrained) module"
+        ),
+    )
+    parser.add_argument(
+        "--pre-dit-register-lora-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "optional LoRA weights (same checkpoint as the bottleneck) applied "
+            "to pipe.dit before the learnable-merge arm runs"
+        ),
+    )
+    parser.add_argument("--pre-dit-register-lora-rank", type=int, default=32)
+    parser.add_argument(
+        "--pre-dit-register-lora-target-modules",
+        type=str,
+        default="q,k,v,o,ffn.0,ffn.2",
+    )
+    parser.add_argument(
+        "--pre-dit-learned-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "add a pre-DiT arm that scores block-0 input with a distilled "
+            "planning selector checkpoint, plus an equal-budget random control"
+        ),
+    )
+    parser.add_argument(
+        "--pre-dit-learned-domain",
+        choices=("last_history", "history"),
+        default="last_history",
+        help=(
+            "candidate domain for the learned pre-DiT arm; last_history matches "
+            "the online teacher, which supervises only the newest history latent"
+        ),
+    )
+    parser.add_argument(
+        "--pre-dit-learned-threshold",
+        type=float,
+        default=0.4,
+        help="absolute keep threshold applied to the learned selector scores",
+    )
+    parser.add_argument(
+        "--pre-dit-learned-random-keep-ratio",
+        type=float,
+        default=0.5,
+        help="budget of the matched random control for the learned pre-DiT arm",
+    )
+    parser.add_argument(
+        "--pre-dit-learned-feature-mode",
+        choices=("all", "condition_position_time"),
+        default="all",
+        help="must match the checkpoint's training feature mode",
+    )
+    parser.add_argument(
         "--temporal-motion-matrix",
         action="store_true",
         help=(
@@ -398,6 +499,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "action_attention_vnorm_temporal",
             "action_contribution_stability",
             "learned_planning_selector",
+            "random",
         ),
         default="action_attention_vnorm",
         help="source-layer importance scorer used by persistent sweeps",
@@ -424,12 +526,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--persistent-future-position-mode",
+        choices=("storage", "history_compatible"),
+        default="storage",
+        help=(
+            "temporal position feature for learned_planning_selector on future "
+            "domains: real storage index (2,3) or history-compatible range (0,1)"
+        ),
+    )
+    parser.add_argument(
         "--persistent-selector",
         choices=(
             "topk",
             "threshold",
             "history_threshold",
             "history_quota",
+            "future_threshold",
+            "future_quota",
             "adaptive_mass",
             "adaptive_spatial_mass",
         ),
@@ -467,6 +580,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--per-future-latent-thresholds",
+        default=None,
+        help=(
+            "comma-separated thresholds in [near,far] storage order; "
+            "required by --persistent-selector future_threshold"
+        ),
+    )
+    parser.add_argument(
+        "--per-future-latent-keep-ratios",
+        default=None,
+        help=(
+            "comma-separated exact keep ratios in [near,far] storage order; "
+            "required by --persistent-selector future_quota"
+        ),
+    )
+    parser.add_argument(
         "--adaptive-ratios",
         default="0.375,0.5,1.0",
         help="comma-separated dynamic keep tiers; must end in 1.0",
@@ -496,8 +625,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--domain",
         default="last_history",
-        choices=("last_history", "history", "all_history"),
-        help="token selection domain; history/all_history covers both history latents",
+        choices=(
+            "last_history",
+            "history",
+            "all_history",
+            "future_video",
+            "future_latent_0",
+            "future_latent_1",
+        ),
+        help=(
+            "token selection domain; future_video covers both future latents "
+            "(near,far storage order)"
+        ),
     )
     parser.add_argument(
         "--retention-policy",
@@ -563,6 +702,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--pdm-num-poses", type=int, default=40)
     parser.add_argument("--pdm-interval-length", type=float, default=0.1)
     parser.add_argument("--save-viz", action="store_true")
+    parser.add_argument(
+        "--infer-video",
+        action="store_true",
+        help=(
+            "decode the model-generated future video (slow); pair with "
+            "--save-viz to render GT-vs-pred camera videos. Default keeps "
+            "trajectory-only mode (no video decode)."
+        ),
+    )
     parser.add_argument("--viz-total-tokens", type=int, default=100)
     parser.add_argument("--viz-max-tokens", type=int, default=20)
     parser.add_argument("--enable-nuscenes-metrics", action="store_true")
@@ -627,7 +775,307 @@ def _parse_float_list(spec: str, name: str) -> list[float]:
     return values
 
 
+def _pre_dit_learned_specs(args, round_seed, pre_dit_spec, baseline) -> list[dict[str, Any]]:
+    """Optional learned-selector arms for the pre-DiT matrix.
+
+    The online teacher supervises only the newest conditioned history latent
+    (``--selector-counterfactual-latent-index 0``), so a checkpoint trained that
+    way must be deployed with ``domain=last_history``.  Scoring the older latent
+    as well (``domain=history``) reads out-of-distribution features that were
+    never supervised, which is exactly how the TokenNorm pilot acquired its
+    "never drop the newest latent" bias.
+    """
+
+    checkpoint = getattr(args, "pre_dit_learned_checkpoint", None)
+    if checkpoint is None:
+        return []
+    domain = str(getattr(args, "pre_dit_learned_domain", "last_history")).strip().lower()
+    if domain not in {"last_history", "history"}:
+        raise ValueError("--pre-dit-learned-domain must be last_history or history")
+    threshold = float(getattr(args, "pre_dit_learned_threshold", 0.4))
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("--pre-dit-learned-threshold must be within [0, 1]")
+    random_keep = float(getattr(args, "pre_dit_learned_random_keep_ratio", 0.5))
+    if not 0.0 < random_keep <= 1.0:
+        raise ValueError("--pre-dit-learned-random-keep-ratio must be within (0, 1]")
+    scorer_options = {
+        "checkpoint": str(checkpoint),
+        # The pre-DiT press reads the block-0 input directly, so the scorer's
+        # feature layer is the same depth as its compression layer.
+        "layer": 0,
+        "feature_layer": 0,
+        "feature_mode": str(getattr(args, "pre_dit_learned_feature_mode", "all")),
+    }
+    return [
+        pre_dit_spec(
+            f"physical_pre_dit_learned_{domain}_threshold_{threshold:g}",
+            "learned_planning_selector",
+            1.0,
+            selector={"name": "threshold", "threshold": threshold},
+            domain=domain,
+            scorer_options=scorer_options,
+        ),
+        pre_dit_spec(
+            f"physical_pre_dit_random_{domain}_keep{int(round(random_keep * 100)):02d}",
+            "random",
+            random_keep,
+            seed=round_seed + 107,
+            domain=domain,
+        ),
+    ]
+
+
 def _method_specs_for_run(args: argparse.Namespace, round_seed: int) -> list[dict[str, Any]]:
+    domain_for_policy = str(getattr(args, "domain", "last_history"))
+    if getattr(args, "retention_policy", None) is not None and domain_for_policy.startswith(
+        "future"
+    ):
+        raise ValueError(
+            "--retention-policy is history-only and cannot be applied to "
+            f"future domain {domain_for_policy!r}"
+        )
+    if getattr(args, "pre_dit_merge_matrix", False):
+        conflicts = (
+            getattr(args, "dynamic_selector_checkpoint", None),
+            getattr(args, "c4_replica_triad_checkpoint", None),
+            getattr(args, "persistent_layer_sweep", None),
+            getattr(args, "promising_full_matrix", False),
+            getattr(args, "breakthrough_full_matrix", False),
+            getattr(args, "temporal_motion_matrix", False),
+            getattr(args, "pre_dit_token_matrix", False),
+            getattr(args, "methods", None),
+        )
+        if any(conflicts):
+            raise ValueError(
+                "--pre-dit-merge-matrix cannot be combined with another method matrix"
+            )
+        if args.domain not in {"history", "all_history", "last_history"}:
+            raise ValueError("--pre-dit-merge-matrix requires a history domain")
+        if args.retention_policy is not None:
+            raise ValueError("--pre-dit-merge-matrix cannot use a retention policy")
+        baseline = next(
+            spec
+            for spec in method_specs(round_seed, domain="history")
+            if spec["name"] == "physical_no_press"
+        )
+        keep_ratio = float(getattr(args, "pre_dit_merge_keep_ratio", 0.5))
+        if not 0.0 < keep_ratio <= 1.0:
+            raise ValueError("--pre-dit-merge-keep-ratio must be within (0, 1]")
+        domain = str(args.domain)
+        tag = f"{domain}_keep{int(round(keep_ratio * 100)):02d}"
+
+        def merge_spec(name, feature, seed=0):
+            config = {
+                "name": "similarity_merge",
+                "injection_point": "block_input",
+                "domain": domain,
+                "feature": feature,
+                "budget": {
+                    "type": "ratio",
+                    "value": keep_ratio,
+                    "reference": "eligible",
+                },
+            }
+            if feature == "random":
+                config["seed"] = int(seed)
+            return {"name": name, "mode": "physical", "press": config}
+
+        def prune_spec(name, scorer, seed=0):
+            config = {
+                "name": "scorer_press",
+                "injection_point": "block_input",
+                "domain": domain,
+                "scorer": {"name": scorer},
+                "selector": {"name": "topk"},
+                "operator": {"name": "hidden_prune"},
+                "budget": {
+                    "type": "ratio",
+                    "value": keep_ratio,
+                    "reference": "eligible",
+                },
+            }
+            if scorer == "random":
+                config["scorer"].update({"seed": int(seed), "scope": "scene_step"})
+            return {"name": name, "mode": "physical", "press": config}
+
+        # Both operators emit exactly `protected + round(ratio * n_candidate)`
+        # tokens, so every arm runs the identical DiT sequence length: the
+        # comparison isolates information retention, not compute.
+        def register_spec(name):
+            n_candidate = 390 if domain == "last_history" else 780
+            config = {
+                "name": "register_merge",
+                "injection_point": "block_input",
+                "domain": domain,
+                "num_key_tokens": int(round(keep_ratio * n_candidate)),
+                "budget": {
+                    "type": "ratio",
+                    "value": keep_ratio,
+                    "reference": "eligible",
+                },
+            }
+            checkpoint = getattr(args, "pre_dit_register_checkpoint", None)
+            if checkpoint:
+                config["checkpoint"] = str(checkpoint)
+            return {"name": name, "mode": "physical", "press": config}
+
+        # The combined training checkpoint carries both LoRA and bottleneck
+        # weights; apply the same LoRA config to the eval pipe.
+        if getattr(args, "pre_dit_register_lora_checkpoint", None):
+            if not getattr(args, "pre_dit_register_checkpoint", None):
+                args.pre_dit_register_checkpoint = args.pre_dit_register_lora_checkpoint
+
+        specs = [
+            baseline,
+            prune_spec(f"physical_pre_dit_prune_random_{tag}", "random", round_seed + 111),
+            merge_spec(f"physical_pre_dit_merge_random_{tag}", "random", round_seed + 112),
+            merge_spec(f"physical_pre_dit_merge_similarity_{tag}", "tokens"),
+            merge_spec(f"physical_pre_dit_merge_kmeans_{tag}", "kmeans"),
+            # Reference grouping kept so a fast-grouping change can be isolated
+            # from a merge-vs-prune change instead of confounded with it.
+            merge_spec(f"physical_pre_dit_merge_greedy_{tag}", "greedy"),
+        ]
+        if domain == "last_history":
+            specs.append(register_spec(f"physical_pre_dit_register_{tag}"))
+        requested_text = getattr(args, "pre_dit_token_methods", None)
+        if requested_text:
+            requested = [item.strip() for item in requested_text.split(",") if item.strip()]
+            available = {spec["name"]: spec for spec in specs}
+            unknown = [name for name in requested if name not in available]
+            if unknown:
+                raise ValueError(
+                    f"unknown --pre-dit-token-methods {unknown}; available={list(available)}"
+                )
+            return [available[name] for name in requested]
+        return specs
+
+    if getattr(args, "pre_dit_token_matrix", False):
+        conflicts = (
+            getattr(args, "dynamic_selector_checkpoint", None),
+            getattr(args, "c4_replica_triad_checkpoint", None),
+            getattr(args, "persistent_layer_sweep", None),
+            getattr(args, "promising_full_matrix", False),
+            getattr(args, "breakthrough_full_matrix", False),
+            getattr(args, "temporal_motion_matrix", False),
+            getattr(args, "methods", None),
+        )
+        if any(conflicts):
+            raise ValueError(
+                "--pre-dit-token-matrix cannot be combined with another method matrix"
+            )
+        learned_checkpoint = getattr(args, "pre_dit_learned_checkpoint", None)
+        allowed_domains = {"history", "all_history"}
+        if learned_checkpoint is not None:
+            allowed_domains.add("last_history")
+        if args.domain not in allowed_domains or args.retention_policy is not None:
+            raise ValueError(
+                "--pre-dit-token-matrix requires --domain history (or last_history "
+                "with --pre-dit-learned-checkpoint) and no retention policy"
+            )
+        baseline = next(
+            spec
+            for spec in method_specs(round_seed, domain="history")
+            if spec["name"] == "physical_no_press"
+        )
+
+        def pre_dit_spec(
+            name, scorer, keep_ratio, *, selector=None, seed=0, domain=None, scorer_options=None
+        ):
+            config = {
+                "name": "scorer_press",
+                "injection_point": "block_input",
+                "domain": str(domain or "history"),
+                "scorer": dict(scorer_options or {}, name=scorer),
+                "selector": dict(selector or {"name": "topk"}),
+                "operator": {"name": "hidden_prune"},
+                "budget": {
+                    "type": "ratio",
+                    "value": float(keep_ratio),
+                    "reference": "eligible",
+                },
+            }
+            if scorer == "random":
+                config["scorer"].update({"seed": int(seed), "scope": "scene_step"})
+            return {"name": name, "mode": "physical", "press": config}
+
+        def select_pre_dit_methods(specs):
+            requested_text = getattr(args, "pre_dit_token_methods", None)
+            if not requested_text:
+                return specs
+            requested = [item.strip() for item in requested_text.split(",") if item.strip()]
+            available = {spec["name"]: spec for spec in specs}
+            unknown = [name for name in requested if name not in available]
+            if unknown:
+                raise ValueError(
+                    f"unknown --pre-dit-token-methods {unknown}; "
+                    f"available={list(available)}"
+                )
+            return [available[name] for name in requested]
+
+        if getattr(args, "pre_dit_token_matrix_profile", "main") == "conservative":
+            return select_pre_dit_methods([
+                baseline,
+                pre_dit_spec(
+                    "physical_pre_dit_random_history_keep95",
+                    "random",
+                    0.95,
+                    seed=round_seed + 103,
+                ),
+                pre_dit_spec(
+                    "physical_pre_dit_token_norm_history_keep95",
+                    "token_norm",
+                    0.95,
+                ),
+                pre_dit_spec(
+                    "physical_pre_dit_random_history_keep90",
+                    "random",
+                    0.90,
+                    seed=round_seed + 104,
+                ),
+                pre_dit_spec(
+                    "physical_pre_dit_token_norm_history_keep90",
+                    "token_norm",
+                    0.90,
+                ),
+            ] + _pre_dit_learned_specs(args, round_seed, pre_dit_spec, baseline))
+
+        return select_pre_dit_methods([
+            baseline,
+            pre_dit_spec(
+                "physical_pre_dit_random_history_keep75",
+                "random",
+                0.75,
+                seed=round_seed + 101,
+            ),
+            pre_dit_spec(
+                "physical_pre_dit_token_norm_history_keep75",
+                "token_norm",
+                0.75,
+            ),
+            pre_dit_spec(
+                "physical_pre_dit_random_history_keep50",
+                "random",
+                0.50,
+                seed=round_seed + 102,
+            ),
+            pre_dit_spec(
+                "physical_pre_dit_token_norm_history_keep50",
+                "token_norm",
+                0.50,
+            ),
+            pre_dit_spec(
+                "physical_pre_dit_token_norm_history_dynamic",
+                "token_norm",
+                1.0,
+                selector={
+                    "name": "adaptive_mass",
+                    "ratios": [0.5, 0.75, 1.0],
+                    "mass_thresholds": [0.60, 0.80],
+                    "gap_thresholds": [0.02, 0.01],
+                    "gap_window": 8,
+                },
+            ),
+        ] + _pre_dit_learned_specs(args, round_seed, pre_dit_spec, baseline))
     c4_checkpoint = getattr(args, "c4_replica_triad_checkpoint", None)
     if c4_checkpoint is not None:
         conflicts = (
@@ -1025,7 +1473,54 @@ def _method_specs_for_run(args: argparse.Namespace, round_seed: int) -> list[dic
             )
         selector_config["ratios"] = ratios
         resolved_keep_ratio = sum(ratios) / len(ratios)
-    if selector_name in {"history_threshold", "history_quota"} and args.retention_policy is not None:
+    if selector_name == "future_threshold":
+        if args.domain != "future_video":
+            raise ValueError(
+                "future_threshold requires --domain future_video "
+                "(both future latents in [near,far] order)"
+            )
+        raw_thresholds = getattr(args, "per_future_latent_thresholds", None)
+        if raw_thresholds is None:
+            raise ValueError(
+                "future_threshold requires --per-future-latent-thresholds"
+            )
+        thresholds = _parse_float_list(
+            raw_thresholds, "--per-future-latent-thresholds"
+        )
+        if len(thresholds) != 2 or any(
+            value < 0.0 or value > 1.0 for value in thresholds
+        ):
+            raise ValueError(
+                "--per-future-latent-thresholds needs two values within [0, 1]"
+            )
+        selector_config["thresholds"] = thresholds
+        resolved_keep_ratio = 1.0
+    if selector_name == "future_quota":
+        if args.domain != "future_video":
+            raise ValueError(
+                "future_quota requires --domain future_video "
+                "(both future latents in [near,far] order)"
+            )
+        raw_ratios = getattr(args, "per_future_latent_keep_ratios", None)
+        if raw_ratios is None:
+            raise ValueError(
+                "future_quota requires --per-future-latent-keep-ratios"
+            )
+        ratios = _parse_float_list(
+            raw_ratios, "--per-future-latent-keep-ratios"
+        )
+        if len(ratios) != 2 or any(value < 0.0 or value > 1.0 for value in ratios):
+            raise ValueError(
+                "--per-future-latent-keep-ratios needs two values within [0, 1]"
+            )
+        selector_config["ratios"] = ratios
+        resolved_keep_ratio = sum(ratios) / len(ratios)
+    if selector_name in {
+        "history_threshold",
+        "history_quota",
+        "future_threshold",
+        "future_quota",
+    } and args.retention_policy is not None:
         raise ValueError(
             "per-latent selector options cannot be combined with --retention-policy"
         )
@@ -1048,6 +1543,13 @@ def _method_specs_for_run(args: argparse.Namespace, round_seed: int) -> list[dic
             }
         )
     scorer_options: dict[str, Any] = {}
+    if scorer_name == "random":
+        scorer_options.update(
+            {
+                "seed": int(round_seed) + 101,
+                "scope": "scene",
+            }
+        )
     feature_layer = getattr(args, "persistent_feature_layer", None)
     if feature_layer is not None:
         feature_layer = int(feature_layer)
@@ -1077,6 +1579,10 @@ def _method_specs_for_run(args: argparse.Namespace, round_seed: int) -> list[dic
                 "--persistent-learned-checkpoint"
             )
         scorer_options["checkpoint"] = str(Path(learned_checkpoint).expanduser().resolve())
+        if str(getattr(args, "domain", "")).startswith("future"):
+            scorer_options["future_position_mode"] = str(
+                getattr(args, "persistent_future_position_mode", "storage")
+            )
     if scorer_name == "action_contribution_stability":
         observation_start = getattr(
             args, "contribution_observation_start_layer", None
@@ -1105,7 +1611,7 @@ def _method_specs_for_run(args: argparse.Namespace, round_seed: int) -> list[dic
             selector_config=selector_config,
             scorer_options=scorer_options,
         )
-        if selector_name == "history_quota":
+        if selector_name in {"history_quota", "future_quota"}:
             spec["press"]["budget"] = {
                 "type": "absolute",
                 "value": sum(
@@ -1173,6 +1679,13 @@ def _metadata_subset(metadata: dict[str, Any]) -> dict[str, Any]:
         "effective_history_latent_keep_ratios",
         "effective_history_kept",
         "effective_history_keep_ratio",
+        "future_latent_token_count",
+        "selected_future_latent_counts",
+        "selected_future_latent_ratios",
+        "effective_future_latent_kept_counts",
+        "effective_future_latent_keep_ratios",
+        "effective_future_kept",
+        "effective_future_keep_ratio",
         "protected_count",
         "selected_count",
         "q_length",
@@ -1492,6 +2005,40 @@ def _build_official_pipeline(official_eval, args: argparse.Namespace, device: to
             f"[official-press] checkpoint loaded missing={len(missing)} unexpected={len(unexpected)}",
             flush=True,
         )
+
+    lora_ckpt = getattr(args, "pre_dit_register_lora_checkpoint", None)
+    if lora_ckpt:
+        from peft import LoraConfig, inject_adapter_in_model
+        from safetensors.torch import load_file
+
+        targets = [
+            name.strip()
+            for name in str(args.pre_dit_register_lora_target_modules).split(",")
+            if name.strip()
+        ]
+        rank = int(args.pre_dit_register_lora_rank)
+        lora_config = LoraConfig(r=rank, lora_alpha=rank, target_modules=targets)
+        pipe.dit = inject_adapter_in_model(lora_config, pipe.dit)
+        # A training checkpoint mixes three prefixes:
+        #   blocks.*            LoRA (relative to pipe.dit)
+        #   pipe.trajectory_*   trained trajectory encoder/head (relative to pipe)
+        #   learnable_merge.*   bottleneck (loaded by the press)
+        combined = {}
+        for key, value in load_file(str(lora_ckpt)).items():
+            key = str(key)
+            if key.startswith("learnable_merge."):
+                continue
+            if key.startswith("pipe."):
+                combined[key[len("pipe."):]] = value
+            else:
+                combined[f"dit.{key}"] = value
+        lora_missing, lora_unexpected = pipe.load_state_dict(combined, strict=False)
+        if _rank() == 0:
+            print(
+                f"[official-press] LoRA+trajectory loaded rank={rank} targets={targets} "
+                f"missing={len(lora_missing)} unexpected={len(lora_unexpected)}",
+                flush=True,
+            )
     return pipe
 
 
@@ -2308,8 +2855,9 @@ def _official_args(args: argparse.Namespace, output_dir: Path, official_eval) ->
         "--no_show_eval_progress",
         "--no_print_errors",
         "--no_print_alignment_params",
-        "--infer_trajectory_only",
     ]
+    if not bool(getattr(args, "infer_video", False)):
+        argv.append("--infer_trajectory_only")
     if args.max_eval_tokens is not None:
         argv.extend(["--max_eval_tokens", str(args.max_eval_tokens)])
     if args.save_viz:

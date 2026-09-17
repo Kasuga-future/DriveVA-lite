@@ -491,6 +491,45 @@ def launch_training_task(
                     counterfactual_displacement_target_mean = _to_float(
                         output.get("counterfactual_displacement_target_mean")
                     )
+                    # Metric-space planning-causal teacher diagnostics.  These
+                    # were computed by the `planning_harm` teacher but silently
+                    # dropped here, so runs using it were not self-traceable.
+                    counterfactual_planning_error_baseline_ade = _to_float(
+                        output.get("counterfactual_planning_error_baseline_ade")
+                    )
+                    counterfactual_planning_error_masked_ade = _to_float(
+                        output.get("counterfactual_planning_error_masked_ade")
+                    )
+                    counterfactual_planning_harm_ade = _to_float(
+                        output.get("counterfactual_planning_harm_ade")
+                    )
+                    counterfactual_planning_harm_ade_positive = _to_float(
+                        output.get("counterfactual_planning_harm_ade_positive")
+                    )
+                    counterfactual_planning_error_baseline_long_horizon = _to_float(
+                        output.get("counterfactual_planning_error_baseline_long_horizon")
+                    )
+                    counterfactual_planning_error_masked_long_horizon = _to_float(
+                        output.get("counterfactual_planning_error_masked_long_horizon")
+                    )
+                    counterfactual_planning_harm_long_horizon = _to_float(
+                        output.get("counterfactual_planning_harm_long_horizon")
+                    )
+                    counterfactual_planning_harm_long_horizon_positive = _to_float(
+                        output.get("counterfactual_planning_harm_long_horizon_positive")
+                    )
+                    counterfactual_displacement_target_std = _to_float(
+                        output.get("counterfactual_displacement_target_std")
+                    )
+                    counterfactual_displacement_normalize = output.get(
+                        "counterfactual_displacement_normalize"
+                    )
+                    counterfactual_displacement_spread = _to_float(
+                        output.get("counterfactual_displacement_spread")
+                    )
+                    counterfactual_displacement_abstain_ratio = _to_float(
+                        output.get("counterfactual_displacement_abstain_ratio")
+                    )
                     counterfactual_supervised_tokens = _to_float(
                         output.get("counterfactual_supervised_tokens")
                     )
@@ -541,6 +580,18 @@ def launch_training_task(
                     counterfactual_control_mask_loss_repeat = None
                     counterfactual_displacement_mean = None
                     counterfactual_displacement_target_mean = None
+                    counterfactual_planning_error_baseline_ade = None
+                    counterfactual_planning_error_masked_ade = None
+                    counterfactual_planning_harm_ade = None
+                    counterfactual_planning_harm_ade_positive = None
+                    counterfactual_planning_error_baseline_long_horizon = None
+                    counterfactual_planning_error_masked_long_horizon = None
+                    counterfactual_planning_harm_long_horizon = None
+                    counterfactual_planning_harm_long_horizon_positive = None
+                    counterfactual_displacement_target_std = None
+                    counterfactual_displacement_normalize = None
+                    counterfactual_displacement_spread = None
+                    counterfactual_displacement_abstain_ratio = None
                     counterfactual_supervised_tokens = None
                     selector_bce_unweighted = None
 
@@ -621,6 +672,18 @@ def launch_training_task(
                             "counterfactual_control_mask_loss_repeat": counterfactual_control_mask_loss_repeat,
                             "counterfactual_displacement_mean": counterfactual_displacement_mean,
                             "counterfactual_displacement_target_mean": counterfactual_displacement_target_mean,
+                            "counterfactual_planning_error_baseline_ade": counterfactual_planning_error_baseline_ade,
+                            "counterfactual_planning_error_masked_ade": counterfactual_planning_error_masked_ade,
+                            "counterfactual_planning_harm_ade": counterfactual_planning_harm_ade,
+                            "counterfactual_planning_harm_ade_positive": counterfactual_planning_harm_ade_positive,
+                            "counterfactual_planning_error_baseline_long_horizon": counterfactual_planning_error_baseline_long_horizon,
+                            "counterfactual_planning_error_masked_long_horizon": counterfactual_planning_error_masked_long_horizon,
+                            "counterfactual_planning_harm_long_horizon": counterfactual_planning_harm_long_horizon,
+                            "counterfactual_planning_harm_long_horizon_positive": counterfactual_planning_harm_long_horizon_positive,
+                            "counterfactual_displacement_target_std": counterfactual_displacement_target_std,
+                            "counterfactual_displacement_normalize": counterfactual_displacement_normalize,
+                            "counterfactual_displacement_spread": counterfactual_displacement_spread,
+                            "counterfactual_displacement_abstain_ratio": counterfactual_displacement_abstain_ratio,
                             "counterfactual_supervised_tokens": counterfactual_supervised_tokens,
                             "selector_bce_unweighted": selector_bce_unweighted,
                             "step_wall_time_ms": (time.perf_counter() - step_wall_start) * 1000.0,

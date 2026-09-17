@@ -452,6 +452,8 @@ class WanVideoPipeline(BasePipeline):
         training_target = self.scheduler.training_target(inputs["input_latents"], inputs["noise"], timestep)
 
         traj_target = None
+        traj_gt_abs = None
+        traj_x0_pred = None
         has_vel_token = False
         if "traj_tokens" in inputs and inputs["traj_tokens"] is not None:
             traj = inputs.get("trajectory")
@@ -487,6 +489,10 @@ class WanVideoPipeline(BasePipeline):
                 traj = traj.unsqueeze(0)
             traj = traj.to(device=self.device, dtype=self.torch_dtype)
             traj = self._ensure_traj_dim(traj, dim=3)
+            # Preserve metric-space ground truth for the planning-causal token
+            # teacher.  The diffusion loss below operates in normalized
+            # velocity space and is not itself a planning metric.
+            traj_gt_abs = traj.detach().float().clone()
             if self.trajectory_use_relative:
                 traj = self._to_relative_trajectory(traj)
             traj_norm = self.norm_trajectory(
@@ -600,6 +606,25 @@ class WanVideoPipeline(BasePipeline):
             if prefix_len > 0 and traj_pred.shape[1] > prefix_len:
                 traj_pred_points = traj_pred[:, prefix_len:]
             traj_loss = torch.nn.functional.mse_loss(traj_pred_points.float(), traj_target.float())
+            # Flow matching predicts v = noise - x0 and x_t =
+            # (1-sigma)x0 + sigma*noise, hence x0_hat = x_t - sigma*v_hat.
+            # Convert that estimate back to metric-space trajectory coordinates
+            # so counterfactual labels measure planning error, not feature or
+            # residual-space sensitivity.
+            timestep_id = torch.argmin(
+                (self.scheduler.timesteps - timestep.detach().cpu()).abs()
+            )
+            sigma = self.scheduler.sigmas[timestep_id].to(
+                device=traj_noisy.device, dtype=traj_noisy.dtype
+            )
+            traj_x0_norm = traj_noisy - sigma * traj_pred_points.to(traj_noisy.dtype)
+            traj_x0_pred = self.denorm_trajectory(
+                traj_x0_norm.float(),
+                is_relative=self.trajectory_use_relative,
+                target_fps=target_fps,
+            )
+            if self.trajectory_use_relative:
+                traj_x0_pred = self._from_relative_trajectory(traj_x0_pred)
             traj_loss_weight = 1.0
         else:
             traj_loss = torch.zeros_like(video_loss)
@@ -628,6 +653,16 @@ class WanVideoPipeline(BasePipeline):
                 # perturbation happens to project onto (review 2026-09-11 P3).
                 "trajectory_pred": (
                     traj_pred.detach() if torch.is_tensor(traj_pred) else None
+                ),
+                "trajectory_x0_pred": (
+                    traj_x0_pred.detach()
+                    if torch.is_tensor(traj_x0_pred)
+                    else None
+                ),
+                "trajectory_gt_abs": (
+                    traj_gt_abs.detach()
+                    if torch.is_tensor(traj_gt_abs)
+                    else None
                 ),
                 "trajectory_prefix_len": int(inputs.get("traj_prefix_len", 0) or 0),
                 # Kept attached only when an online gradient teacher requests it.
@@ -1801,6 +1836,31 @@ def model_fn_wan_video(
         traj_freqs = traj_freqs.view(traj_len, 1, -1)
         freqs = torch.cat([freqs, traj_freqs], dim=0)
 
+    # Optional physical selection immediately before DiT block 0.  The
+    # controller is installed only on the active pipeline by VideoTokenPress;
+    # the base DriveVA model has no dependency on that package.
+    pre_dit_controller = getattr(dit, "_tokenpress_pre_dit_controller", None)
+    if pre_dit_controller is not None:
+        incompatible = []
+        if tea_cache is not None:
+            incompatible.append("TeaCache")
+        if vace_context is not None:
+            incompatible.append("VACE")
+        if use_unified_sequence_parallel:
+            incompatible.append("unified sequence parallel")
+        if use_gradient_checkpointing or use_gradient_checkpointing_offload:
+            incompatible.append("gradient checkpointing")
+        if pose_latents is not None or face_pixel_values is not None:
+            incompatible.append("Animate")
+        if incompatible:
+            raise NotImplementedError(
+                "pre-DiT token selection is not implemented with "
+                + ", ".join(incompatible)
+            )
+        x, freqs, t_mod = pre_dit_controller.begin_forward(
+            x, freqs, t_mod, num_blocks=len(dit.blocks)
+        )
+
     # TokenPress can shorten the residual sequence after a selected source
     # block.  Keep this integration duck-typed so the clean DriveVA model does
     # not depend on the optional evaluation framework.
@@ -1877,6 +1937,89 @@ def model_fn_wan_video(
                 f"{cf_latent_index} is out of range for "
                 f"{num_cond_latents} conditioned history latents"
             )
+
+        def apply_counterfactual_mask(x, freqs, t_mod):
+            """Apply one history-token intervention and retain restore indices.
+
+            ``counterfactual_layer == -1`` calls this helper before block 0,
+            matching the deployment-time pre-DiT selector.  Non-negative
+            layers preserve the historical post-block intervention semantics.
+            """
+            nonlocal counterfactual_keep, counterfactual_original_length
+            if num_cond_latents <= 0:
+                raise RuntimeError(
+                    "counterfactual mask requires conditioned history latents"
+                )
+            candidate_start = int(
+                (num_cond_latents - 1 - cf_latent_index) * h * w
+            )
+            candidate_end = int((num_cond_latents - cf_latent_index) * h * w)
+            mask = counterfactual_history_token_mask.to(
+                device=x.device, dtype=x.dtype
+            )
+            if mask.ndim == 1:
+                mask = mask.unsqueeze(0)
+            expected = (x.shape[0], candidate_end - candidate_start)
+            if tuple(mask.shape) != expected:
+                raise ValueError(
+                    f"counterfactual mask shape {tuple(mask.shape)} != {expected}"
+                )
+            if not counterfactual_physical_prune:
+                return (
+                    torch.cat(
+                        [
+                            x[:, :candidate_start],
+                            x[:, candidate_start:candidate_end]
+                            * mask.unsqueeze(-1),
+                            x[:, candidate_end:],
+                        ],
+                        dim=1,
+                    ),
+                    freqs,
+                    t_mod,
+                )
+
+            keep_rows = []
+            prefix = torch.arange(candidate_start, device=x.device)
+            suffix = torch.arange(candidate_end, x.shape[1], device=x.device)
+            for row in range(x.shape[0]):
+                selected = mask[row].bool().nonzero(as_tuple=False).flatten()
+                keep_rows.append(
+                    torch.cat([prefix, selected + candidate_start, suffix])
+                )
+            keep = torch.stack(keep_rows)
+            counterfactual_keep = keep
+            counterfactual_original_length = int(x.shape[1])
+
+            def gather_sequence(tensor):
+                view = keep.view(
+                    keep.shape[0],
+                    keep.shape[1],
+                    *((1,) * (tensor.ndim - 2)),
+                )
+                index = view.expand(
+                    keep.shape[0], keep.shape[1], *tensor.shape[2:]
+                )
+                return torch.gather(tensor, 1, index)
+
+            x = gather_sequence(x)
+            if freqs.ndim == 3:
+                freqs = freqs.unsqueeze(0).expand(x.shape[0], -1, -1, -1)
+            freqs = gather_sequence(freqs)
+            if t_mod.ndim == 4:
+                t_mod = gather_sequence(t_mod)
+            elif t_mod.ndim != 3:
+                raise ValueError(
+                    "unsupported t_mod rank for counterfactual pruning: "
+                    f"{t_mod.ndim}"
+                )
+            return x, freqs, t_mod
+
+        if (
+            counterfactual_history_token_mask is not None
+            and int(counterfactual_layer) == -1
+        ):
+            x, freqs, t_mod = apply_counterfactual_mask(x, freqs, t_mod)
         for block_id, block in enumerate(dit.blocks):
             if capture_history_tokens and block_id == int(selector_layer):
                 if pipe is None:
@@ -1955,74 +2098,7 @@ def model_fn_wan_video(
                 counterfactual_history_token_mask is not None
                 and block_id == int(counterfactual_layer)
             ):
-                if num_cond_latents <= 0:
-                    raise RuntimeError("counterfactual mask requires conditioned history latents")
-                if not 0 <= int(counterfactual_latent_index) <= num_cond_latents - 1:
-                    raise ValueError(
-                        "counterfactual_latent_index "
-                        f"{int(counterfactual_latent_index)} is out of range for "
-                        f"{num_cond_latents} conditioned history latents"
-                    )
-                candidate_start = int(
-                    (num_cond_latents - 1 - int(counterfactual_latent_index)) * h * w
-                )
-                candidate_end = int(
-                    (num_cond_latents - int(counterfactual_latent_index)) * h * w
-                )
-                mask = counterfactual_history_token_mask.to(
-                    device=x.device, dtype=x.dtype
-                )
-                if mask.ndim == 1:
-                    mask = mask.unsqueeze(0)
-                expected = (x.shape[0], candidate_end - candidate_start)
-                if tuple(mask.shape) != expected:
-                    raise ValueError(
-                        f"counterfactual mask shape {tuple(mask.shape)} != {expected}"
-                    )
-                if counterfactual_physical_prune:
-                    keep_rows = []
-                    prefix = torch.arange(candidate_start, device=x.device)
-                    suffix = torch.arange(candidate_end, x.shape[1], device=x.device)
-                    for row in range(x.shape[0]):
-                        selected = mask[row].bool().nonzero(as_tuple=False).flatten()
-                        keep_rows.append(
-                            torch.cat([prefix, selected + candidate_start, suffix])
-                        )
-                    counterfactual_keep = torch.stack(keep_rows)
-                    counterfactual_original_length = int(x.shape[1])
-
-                    def gather_sequence(tensor):
-                        view = counterfactual_keep.view(
-                            counterfactual_keep.shape[0],
-                            counterfactual_keep.shape[1],
-                            *((1,) * (tensor.ndim - 2)),
-                        )
-                        index = view.expand(
-                            counterfactual_keep.shape[0],
-                            counterfactual_keep.shape[1],
-                            *tensor.shape[2:],
-                        )
-                        return torch.gather(tensor, 1, index)
-
-                    x = gather_sequence(x)
-                    if freqs.ndim == 3:
-                        freqs = freqs.unsqueeze(0).expand(x.shape[0], -1, -1, -1)
-                    freqs = gather_sequence(freqs)
-                    if t_mod.ndim == 4:
-                        t_mod = gather_sequence(t_mod)
-                    elif t_mod.ndim != 3:
-                        raise ValueError(
-                            f"unsupported t_mod rank for counterfactual pruning: {t_mod.ndim}"
-                        )
-                else:
-                    x = torch.cat(
-                        [
-                            x[:, :candidate_start],
-                            x[:, candidate_start:candidate_end] * mask.unsqueeze(-1),
-                            x[:, candidate_end:],
-                        ],
-                        dim=1,
-                    )
+                x, freqs, t_mod = apply_counterfactual_mask(x, freqs, t_mod)
             if hidden_sequence_controller is not None:
                 x, freqs, t_mod = hidden_sequence_controller.after_block(
                     block_id, x, freqs, t_mod
@@ -2037,6 +2113,8 @@ def model_fn_wan_video(
             x = restored
         if hidden_sequence_controller is not None:
             x = hidden_sequence_controller.finish_forward(x)
+        if pre_dit_controller is not None:
+            x = pre_dit_controller.finish_forward(x)
         dit._tokenpress_pre_block_hidden = None
         dit._tokenpress_pre_block_layer = None
         if tea_cache is not None:

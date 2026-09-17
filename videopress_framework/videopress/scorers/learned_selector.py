@@ -151,6 +151,7 @@ class LearnedPlanningSelectorScorer(TokenScorer):
         token_dim: int = 3072,
         action_mode: str | None = None,
         feature_mode: str = "all",
+        future_position_mode: str = "storage",
     ):
         self.checkpoint = str(Path(checkpoint).expanduser().resolve())
         self.layer = int(layer)
@@ -165,6 +166,11 @@ class LearnedPlanningSelectorScorer(TokenScorer):
         # the learned network already pools planning supervision in its teacher.
         self.action_mode = action_mode
         self.feature_mode = str(feature_mode)
+        self.future_position_mode = str(future_position_mode).strip().lower()
+        if self.future_position_mode not in {"storage", "history_compatible"}:
+            raise ValueError(
+                "future_position_mode must be 'storage' or 'history_compatible'"
+            )
         path = Path(self.checkpoint)
         if not path.is_file():
             raise FileNotFoundError(f"learned selector checkpoint not found: {path}")
@@ -232,73 +238,85 @@ class LearnedPlanningSelectorScorer(TokenScorer):
         )
 
     @staticmethod
-    def _positions(ctx, dtype: torch.dtype):
+    def _positions(ctx, dtype: torch.dtype, future_position_mode: str = "storage"):
         """Position features ``(t, y, x)`` for every candidate token.
 
-        Two domains are supported, and the distinction matters for how much of
-        the history the press is allowed to touch:
+        History domains retain the training-time convention exactly: the
+        temporal coordinate is the latent's storage index (oldest = 0,
+        newest = 1 for the default two-history-latent layout).
 
-        * ``last_history`` -- the newest history latent only (390 tokens).  This
-          is the deployed configuration; the older latent stays protected.
-        * ``history`` -- BOTH history latents (390 x 2 = 780 tokens).  Here each
-          latent gets its own patch-grid ``(y, x)`` plus the latent index as the
-          temporal coordinate, so the selector sees a coherent 780-token history
-          instead of one frame's worth of geometry.
+        Future domains support two documented modes:
 
-        The temporal coordinate follows the training-time teacher EXACTLY.  The
-        teacher (``diffsynth/pipelines/wan_video_new.py`` model_fn) writes
-        ``t_idx = num_cond_latents - 1 - cf_latent_index`` where
-        ``cf_latent_index`` is the distance back from the newest latent
-        (0 == newest).  Two facts therefore pin the convention:
+        * ``"storage"`` -- use the real storage index ``t = 2, 3`` for the two
+          future latents.  This is the honest coordinate, but it is out of the
+          training distribution because history checkpoints only saw ``t`` in
+          ``{0, 1}``.
+        * ``"history_compatible"`` -- subtract ``num_cond_latents`` so the
+          future latents reuse the history temporal range ``t = 0, 1``.  The
+          relative order (near future = 0, far future = 1) is preserved while
+          the selector sees coordinates closer to its history training data.
 
-        * for ``num_cond_latents == 2`` and ``cf_latent_index == 0`` (the
-          newest latent = the deployed ``last_history`` candidate) the teacher
-          emits ``t = 1.0`` -- its own comment says "exactly the previous
-          constant 1.0";
-        * the newest latent occupies the SECOND half of the history block,
-          i.e. storage index 1 in ``[0, 390, 780)``.
-
-        Both agree that **t equals the latent's storage index** (older = 0,
-        newest = 1), which is also what the artifact writer
-        (``t = global_index // tokens_per_latent``) and
-        ``selectors/history_topk.py`` assume.
-
-        This was briefly changed to a "distance back from newest"
-        interpretation, which silently INVERTED the coordinate for the deployed
-        domain and moved the selection scores.  Do not reintroduce that: the
-        value depends on which latent a token BELONGS to, not on how a
-        counterfactual probe happens to number it.
+        Future latent order is always storage/temporal order: ``future_latent_0``
+        is nearest to the history block, ``future_latent_1`` is farther ahead.
         """
 
+        mode = str(future_position_mode).strip().lower()
+        if mode not in {"storage", "history_compatible"}:
+            raise ValueError(
+                "future_position_mode must be 'storage' or 'history_compatible'"
+            )
         indices = ctx.domain.candidate_indices.to(ctx.tokens.device)
+        if indices.numel() == 0:
+            raise ValueError("learned planning selector requires a non-empty video domain")
         layout = ctx.layout
         per_latent = int(layout.tokens_per_latent)
-        history_end = int(layout.history_video.end)
+        video_start = int(layout.video.start)
+        video_end = int(layout.video.end)
         history_start = int(layout.history_video.start)
+        history_end = int(layout.history_video.end)
+        future_start = int(layout.future_video.start)
+        future_end = int(layout.future_video.end)
+        num_cond = int(layout.num_cond_latents)
 
         in_history = bool(
-            indices.numel() > 0
-            and int(indices.min()) >= history_start
-            and int(indices.max()) < history_end
+            int(indices.min()) >= history_start and int(indices.max()) < history_end
         )
-        if not in_history:
+        in_future = bool(
+            int(indices.min()) >= future_start and int(indices.max()) < future_end
+        )
+        in_video = bool(
+            int(indices.min()) >= video_start and int(indices.max()) < video_end
+        )
+        if not in_video:
             raise ValueError(
-                "learned planning selector requires a history domain "
-                "(last_history or history)"
+                "learned planning selector requires a video domain "
+                "(history, future_video, future_latent_i or all_video)"
             )
 
-        # Offset of each candidate token inside its own latent frame.  The
-        # quotient IS the storage index, which is the temporal coordinate.
-        offset_in_history = indices - history_start
-        t = torch.div(offset_in_history, per_latent, rounding_mode="floor")
-        local = offset_in_history.remainder(per_latent)
-        y = torch.div(local, layout.video_w, rounding_mode="floor")
-        x = local.remainder(layout.video_w)
+        offset_in_video = indices - video_start
+        t_storage = torch.div(offset_in_video, per_latent, rounding_mode="floor")
+        local = offset_in_video.remainder(per_latent)
+        if in_history or (not in_future and mode == "storage"):
+            t = t_storage
+        elif in_future and mode == "storage":
+            t = t_storage
+        elif in_future and mode == "history_compatible":
+            # Near future -> 0, next future -> 1, matching the history range.
+            t = t_storage - num_cond
+        else:
+            # all_video with history_compatible: preserve history storage
+            # coordinates and remap future latents into the same 0.. series.
+            t = torch.where(
+                t_storage < num_cond, t_storage, t_storage - num_cond
+            )
+
+        y = torch.div(local, int(layout.video_w), rounding_mode="floor")
+        x = local.remainder(int(layout.video_w))
         positions = torch.stack(
             [
                 t.to(dtype=dtype),
-                (y / max(layout.video_h - 1, 1)).to(dtype=dtype),
-                (x / max(layout.video_w - 1, 1)).to(dtype=dtype),
+                (y / max(int(layout.video_h) - 1, 1)).to(dtype=dtype),
+                (x / max(int(layout.video_w) - 1, 1)).to(dtype=dtype),
             ],
             dim=-1,
         )
@@ -314,7 +332,7 @@ class LearnedPlanningSelectorScorer(TokenScorer):
             )
         self.network.to(candidate.device)
         dtype = next(self.network.parameters()).dtype
-        positions = self._positions(ctx, dtype)
+        positions = self._positions(ctx, dtype, self.future_position_mode)
         ego, command = self._conditions(ctx, dtype)
         timestep = 0.0 if ctx.diffusion_rank is None else float(ctx.diffusion_rank)
         scores = torch.sigmoid(
@@ -372,6 +390,7 @@ class LearnedPlanningSelectorScorer(TokenScorer):
             "uses_pre_block_hidden": True,
             "action_mode": self.action_mode,
             "feature_mode": self.feature_mode,
+            "future_position_mode": self.future_position_mode,
         }
 
     def signature(self) -> str:
@@ -383,4 +402,6 @@ class LearnedPlanningSelectorScorer(TokenScorer):
             signature += (
                 f":feature_layer={self.feature_layer}:source_layer={self.layer}"
             )
+        if self.future_position_mode != "storage":
+            signature += f":future_position_mode={self.future_position_mode}"
         return signature

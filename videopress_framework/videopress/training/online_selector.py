@@ -273,6 +273,7 @@ def displacement_token_bce(
     disp_scale: float = 0.01,
     normalize: str = "scene",
     sample_weight: Optional[torch.Tensor] = None,
+    min_spread: float = 0.0,
 ) -> tuple[torch.Tensor, dict]:
     """Per-token BCE on the measured plan displacement caused by removal.
 
@@ -288,6 +289,13 @@ def displacement_token_bce(
     ``disp_scale`` so the selector logit keeps the same "probability of being
     worth keeping" semantics as the existing threshold rule.
 
+    ``min_spread`` guards the scene-relative normalisation against amplifying
+    numerical noise.  Min-max maps the smallest measured harm to 0 and the
+    largest to 1 no matter how small that range is, so a step whose whole tile
+    spread is 1e-5 still produces full-confidence 0/1 labels.  When the observed
+    spread is below ``min_spread`` the step carries no usable ordering
+    information and is abstained from instead of being stretched to [0, 1].
+
     Supervision is per token, not per tile mean: pooling to the tile mean is
     review defect 3.4 and destroys exactly the within-tile discrimination that
     token selection needs.
@@ -296,6 +304,8 @@ def displacement_token_bce(
         raise ValueError("logits and membership must have identical [B,N] shape")
     if not math.isfinite(float(disp_scale)) or float(disp_scale) <= 0:
         raise ValueError("disp_scale must be finite and positive")
+    if not math.isfinite(float(min_spread)) or float(min_spread) < 0:
+        raise ValueError("min_spread must be finite and non-negative")
     displacement = relative_displacements.detach().float().reshape(-1)
     if displacement.numel() == 1 and logits.shape[0] > 1:
         displacement = displacement.expand(logits.shape[0])
@@ -305,6 +315,8 @@ def displacement_token_bce(
         )
     if normalize not in {"scene", "absolute"}:
         raise ValueError(f"unsupported displacement normalisation: {normalize}")
+    spread = 0.0
+    abstained = torch.zeros(logits.shape[0], dtype=torch.bool, device=logits.device)
     if normalize == "scene" and displacement.numel() > 1:
         # Selection only ever compares tiles *inside one scene*, so the target is
         # the tile's relative displacement rank, not its absolute magnitude.
@@ -314,8 +326,17 @@ def displacement_token_bce(
         # floor (0.684 vs 0.644), i.e. it had learned nothing about ordering.
         low = displacement.min()
         high = displacement.max()
-        target = ((displacement - low) / (high - low).clamp_min(1e-6)).clamp(0.0, 1.0)
+        spread = float((high - low).clamp_min(0.0).item())
+        if spread < float(min_spread):
+            # No measurable ordering signal: supervise nothing this step rather
+            # than turning floating-point dust into a confident 0/1 label.
+            target = torch.zeros_like(displacement)
+            abstained = torch.ones_like(abstained)
+        else:
+            target = ((displacement - low) / (high - low).clamp_min(1e-6)).clamp(0.0, 1.0)
     else:
+        if normalize == "scene":
+            spread = float(displacement.max().item()) if displacement.numel() else 0.0
         target = (displacement / float(disp_scale)).clamp(0.0, 1.0)
     target = target.to(dtype=logits.dtype)
     selected_logits = logits[membership]
@@ -328,24 +349,40 @@ def displacement_token_bce(
         selected_logits, selected_target, reduction="none"
     )
     unweighted_bce = per_token.mean()
+    token_weight = torch.ones_like(per_token)
     if sample_weight is not None:
         weight = sample_weight.detach().float().reshape(-1)
         if weight.numel() == 1 and logits.shape[0] > 1:
             weight = weight.expand(logits.shape[0])
-        token_weight = torch.repeat_interleave(
+        token_weight = token_weight * torch.repeat_interleave(
             weight.to(dtype=per_token.dtype), membership.sum(dim=1), dim=0
         )
+    if bool(abstained.any()):
+        row_weight = (~abstained).to(dtype=per_token.dtype)
+        token_weight = token_weight * torch.repeat_interleave(
+            row_weight, membership.sum(dim=1), dim=0
+        )
+    if sample_weight is not None or bool(abstained.any()):
         loss = (per_token * token_weight).sum() / token_weight.sum().clamp_min(1e-6)
+        # Keep the term connected to the graph even when every row abstained so
+        # DDP never sees an unused-parameter mismatch.
+        loss = loss + selected_logits.sum() * 0.0
     else:
         loss = unweighted_bce
     return loss, {
         "counterfactual_displacement_target_mean": float(target.mean()),
         "counterfactual_displacement_target_max": float(target.max()),
+        "counterfactual_displacement_target_std": float(
+            target.std(unbiased=False)
+        ),
         "counterfactual_displacement_scale": float(disp_scale),
         "counterfactual_displacement_normalize": normalize,
+        "counterfactual_displacement_spread": float(spread),
+        "counterfactual_displacement_abstain_ratio": float(abstained.float().mean()),
         "counterfactual_unweighted_bce": float(unweighted_bce.detach()),
         "counterfactual_supervised_tokens": float(selected_logits.numel()),
     }
+
 
 
 def parse_keep_schedule(spec: str | None) -> List[Tuple[int, float]]:

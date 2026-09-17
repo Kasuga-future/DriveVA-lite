@@ -75,7 +75,7 @@ args=(
   --max_timestep_boundary "${MAX_TIMESTEP_BOUNDARY}"
   --min_timestep_boundary "${MIN_TIMESTEP_BOUNDARY}"
   --selector-warmup-steps "${SELECTOR_WARMUP_STEPS}"
-  --selector-layer "${SELECTOR_LAYER}"
+  --selector-layer "${SELECTOR_LAYER:-0}"
   --selector-loss-weight "${SELECTOR_LOSS_WEIGHT}"
   --selector-input-variant "${SELECTOR_INPUT_VARIANT}"
   --selector-feature-mode "${SELECTOR_FEATURE_MODE:-all}"
@@ -90,6 +90,7 @@ args=(
   --selector-counterfactual-scale "${SELECTOR_COUNTERFACTUAL_SCALE:-0.05}"
   --selector-counterfactual-tile-h "${SELECTOR_COUNTERFACTUAL_TILE_H:-3}"
   --selector-counterfactual-tile-w "${SELECTOR_COUNTERFACTUAL_TILE_W:-4}"
+  --selector-counterfactual-injection-point "${SELECTOR_COUNTERFACTUAL_INJECTION_POINT:-post_block}"
   --selector-teacher-timesteps "${SELECTOR_TEACHER_TIMESTEPS:-}"
   --selector-counterfactual-dump-dir "${SELECTOR_COUNTERFACTUAL_DUMP_DIR:-}"
   --selector-counterfactual-replicate "${SELECTOR_COUNTERFACTUAL_REPLICATE:-0}"
@@ -132,6 +133,7 @@ if [[ -n "${SELECTOR_COUNTERFACTUAL_NOISE_SEED:-}" ]]; then args+=(--selector-co
 if [[ -n "${DRIVEVA_RUN_ID:-}" ]]; then args+=(--run-id "${DRIVEVA_RUN_ID}"); fi
 if [[ -n "${SELECTOR_TEACHER_DISP_SCALE:-}" ]]; then args+=(--selector-teacher-disp-scale "${SELECTOR_TEACHER_DISP_SCALE}"); fi
 if [[ -n "${SELECTOR_TEACHER_DISP_NORMALIZE:-}" ]]; then args+=(--selector-teacher-disp-normalize "${SELECTOR_TEACHER_DISP_NORMALIZE}"); fi
+if [[ -n "${SELECTOR_TEACHER_DISP_MIN_SPREAD:-}" ]]; then args+=(--selector-teacher-disp-min-spread "${SELECTOR_TEACHER_DISP_MIN_SPREAD}"); fi
 if [[ -n "${SELECTOR_RANKING_LOSS_WEIGHT:-}" ]]; then args+=(--selector-ranking-loss-weight "${SELECTOR_RANKING_LOSS_WEIGHT}"); fi
 if [[ -n "${SELECTOR_RANKING_MARGIN:-}" ]]; then args+=(--selector-ranking-margin "${SELECTOR_RANKING_MARGIN}"); fi
 if [[ -n "${SELECTOR_RANKING_MAX_PAIRS:-}" ]]; then args+=(--selector-ranking-max-pairs "${SELECTOR_RANKING_MAX_PAIRS}"); fi

@@ -61,6 +61,14 @@ def resolve_budget(budget: TokenBudget, layout: TokenLayout, domain: TokenDomain
             raise ValueError("reference=each_history requires the complete history domain")
         per_latent = int(round(layout.tokens_per_latent * float(budget.value)))
         k = per_latent * layout.num_cond_latents
+    elif budget.reference in {"each_future", "per_future_latent"}:
+        if domain.name != "future_video":
+            raise ValueError("reference=each_future requires domain=future_video")
+        if domain.n_candidate != layout.future_video.length:
+            raise ValueError("reference=each_future requires the complete future domain")
+        num_future_latents = int(layout.video_f) - int(layout.num_cond_latents)
+        per_latent = int(round(layout.tokens_per_latent * float(budget.value)))
+        k = per_latent * num_future_latents
     else:
         k = int(round(_reference_count(budget.reference, layout, domain) * float(budget.value)))
     if k < 0 or k > domain.n_candidate:
@@ -124,4 +132,65 @@ def history_retention_stats(layout: TokenLayout, domain: TokenDomain, keep_globa
         "effective_history_keep_ratio": (
             effective_matrix.sum(dim=1).float() / float(max(1, layout.history_video.length))
         ).detach().cpu().tolist(),
+    }
+
+
+def future_retention_stats(layout: TokenLayout, domain: TokenDomain, keep_global_indices) -> dict:
+    """Report selected and effectively preserved tokens for every future latent.
+
+    The accounting mirrors :func:`history_retention_stats`, but latent indices
+    are the storage-order future frames ``num_cond_latents .. video_f - 1``.
+    ``future_latent_0`` is always the nearest future latent.
+    """
+
+    import torch
+
+    if not torch.is_tensor(keep_global_indices) or keep_global_indices.ndim != 2:
+        raise ValueError("keep_global_indices must have shape [B,K]")
+    device = keep_global_indices.device
+    selected = torch.zeros(
+        (keep_global_indices.shape[0], layout.total_length), dtype=torch.bool, device=device
+    )
+    if keep_global_indices.numel():
+        selected.scatter_(1, keep_global_indices.long(), True)
+    protected = domain.protected_mask.to(device).unsqueeze(0).expand_as(selected)
+    effective = selected | protected
+    num_future = int(layout.video_f) - int(layout.num_cond_latents)
+    selected_counts = []
+    effective_counts = []
+    for future_index in range(num_future):
+        frame = layout.frame_range(int(layout.num_cond_latents) + future_index)
+        selected_counts.append(selected[:, frame.start : frame.end].sum(dim=1))
+        effective_counts.append(effective[:, frame.start : frame.end].sum(dim=1))
+    selected_matrix = (
+        torch.stack(selected_counts, dim=1)
+        if selected_counts
+        else selected.new_zeros((selected.shape[0], 0), dtype=torch.long)
+    )
+    effective_matrix = (
+        torch.stack(effective_counts, dim=1)
+        if effective_counts
+        else selected.new_zeros((selected.shape[0], 0), dtype=torch.long)
+    )
+    denominator = float(layout.tokens_per_latent)
+    future_tokens = int(layout.future_video.length)
+    return {
+        "future_latent_token_count": int(layout.tokens_per_latent),
+        "selected_future_latent_counts": selected_matrix.detach().cpu().tolist(),
+        "selected_future_latent_ratios": (selected_matrix.float() / denominator)
+        .detach()
+        .cpu()
+        .tolist(),
+        "effective_future_latent_kept_counts": effective_matrix.detach().cpu().tolist(),
+        "effective_future_latent_keep_ratios": (effective_matrix.float() / denominator)
+        .detach()
+        .cpu()
+        .tolist(),
+        "effective_future_kept": effective_matrix.sum(dim=1).detach().cpu().tolist(),
+        "effective_future_keep_ratio": (
+            effective_matrix.sum(dim=1).float() / float(max(1, future_tokens))
+        )
+        .detach()
+        .cpu()
+        .tolist(),
     }

@@ -165,6 +165,8 @@ def persistent_attention_vnorm_spec(
         "adaptive_mass": "_adaptive",
         "history_threshold": "_history_threshold",
         "history_quota": "_history_quota",
+        "future_threshold": "_future_threshold",
+        "future_quota": "_future_quota",
     }.get(selector_config.get("name"), "")
     persistence_label = "persistent" if persistence_enabled else "one_shot"
     method_name = name or (
@@ -172,9 +174,12 @@ def persistent_attention_vnorm_spec(
     )
     resolved_scorer_options = {
         "layer": start_layer,
-        "action_mode": "mean",
         **requested_scorer_options,
     }
+    if scorer_name != "random":
+        # Attention-style and learned scorers accept the compatibility field;
+        # RandomScorer does not and must not receive it.
+        resolved_scorer_options.setdefault("action_mode", "mean")
     if scorer_name in {"action_attention_vnorm", "action_attention_vnorm_temporal"}:
         resolved_scorer_options.setdefault("head_mode", "mean")
     press = _press_config(
@@ -195,7 +200,8 @@ def persistent_attention_vnorm_spec(
         # Adaptive selection needs the full candidate count as its safe
         # fallback; fixed Top-K continues to use keep_ratio exactly.
         "value": 1.0
-        if selector_config.get("name") in {"adaptive_mass", "history_threshold"}
+        if selector_config.get("name")
+        in {"adaptive_mass", "history_threshold", "future_threshold"}
         else float(keep_ratio),
         "reference": "eligible",
     }

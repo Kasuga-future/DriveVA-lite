@@ -10,6 +10,7 @@ from .core.registry import OPERATOR_REGISTRY, SCORER_REGISTRY, SELECTOR_REGISTRY
 from .core.runtime import InjectionPoint
 from .core.retention import apply_history_retention_policy
 from .operators import (
+    HiddenPruneOperator,
     HiddenTokenMergeOperator,
     KVMergeOperator,
     KVPruneOperator,
@@ -20,7 +21,13 @@ from .operators import (
     ShuffleOperator,
     ZeroMaskOperator,
 )
-from .presses import ComposedPress, NoPress, ScorerPress, SimilarityMergePress
+from .presses import (
+    ComposedPress,
+    NoPress,
+    RegisterBottleneckPress,
+    ScorerPress,
+    SimilarityMergePress,
+)
 from .scorers import (
     ActionAttentionScorer,
     ActionAttentionVNormScorer,
@@ -36,6 +43,8 @@ from .scorers import (
 from .selectors import (
     AdaptiveMassSelector,
     AdaptiveSpatialMassSelector,
+    FutureQuotaSelector,
+    FutureThresholdSelector,
     HistoryQuotaSelector,
     HistoryThresholdSelector,
     HistoryTopKSelector,
@@ -58,11 +67,11 @@ def _section(value: Any, default: dict | None = None) -> dict:
 def _register_builtin_aliases() -> None:
     # Importing the modules registers the canonical entries.  Aliases here are
     # intentionally explicit so configuration names remain stable.
-    _ = (NoPress, ScorerPress, SimilarityMergePress, RandomScorer, TokenNormScorer,
+    _ = (NoPress, ScorerPress, SimilarityMergePress, RegisterBottleneckPress, RandomScorer, TokenNormScorer,
          ActionAttentionScorer, ActionAttentionVNormScorer, ActionAttentionVNormTemporalScorer, ActionContributionStabilityScorer, GradientNormScorer,
-         GradientInputScorer, PlanningGradientInputScorer, LearnedPlanningSelectorScorer, AdaptiveMassSelector, AdaptiveSpatialMassSelector, HistoryQuotaSelector, HistoryThresholdSelector, HistoryTopKSelector, ProtectedTokenSelector, TopKSelector, ThresholdSelector, ZeroMaskOperator,
+         GradientInputScorer, PlanningGradientInputScorer, LearnedPlanningSelectorScorer, AdaptiveMassSelector, AdaptiveSpatialMassSelector, FutureQuotaSelector, FutureThresholdSelector, HistoryQuotaSelector, HistoryThresholdSelector, HistoryTopKSelector, ProtectedTokenSelector, TopKSelector, ThresholdSelector, ZeroMaskOperator,
          MeanReplaceOperator, ShuffleOperator, ShuffleAllOperator,
-         ShuffleDroppedOperator, ShuffleKeptOperator, KVPruneOperator,
+         ShuffleDroppedOperator, ShuffleKeptOperator, KVPruneOperator, HiddenPruneOperator,
          HiddenTokenMergeOperator, KVMergeOperator, ComposedPress)
 
 
@@ -143,6 +152,25 @@ def build_press(config: Any, *, gradient_forward=None, gradient_objective=None):
             budget=build_budget(section.get("budget")),
             domain=domain,
             feature=section.get("feature", "tokens"),
+            injection_point=section.get("injection_point", InjectionPoint.SELF_ATTN_KV),
+            seed=int(section.get("seed", 0)),
+        )
+    if name in {"register_merge", "learnable_merge"}:
+        if retention_policy is not None:
+            raise ValueError("register_merge does not implement a retention policy")
+        return RegisterBottleneckPress(
+            budget=build_budget(section.get("budget")),
+            domain=section.get("domain", "last_history"),
+            num_key_tokens=int(section.get("num_key_tokens", 64)),
+            hidden_dim=int(section.get("hidden_dim", 3072)),
+            attn_dim=int(section.get("attn_dim", 1024)),
+            num_heads=int(section.get("num_heads", 8)),
+            dropout=float(section.get("dropout", 0.0)),
+            use_position_bias=bool(section.get("use_position_bias", True)),
+            value_norm=bool(section.get("value_norm", False)),
+            checkpoint=section.get("checkpoint"),
+            trainable=bool(section.get("trainable", True)),
+            injection_point=section.get("injection_point", InjectionPoint.BLOCK_INPUT),
         )
     if name in {"composed", "compose"}:
         if retention_policy is not None:

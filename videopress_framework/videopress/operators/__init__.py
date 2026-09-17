@@ -8,10 +8,12 @@ from .replace import (
     ShuffleOperator,
 )
 from .kv_prune import KVPruneOperator
+from .hidden_prune import HiddenPruneOperator
 from .merge import HiddenTokenMergeOperator, KVMergeOperator, MergeGroup, MergePlan, MergeOperator
 
 __all__ = [
     "KVPruneOperator",
+    "HiddenPruneOperator",
     "MeanReplaceOperator",
     "MergeGroup",
     "HiddenTokenMergeOperator",

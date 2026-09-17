@@ -227,6 +227,76 @@ def _trajectory_divergence(
     return metrics
 
 
+def _planning_error_harm(
+    baseline_pred: Optional[torch.Tensor],
+    masked_pred: Optional[torch.Tensor],
+    target: Optional[torch.Tensor],
+    *,
+    horizon_weights=(),
+    target_fps: float = 2.0,
+) -> dict:
+    """Increase in metric-space planning error caused by removing a token tile.
+
+    Positive harm means that deletion moves the predicted trajectory farther
+    from ground truth and therefore supplies direct evidence that the removed
+    tile is worth keeping.  Negative harm is retained for diagnostics but is
+    clamped to zero by the selector target.
+    """
+    if not all(torch.is_tensor(value) for value in (baseline_pred, masked_pred, target)):
+        return {}
+    baseline = baseline_pred.detach().float()
+    masked = masked_pred.detach().float()
+    target = target.detach().float()
+    if baseline.shape != masked.shape or baseline.shape != target.shape:
+        return {}
+    if baseline.ndim != 3 or baseline.shape[1] == 0:
+        return {}
+    # NAVSIM planning displacement is evaluated in the ground-plane x/y axes.
+    baseline_step_error = (baseline[..., :2] - target[..., :2]).norm(dim=-1)
+    masked_step_error = (masked[..., :2] - target[..., :2]).norm(dim=-1)
+    baseline_ade = baseline_step_error.mean(dim=1)
+    masked_ade = masked_step_error.mean(dim=1)
+    harm_ade = masked_ade - baseline_ade
+    metrics = {
+        "counterfactual_planning_error_baseline_ade": float(baseline_ade.mean()),
+        "counterfactual_planning_error_masked_ade": float(masked_ade.mean()),
+        "counterfactual_planning_harm_ade": float(harm_ade.mean()),
+        "counterfactual_planning_harm_ade_positive": float(
+            harm_ade.clamp_min(0).mean()
+        ),
+    }
+    if horizon_weights:
+        baseline_weighted, indices = horizon_weighted_trajectory_displacement(
+            baseline[..., :2],
+            target[..., :2],
+            horizon_weights,
+            target_fps=target_fps,
+        )
+        masked_weighted, _ = horizon_weighted_trajectory_displacement(
+            masked[..., :2],
+            target[..., :2],
+            horizon_weights,
+            target_fps=target_fps,
+        )
+        harm = masked_weighted - baseline_weighted
+        metrics.update(
+            {
+                "counterfactual_planning_error_baseline_long_horizon": float(
+                    baseline_weighted.mean()
+                ),
+                "counterfactual_planning_error_masked_long_horizon": float(
+                    masked_weighted.mean()
+                ),
+                "counterfactual_planning_harm_long_horizon": float(harm.mean()),
+                "counterfactual_planning_harm_long_horizon_positive": float(
+                    harm.clamp_min(0).mean()
+                ),
+                "counterfactual_planning_horizon_indices": indices,
+            }
+        )
+    return metrics
+
+
 _NAVSIM_EVAL_LOG_DEFAULT = "/path/to/navsim_v1.1/navsim_logs/test"
 _NAVSIM_EVAL_SENSOR_DEFAULT = "/path/to/navsim_v1.1/sensor_blobs/test"
 _NAVSIM_EVAL_CACHE_DEFAULT = (
@@ -850,6 +920,7 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
         selector_counterfactual_tile_h: int = 3,
         selector_counterfactual_tile_w: int = 4,
         selector_counterfactual_physical: bool = False,
+        selector_counterfactual_injection_point: str = "post_block",
         selector_teacher_timesteps: str = "",
         selector_teacher_seed: Optional[int] = None,
         selector_counterfactual_dump_dir: Optional[str] = None,
@@ -863,6 +934,7 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
         selector_counterfactual_jsonl_dir: Optional[str] = None,
         selector_teacher_disp_scale: float = 0.01,
         selector_teacher_disp_normalize: str = "scene",
+        selector_teacher_disp_min_spread: float = 0.0,
         selector_ranking_loss_weight: float = 0.0,
         selector_ranking_margin: float = 0.0,
         selector_ranking_max_pairs: int = 4096,
@@ -902,6 +974,16 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
         self.selector_counterfactual_tile_h = int(selector_counterfactual_tile_h)
         self.selector_counterfactual_tile_w = int(selector_counterfactual_tile_w)
         self.selector_counterfactual_physical = bool(selector_counterfactual_physical)
+        self.selector_counterfactual_injection_point = str(
+            selector_counterfactual_injection_point
+        )
+        if self.selector_counterfactual_injection_point not in {
+            "post_block",
+            "pre_dit",
+        }:
+            raise ValueError(
+                "selector counterfactual injection point must be post_block or pre_dit"
+            )
         self.selector_teacher_seed = (
             None if selector_teacher_seed is None else int(selector_teacher_seed)
         )
@@ -970,6 +1052,12 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
         if not math.isfinite(self.selector_teacher_disp_scale) or self.selector_teacher_disp_scale <= 0:
             raise ValueError("selector teacher disp_scale must be finite and positive")
         self.selector_teacher_disp_normalize = str(selector_teacher_disp_normalize)
+        self.selector_teacher_disp_min_spread = float(selector_teacher_disp_min_spread)
+        if (
+            not math.isfinite(self.selector_teacher_disp_min_spread)
+            or self.selector_teacher_disp_min_spread < 0
+        ):
+            raise ValueError("selector_teacher_disp_min_spread must be finite and non-negative")
         if self.selector_teacher_disp_normalize not in {"scene", "absolute"}:
             raise ValueError("selector teacher disp_normalize must be scene or absolute")
         self.selector_ranking_loss_weight = float(selector_ranking_loss_weight)
@@ -1370,16 +1458,39 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
         teacher_step = self.enable_online_selector and self.global_step >= self.selector_warmup_steps and self.global_step % self.selector_gradient_interval == 0
         counterfactual_step = (
             teacher_step
-            and self.selector_teacher_mode in {"signed_hybrid", "displacement"}
+            and self.selector_teacher_mode
+            in {"signed_hybrid", "displacement", "planning_harm"}
             and self.global_step % self.selector_counterfactual_interval == 0
         )
+        if counterfactual_step:
+            # The counterfactual teacher records exactly one tile record and one
+            # target per probe spec, so the tile/logit stacking below is only
+            # well defined for a per-device batch of one.  Fail loudly here
+            # instead of producing a silently misaligned supervision tensor.
+            batch = None
+            for key in ("noise", "input_latents", "latents"):
+                value = inputs.get(key) if isinstance(inputs, dict) else None
+                if torch.is_tensor(value) and value.ndim >= 1:
+                    batch = int(value.shape[0])
+                    break
+            if batch is None and isinstance(data, dict) and data.get("video") is not None:
+                batch = len(data["video"])
+            if batch is not None and batch != 1:
+                raise ValueError(
+                    "the counterfactual token teacher requires per-device batch "
+                    f"size 1, got {batch}; its tile records are not batch-aligned"
+                )
         if counterfactual_step and self.selector_teacher_timesteps:
             world_size = 1
             if torch.distributed.is_available() and torch.distributed.is_initialized():
                 world_size = torch.distributed.get_world_size()
             group_count = self.selector_counterfactual_tile_h * self.selector_counterfactual_tile_w
             counterfactual_event = self.global_step // self.selector_counterfactual_interval
-            events_per_spatial_sweep = max(1, math.ceil(group_count / world_size))
+            events_per_spatial_sweep = (
+                1
+                if self.selector_counterfactual_sweep_all
+                else max(1, math.ceil(group_count / world_size))
+            )
             timestep_index = (
                 counterfactual_event // events_per_spatial_sweep
             ) % len(self.selector_teacher_timesteps)
@@ -1410,7 +1521,6 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
             result = self.pipe.training_loss(**models, **inputs, return_loss_breakdown=True)
         if not self.enable_online_selector or self.selector is None:
             return result
-        tokens = inputs.get("history_tokens")
         tokens = getattr(self.pipe, "_last_history_tokens", None)
         positions = getattr(self.pipe, "_last_token_positions", None)
         planning_loss = result.get("planning_loss_for_teacher")
@@ -1509,7 +1619,14 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
                     "capture_planning_graph": False,
                     "capture_training_replay": False,
                     "forced_training_timestep": replay_timestep,
-                    "counterfactual_layer": self.selector_layer,
+                    # -1 is the exact deployment intervention: physically
+                    # remove tokens before the first DiT block.  Keep the old
+                    # post-block mode available for reproducibility.
+                    "counterfactual_layer": (
+                        -1
+                        if self.selector_counterfactual_injection_point == "pre_dit"
+                        else self.selector_layer
+                    ),
                     "counterfactual_physical_prune": self.selector_counterfactual_physical,
                     "return_traj_pred": True,
                     "use_gradient_checkpointing": False,
@@ -1593,6 +1710,15 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
                         ),
                         horizon_weights=self.selector_long_horizon_weights,
                         target_fps=self.target_fps,
+                    )
+                    trajectory_divergence.update(
+                        _planning_error_harm(
+                            baseline_result.get("trajectory_x0_pred"),
+                            masked_result.get("trajectory_x0_pred"),
+                            baseline_result.get("trajectory_gt_abs"),
+                            horizon_weights=self.selector_long_horizon_weights,
+                            target_fps=self.target_fps,
+                        )
                     )
                     spec_trajectory[spec_position].append(trajectory_divergence)
                     if replay_index != 0:
@@ -1684,6 +1810,18 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
                                         float("nan"),
                                     )
                                 ),
+                                "counterfactual_planning_harm_ade": float(
+                                    trajectory_divergence.get(
+                                        "counterfactual_planning_harm_ade",
+                                        float("nan"),
+                                    )
+                                ),
+                                "counterfactual_planning_harm_long_horizon": float(
+                                    trajectory_divergence.get(
+                                        "counterfactual_planning_harm_long_horizon",
+                                        float("nan"),
+                                    )
+                                ),
                                 "tile_pos_t": float(tile_pos_mean[0]),
                                 "tile_pos_y": float(tile_pos_mean[1]),
                                 "tile_pos_x": float(tile_pos_mean[2]),
@@ -1707,7 +1845,12 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
                                 # reports/next_steps_plan_20260911.md)
                                 # self-traceable instead of relying on a config
                                 # sidecar.
-                                "counterfactual_layer": int(self.selector_layer),
+                                "counterfactual_layer": int(
+                                    probe_base["counterfactual_layer"]
+                                ),
+                                "counterfactual_injection_point": (
+                                    self.selector_counterfactual_injection_point
+                                ),
                                 "teacher_timestep": float(
                                     replay_timestep_float.reshape(-1)[0]
                                 ),
@@ -1858,15 +2001,23 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
                     dtype=reference_unweighted.dtype,
                 )
                 baseline_tensor = reference_unweighted
-            if self.selector_teacher_mode == "displacement":
+            teacher_token_scores = None
+            if self.selector_teacher_mode in {"displacement", "planning_harm"}:
                 # Magnitude teacher (2026-09-11 verdict, section 12.2): the sign
                 # of the loss change is unlearnable, its geometric magnitude is
                 # not.  Displacement is averaged over replays when replays > 1.
-                displacement_key = (
-                    "counterfactual_traj_disp_long_horizon_relative"
-                    if self.selector_long_horizon_weights
-                    else "counterfactual_traj_disp_relative"
-                )
+                if self.selector_teacher_mode == "planning_harm":
+                    displacement_key = (
+                        "counterfactual_planning_harm_long_horizon_positive"
+                        if self.selector_long_horizon_weights
+                        else "counterfactual_planning_harm_ade_positive"
+                    )
+                else:
+                    displacement_key = (
+                        "counterfactual_traj_disp_long_horizon_relative"
+                        if self.selector_long_horizon_weights
+                        else "counterfactual_traj_disp_relative"
+                    )
                 if self.selector_counterfactual_replays > 1:
                     displacement_values = [
                         self._mean_trajectory_metric(
@@ -1894,13 +2045,52 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
                     displacement_tensor,
                     disp_scale=self.selector_teacher_disp_scale,
                     normalize=self.selector_teacher_disp_normalize,
+                    min_spread=self.selector_teacher_disp_min_spread,
                 )
+                if (
+                    self.selector_teacher_disp_normalize == "scene"
+                    and displacement_tensor.numel() > 1
+                ):
+                    disp_low = displacement_tensor.min()
+                    disp_high = displacement_tensor.max()
+                    disp_spread = float((disp_high - disp_low).clamp_min(0.0).item())
+                    if disp_spread < self.selector_teacher_disp_min_spread:
+                        # Same abstention rule as displacement_token_bce (which
+                        # also reports the ratio/spread): the ranking diagnostics
+                        # must not pretend that a numerically degenerate spread
+                        # is a real ordering.
+                        target_values = torch.zeros_like(displacement_tensor)
+                    else:
+                        target_values = (
+                            (displacement_tensor - disp_low)
+                            / (disp_high - disp_low).clamp_min(1e-6)
+                        ).clamp(0.0, 1.0)
+                else:
+                    target_values = (
+                        displacement_tensor / self.selector_teacher_disp_scale
+                    ).clamp(0.0, 1.0)
+                # Expand the tile-level causal targets back to the 390-token
+                # grid solely for ranking diagnostics (and the optional
+                # pairwise loss).  Full 12-tile sweeps cover every token once.
+                teacher_token_scores = torch.zeros_like(logits, dtype=torch.float32)
+                teacher_token_counts = torch.zeros_like(logits, dtype=torch.float32)
+                for position, membership in enumerate(member_rows):
+                    membership_float = membership.to(dtype=torch.float32)
+                    teacher_token_scores = teacher_token_scores + (
+                        membership_float * target_values[position]
+                    )
+                    teacher_token_counts = teacher_token_counts + membership_float
+                teacher_token_scores = teacher_token_scores / teacher_token_counts.clamp_min(1)
                 counterfactual_metrics["counterfactual_displacement_mean"] = float(
                     displacement_tensor.mean()
                 )
                 counterfactual_metrics["counterfactual_displacement_target_key"] = (
                     displacement_key
                 )
+                if self.selector_teacher_mode == "planning_harm":
+                    counterfactual_metrics["counterfactual_planning_harm_mean"] = float(
+                        displacement_tensor.mean()
+                    )
             else:
                 selector_loss, counterfactual_metrics_bce = counterfactual_group_bce(
                     stacked_logits,
@@ -1916,8 +2106,12 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
                 float(counterfactual_metrics.get("counterfactual_unweighted_bce", 0.0)),
                 device=selector_loss.device,
             )
-            scores = None
-            labels = (logits.detach() >= 0).float()
+            scores = teacher_token_scores
+            labels = (
+                online_topk_labels(scores, self.selector_teacher_keep_ratio)
+                if scores is not None
+                else (logits.detach() >= 0).float()
+            )
             counterfactual_metrics["counterfactual_group_index"] = float(
                 sum(record["group_index"] for record in tile_records) / len(tile_records)
             )
@@ -1978,6 +2172,14 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
                 "counterfactual_traj_disp_long_horizon_relative",
                 "counterfactual_traj_endpoint_disp",
                 "counterfactual_traj_scale",
+                "counterfactual_planning_error_baseline_ade",
+                "counterfactual_planning_error_masked_ade",
+                "counterfactual_planning_harm_ade",
+                "counterfactual_planning_harm_ade_positive",
+                "counterfactual_planning_error_baseline_long_horizon",
+                "counterfactual_planning_error_masked_long_horizon",
+                "counterfactual_planning_harm_long_horizon",
+                "counterfactual_planning_harm_long_horizon_positive",
             ):
                 values = [
                     record["trajectory"][key]
@@ -1987,9 +2189,9 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
                 if values:
                     counterfactual_metrics[key] = float(sum(values) / len(values))
         else:
-            if self.selector_teacher_mode == "displacement":
+            if self.selector_teacher_mode in {"displacement", "planning_harm"}:
                 raise RuntimeError(
-                    "the displacement teacher needs the counterfactual probe; "
+                    "the planning-causal teacher needs the counterfactual probe; "
                     "set --selector-counterfactual-interval 1"
                 )
             if planning_loss is None:
@@ -2058,16 +2260,41 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
             result["loss"] = self.selector_loss_weight * selector_loss
         else:
             result["loss"] = result["loss"] + self.selector_loss_weight * selector_loss
-        # Consumers can apply this to the history portion while preserving sequence length.
-        result["history_mask"] = hard_topk_mask(
+        # Consumers can apply this to the history portion while preserving
+        # sequence length.  The selector is trained on the *newest* conditioned
+        # history latent (``selector_counterfactual_latent_indices[0]``), so its
+        # mask covers ``tokens.shape[1]`` candidates; ``model_fn`` masks the
+        # whole ``num_cond_latents * h * w`` history block.  Expanding the
+        # candidate mask with ones outside the newest latent keeps the older
+        # history protected and makes the two shapes agree -- without this the
+        # train-time masking path raised a broadcast error and could not be
+        # enabled at all.
+        selector_mask = hard_topk_mask(
             logits, ratio, protected_mask=critical_token_mask
         ).detach()
+        num_cond_latents = 0
+        longcat_latents = inputs.get("longcat_latents")
+        if torch.is_tensor(longcat_latents) and longcat_latents.ndim >= 3:
+            num_cond_latents = int(longcat_latents.shape[2])
+        tokens_per_latent = int(tokens.shape[1])
+        full_history_length = num_cond_latents * tokens_per_latent
+        if num_cond_latents > 1 and full_history_length > tokens_per_latent:
+            history_mask = torch.ones(
+                (selector_mask.shape[0], full_history_length),
+                device=selector_mask.device,
+                dtype=selector_mask.dtype,
+            )
+            history_mask[:, full_history_length - tokens_per_latent :] = selector_mask
+        else:
+            history_mask = selector_mask
+        result["history_mask"] = history_mask
+        result["history_mask_length"] = int(history_mask.shape[1])
+        result["history_mask_candidate_length"] = tokens_per_latent
         result["selector_protected_token_count"] = float(
             critical_token_mask.sum().item() if critical_token_mask is not None else 0
         )
         self._selector_mask = result["history_mask"]
         return result
-
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train DriveVA on NAVSIM v1.")
@@ -2192,7 +2419,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--selector-teacher-mode",
         type=str,
         default="gradient_abs",
-        choices=["gradient_abs", "signed_hybrid", "displacement"],
+        choices=["gradient_abs", "signed_hybrid", "displacement", "planning_harm"],
     )
     parser.add_argument("--selector-signed-temperature", type=float, default=1.0)
     parser.add_argument("--selector-counterfactual-interval", type=int, default=4)
@@ -2201,6 +2428,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--selector-counterfactual-tile-h", type=int, default=3)
     parser.add_argument("--selector-counterfactual-tile-w", type=int, default=4)
     parser.add_argument("--selector-counterfactual-physical", action="store_true")
+    parser.add_argument(
+        "--selector-counterfactual-injection-point",
+        type=str,
+        default="post_block",
+        choices=["post_block", "pre_dit"],
+        help=(
+            "where the teacher removes history tokens; pre_dit matches the "
+            "deployment selector before block 0"
+        ),
+    )
     parser.add_argument("--selector-teacher-timesteps", type=str, default="")
     parser.add_argument("--selector-teacher-seed", type=int, default=None)
     parser.add_argument(
@@ -2261,6 +2498,16 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=str,
         default="scene",
         choices=["scene", "absolute"],
+    )
+    parser.add_argument(
+        "--selector-teacher-disp-min-spread",
+        type=float,
+        default=float(_env_first("SELECTOR_TEACHER_DISP_MIN_SPREAD", default=0.0)),
+        help=(
+            "scene-relative teacher normalisation abstains when the measured "
+            "tile spread is below this value; 0.0 preserves the legacy min-max "
+            "behaviour"
+        ),
     )
     parser.add_argument(
         "--selector-ranking-loss-weight",
@@ -2462,6 +2709,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         selector_counterfactual_tile_h=args.selector_counterfactual_tile_h,
         selector_counterfactual_tile_w=args.selector_counterfactual_tile_w,
         selector_counterfactual_physical=args.selector_counterfactual_physical,
+        selector_counterfactual_injection_point=(
+            args.selector_counterfactual_injection_point
+        ),
         selector_teacher_timesteps=args.selector_teacher_timesteps,
         selector_teacher_seed=args.selector_teacher_seed,
         selector_counterfactual_dump_dir=args.selector_counterfactual_dump_dir,
@@ -2475,6 +2725,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         selector_counterfactual_jsonl_dir=args.selector_counterfactual_jsonl_dir,
         selector_teacher_disp_scale=args.selector_teacher_disp_scale,
         selector_teacher_disp_normalize=args.selector_teacher_disp_normalize,
+        selector_teacher_disp_min_spread=args.selector_teacher_disp_min_spread,
         selector_ranking_loss_weight=args.selector_ranking_loss_weight,
         selector_ranking_margin=args.selector_ranking_margin,
         selector_ranking_max_pairs=args.selector_ranking_max_pairs,

@@ -34,6 +34,7 @@ from train_navsim_v1 import (  # noqa: E402
     _dump_counterfactual_probe,
     _forbidden_manifest_tokens,
     _manifest_scene_tokens,
+    _planning_error_harm,
     _read_jsonl_manifest,
     _representative_frame_tokens,
     _trajectory_divergence,
@@ -143,6 +144,30 @@ def test_trajectory_divergence_exposes_preregistered_long_horizon_target() -> No
     )
     assert result["counterfactual_traj_disp_long_horizon"] == pytest.approx(2.3)
     assert result["counterfactual_traj_horizon_indices"] == [1, 3, 5]
+
+
+def test_planning_error_harm_prefers_deletions_that_worsen_ground_truth_error() -> None:
+    target = torch.zeros(1, 6, 3)
+    baseline = torch.zeros_like(target)
+    harmful = baseline.clone()
+    harmful[:, 1, 0] = 1.0
+    harmful[:, 3, 0] = 2.0
+    harmful[:, 5, 0] = 3.0
+    metrics = _planning_error_harm(
+        baseline,
+        harmful,
+        target,
+        horizon_weights=[(1.0, 0.15), (2.0, 0.30), (3.0, 0.55)],
+        target_fps=2.0,
+    )
+    assert metrics["counterfactual_planning_harm_ade"] > 0
+    assert metrics["counterfactual_planning_harm_long_horizon"] == pytest.approx(
+        2.4
+    )
+
+    improved = _planning_error_harm(harmful, baseline, target)
+    assert improved["counterfactual_planning_harm_ade"] < 0
+    assert improved["counterfactual_planning_harm_ade_positive"] == 0
 
 
 def test_signed_removal_teacher_preserves_harmful_direction() -> None:
@@ -624,6 +649,72 @@ def test_displacement_token_bce_supervises_every_token_in_the_tile() -> None:
     assert abs(single["counterfactual_displacement_target_mean"] - 0.4) < 1e-6
 
 
+def test_displacement_scene_normalisation_abstains_below_the_spread_floor() -> None:
+    """Min-max must not turn numerically degenerate spreads into 0/1 labels.
+
+    A scene whose whole 12-tile spread is 5e-7 is not evidence that one tile is
+    100% worth keeping; without a floor the legacy min-max path emits exactly
+    that label and supervises the selector with full confidence.
+    """
+
+    torch.manual_seed(7)
+    positions = _tile_grid_positions(4, 3, 4)
+    memberships = _tile_memberships(positions, 3, 4)
+    dust = torch.full((12,), 0.01)
+    dust[0] += 1e-5  # spread 1e-5: above the legacy 1e-6 guard, still meaningless
+
+    logits = torch.zeros(12, 48, requires_grad=True)
+    legacy, legacy_info = displacement_token_bce(
+        logits, memberships, dust, normalize="scene", min_spread=0.0
+    )
+    assert 1e-6 < legacy_info["counterfactual_displacement_spread"] < 1e-4
+    assert abs(legacy_info["counterfactual_displacement_target_max"] - 1.0) < 1e-5
+    assert legacy_info["counterfactual_displacement_abstain_ratio"] == 0.0
+
+    guarded_logits = torch.zeros(12, 48, requires_grad=True)
+    guarded, guarded_info = displacement_token_bce(
+        guarded_logits, memberships, dust, normalize="scene", min_spread=1e-3
+    )
+    assert guarded_info["counterfactual_displacement_abstain_ratio"] == 1.0
+    assert guarded_info["counterfactual_displacement_target_max"] == 0.0
+    assert torch.isfinite(guarded)
+    assert legacy.requires_grad and guarded.requires_grad
+    # An abstained step must not move the selector at all.
+    guarded.backward()
+    assert torch.count_nonzero(guarded_logits.grad) == 0
+
+    # A genuine spread is unaffected by a floor below it.
+    real = torch.linspace(0.001, 0.011, 12)
+    _, above = displacement_token_bce(
+        torch.zeros(12, 48), memberships, real, normalize="scene", min_spread=1e-4
+    )
+    _, legacy_real = displacement_token_bce(
+        torch.zeros(12, 48), memberships, real, normalize="scene", min_spread=0.0
+    )
+    assert above["counterfactual_displacement_abstain_ratio"] == 0.0
+    assert (
+        abs(
+            above["counterfactual_displacement_target_mean"]
+            - legacy_real["counterfactual_displacement_target_mean"]
+        )
+        < 1e-6
+    )
+
+    for bad in (-1e-3, float("nan")):
+        try:
+            displacement_token_bce(
+                torch.zeros(12, 48),
+                memberships,
+                real,
+                normalize="scene",
+                min_spread=bad,
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"min_spread={bad} was accepted")
+
+
 def test_displacement_token_bce_weighting_is_a_token_weighted_mean() -> None:
     logits = torch.zeros(2, 3)
     membership = torch.tensor([[True, False, False], [True, True, False]])
@@ -952,11 +1043,46 @@ def test_learned_selector_position_geometry_is_per_latent() -> None:
         assert float(x.min()) == 0.0 and float(x.max()) == 1.0
 
 
-def test_learned_selector_rejects_non_history_domains() -> None:
+def test_learned_selector_future_positions_storage_and_compatible() -> None:
+    """Future positions are explicit and always storage order near -> far."""
+
+    ctx, layout = _selector_context_for_domain("future_video")
+    per_latent = int(layout.tokens_per_latent)
+
+    storage = LearnedPlanningSelectorScorer._positions(
+        ctx, torch.float32, "storage"
+    )[0, :, 0]
+    assert storage.numel() == 2 * per_latent
+    assert float(storage[:per_latent].min()) == 2.0
+    assert float(storage[:per_latent].max()) == 2.0
+    assert float(storage[per_latent:].min()) == 3.0
+    assert float(storage[per_latent:].max()) == 3.0
+
+    compatible = LearnedPlanningSelectorScorer._positions(
+        ctx, torch.float32, "history_compatible"
+    )[0, :, 0]
+    assert float(compatible[:per_latent].min()) == 0.0
+    assert float(compatible[:per_latent].max()) == 0.0
+    assert float(compatible[per_latent:].min()) == 1.0
+    assert float(compatible[per_latent:].max()) == 1.0
+
+
+def test_learned_selector_future_latent_domains_are_single_latents() -> None:
+    near_ctx, layout = _selector_context_for_domain("future_latent_0")
+    far_ctx, _ = _selector_context_for_domain("future_latent_1")
+    assert near_ctx.domain.n_candidate == layout.tokens_per_latent
+    assert far_ctx.domain.n_candidate == layout.tokens_per_latent
+    near_t = LearnedPlanningSelectorScorer._positions(
+        near_ctx, torch.float32, "storage"
+    )[0, :, 0]
+    far_t = LearnedPlanningSelectorScorer._positions(
+        far_ctx, torch.float32, "storage"
+    )[0, :, 0]
+    assert float(near_t.min()) == 2.0 and float(near_t.max()) == 2.0
+    assert float(far_t.min()) == 3.0 and float(far_t.max()) == 3.0
+
+
+def test_learned_selector_rejects_unknown_future_position_mode() -> None:
     ctx, _ = _selector_context_for_domain("future_video")
-    try:
-        LearnedPlanningSelectorScorer._positions(ctx, torch.float32)
-    except ValueError as exc:
-        assert "history domain" in str(exc)
-    else:
-        raise AssertionError("a non-history domain must be rejected")
+    with pytest.raises(ValueError, match="future_position_mode"):
+        LearnedPlanningSelectorScorer._positions(ctx, torch.float32, "diagonal")

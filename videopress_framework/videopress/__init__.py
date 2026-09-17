@@ -11,6 +11,7 @@ from .core.context import TokenContext
 from .core.domain import (
     AllVideoDomain,
     DomainBuilder,
+    FutureLatentDomain,
     FutureVideoDomain,
     HistoryDomain,
     LastHistoryDomain,
@@ -35,6 +36,7 @@ __all__ = [
     "CompressionEventKey",
     "DomainBuilder",
     "EvaluationMode",
+    "FutureLatentDomain",
     "FutureVideoDomain",
     "HistoryDomain",
     "InjectionPoint",

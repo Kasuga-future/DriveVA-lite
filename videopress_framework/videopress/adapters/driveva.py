@@ -24,6 +24,109 @@ from ..core.runtime import InjectionPoint
 from .wan_attention import canonicalize_wan_qkv, restore_wan_qkv
 
 
+class _DriveVAPreDiTController:
+    """Shorten the complete residual sequence before DiT block 0."""
+
+    def __init__(self, adapter, runtime, model_name: str):
+        self.adapter = adapter
+        self.runtime = runtime
+        self.model_name = str(model_name)
+        self._keep = None
+        self._original_length = 0
+
+    @staticmethod
+    def _gather(tensor, keep):
+        if tensor.shape[0] != keep.shape[0]:
+            raise ValueError("batch dimension differs from pre-DiT selection")
+        view = keep.view(keep.shape[0], keep.shape[1], *((1,) * (tensor.ndim - 2)))
+        return torch.gather(
+            tensor,
+            1,
+            view.expand(keep.shape[0], keep.shape[1], *tensor.shape[2:]),
+        )
+
+    def begin_forward(self, x, freqs, t_mod, *, num_blocks: int):
+        if self._keep is not None:
+            raise RuntimeError("pre-DiT controller was reused before restoring its prior call")
+        layout = self.runtime.layout
+        if layout is None or int(layout.total_length) != int(x.shape[1]):
+            raise RuntimeError(
+                "pre-DiT selection requires an exact full-sequence TokenLayout"
+            )
+        configured, resolved, overridden, domain = self.adapter._resolve_domain_for_device(
+            self.runtime, layout, x.device
+        )
+        metadata = self.adapter._sample_metadata(self.runtime)
+        metadata.update(
+            self.adapter._domain_metadata(configured, resolved, domain, overridden)
+        )
+        metadata.update(
+            {
+                "injection_point": InjectionPoint.BLOCK_INPUT.value,
+                "pre_dit": True,
+                "model_name": self.model_name,
+            }
+        )
+        scene_tokens = metadata.get("scene_tokens")
+        if scene_tokens is None or len(scene_tokens) != x.shape[0]:
+            metadata["scene_tokens"] = [self.runtime.current_scene or ""] * x.shape[0]
+        ctx = self.adapter.create_context(
+            x,
+            layout,
+            domain,
+            scene_token=self.runtime.current_scene or "",
+            frame_token=getattr(self.runtime.current_sample, "frame_token", None),
+            log_id=getattr(self.runtime.current_sample, "log_id", ""),
+            timestamp=getattr(self.runtime.current_sample, "timestamp", None),
+            diffusion_rank=self.adapter._sample_value(
+                self.runtime, "diffusion_rank", None
+            ),
+            layer_idx=-1,
+            metadata=metadata,
+        )
+        self.runtime.current_context = ctx
+        result = self.runtime.execute_press(ctx)
+        mapping = result.mapping
+        keep = None if mapping is None else mapping.output_to_input
+        if not torch.is_tensor(keep) or keep.ndim != 2:
+            raise RuntimeError("pre-DiT operator must return a rectangular token mapping")
+        keep = keep.to(x.device).long()
+        if result.output.shape[:2] != keep.shape:
+            raise RuntimeError("pre-DiT output and mapping lengths disagree")
+
+        self._keep = keep
+        self._original_length = int(x.shape[1])
+        if freqs.ndim == 3:
+            freqs = freqs.unsqueeze(0).expand(x.shape[0], -1, -1, -1)
+        freqs = self._gather(freqs, keep)
+        if t_mod.ndim == 4:
+            t_mod = self._gather(t_mod, keep)
+        elif t_mod.ndim != 3:
+            raise ValueError(f"unsupported t_mod rank for pre-DiT pruning: {t_mod.ndim}")
+        result.metadata.update(
+            {
+                "selection_source_layer": -1,
+                "selection_applied_layer": -1,
+                "hidden_sequence_length_before": self._original_length,
+                "hidden_sequence_length_after": int(keep.shape[1]),
+                "hidden_sequence_ratio": float(keep.shape[1] / self._original_length),
+                "hidden_sequence_first_compressed_layer": 0,
+                "hidden_sequence_last_compressed_layer": int(num_blocks) - 1,
+                "hidden_sequence_compressed_layer_count": int(num_blocks),
+            }
+        )
+        return result.output, freqs, t_mod
+
+    def finish_forward(self, x):
+        if self._keep is None:
+            return x
+        restored = x.new_zeros((x.shape[0], self._original_length, x.shape[2]))
+        restored.scatter_(1, self._keep.unsqueeze(-1).expand_as(x), x)
+        self._keep = None
+        self._original_length = 0
+        return restored
+
+
 class DriveVAAdapter:
     def build_layout(self, f, h, w, num_cond_latents, traj_len, traj_prefix_len):
         return build_driveva_layout(f, h, w, num_cond_latents, traj_len, traj_prefix_len)
@@ -182,10 +285,74 @@ class DriveVAAdapter:
         if point is InjectionPoint.VIDEO_INPUT:
             self._install_video_input_hooks(pipe, runtime)
             return
+        if point is InjectionPoint.BLOCK_INPUT:
+            self._install_block_input_hooks(pipe, runtime)
+            return
         if point is InjectionPoint.SELF_ATTN_KV:
             self._install_kv_hooks(pipe, runtime)
             return
         raise NotImplementedError(f"{point.value} is declared but not implemented")
+
+    def _install_block_input_hooks(self, pipe, runtime) -> None:
+        hooks = []
+        for model_name in ("dit", "dit2"):
+            model = getattr(pipe, model_name, None)
+            if model is None or not hasattr(model, "blocks"):
+                continue
+            attribute = "_tokenpress_pre_dit_controller"
+            had_controller = hasattr(model, attribute)
+            previous_controller = getattr(model, attribute, None)
+            setattr(model, attribute, _DriveVAPreDiTController(self, runtime, model_name))
+            hooks.append((model, attribute, had_controller, previous_controller))
+        if not hooks:
+            raise RuntimeError("BLOCK_INPUT hook could not find pipe.dit or pipe.dit2")
+        runtime._driveva_pre_dit_hooks = hooks
+        runtime._driveva_hooks = []
+        runtime._driveva_video_hooks = []
+        runtime._driveva_hidden_sequence_hooks = []
+
+        original_model_fn = getattr(pipe, "model_fn", None)
+        if original_model_fn is not None:
+            def wrapped_model_fn(*args, **kwargs):
+                old_state = getattr(runtime, "_model_call_state", None)
+                timestep = kwargs.get("timestep")
+                if torch.is_tensor(timestep) and timestep.numel():
+                    runtime.current_diffusion_rank = int(timestep.reshape(-1)[0].item())
+                    runtime.current_timestep = runtime.current_diffusion_rank
+                latents = kwargs.get("latents")
+                longcat = kwargs.get("longcat_latents")
+                traj = kwargs.get("traj_tokens")
+                dit = kwargs.get("dit")
+                if torch.is_tensor(latents) and latents.ndim == 5 and dit is not None:
+                    patch = tuple(int(value) for value in getattr(dit, "patch_size", (1, 2, 2)))
+                    if len(patch) != 3 or any(int(value) <= 0 for value in patch):
+                        raise RuntimeError(f"invalid DriveVA patch_size={patch}")
+                    num_cond = (
+                        int(longcat.shape[2])
+                        if torch.is_tensor(longcat) and longcat.ndim >= 3
+                        else 0
+                    )
+                    traj_len = (
+                        int(traj.shape[1])
+                        if torch.is_tensor(traj) and traj.ndim >= 2
+                        else 0
+                    )
+                    runtime.layout = self.build_layout(
+                        int(latents.shape[2]) // patch[0],
+                        int(latents.shape[3]) // patch[1],
+                        int(latents.shape[4]) // patch[2],
+                        num_cond,
+                        traj_len,
+                        int(kwargs.get("traj_prefix_len", 0) or 0),
+                    )
+                runtime._model_call_state = {}
+                try:
+                    return original_model_fn(*args, **kwargs)
+                finally:
+                    runtime._model_call_state = old_state
+
+            pipe.model_fn = wrapped_model_fn
+            runtime._driveva_model_fn_hook = (pipe, original_model_fn)
 
     def _install_video_input_hooks(self, pipe, runtime) -> None:
         hooks = []
@@ -575,6 +742,17 @@ class DriveVAAdapter:
                 except AttributeError:
                     pass
         runtime._driveva_hidden_sequence_hooks = []
+        for model, attribute, had_controller, previous_controller in getattr(
+            runtime, "_driveva_pre_dit_hooks", []
+        ):
+            if had_controller:
+                setattr(model, attribute, previous_controller)
+            else:
+                try:
+                    delattr(model, attribute)
+                except AttributeError:
+                    pass
+        runtime._driveva_pre_dit_hooks = []
         persistence_store = getattr(runtime, "_cross_layer_selection_store", None)
         if persistence_store is not None:
             persistence_store.clear()

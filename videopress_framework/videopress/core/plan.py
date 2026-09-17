@@ -42,13 +42,17 @@ def validate_protocol(press, mode: EvaluationMode | str) -> None:
     if getattr(press, "name", "") in {"noop", "none", "full"}:
         return
     point = InjectionPoint.parse(getattr(press, "injection_point", InjectionPoint.VIDEO_INPUT))
-    if point in {InjectionPoint.BLOCK_INPUT, InjectionPoint.SELF_ATTN_OUTPUT}:
+    if point is InjectionPoint.SELF_ATTN_OUTPUT:
         raise NotImplementedError(f"{point.value} is declared but not implemented")
     operators = list(_operators(press))
     if not operators:
         raise ValueError(f"press {getattr(press, 'name', type(press).__name__)} has no operator")
     has_physical = any(bool(getattr(op, "physical_compression", False)) for op in operators)
     if eval_mode is EvaluationMode.CAUSAL:
+        if point is InjectionPoint.BLOCK_INPUT:
+            raise NotImplementedError(
+                "block_input is implemented only for physical hidden-token pruning"
+            )
         if has_physical:
             raise ValueError("causal mode cannot use a physical compression operator")
         if point is not InjectionPoint.VIDEO_INPUT:
@@ -56,12 +60,18 @@ def validate_protocol(press, mode: EvaluationMode | str) -> None:
         if any(not bool(getattr(op, "preserves_sequence_length", False)) for op in operators):
             raise ValueError("causal mode requires sequence-length-preserving operators")
     elif eval_mode is EvaluationMode.PHYSICAL:
-        if point is not InjectionPoint.SELF_ATTN_KV:
-            raise ValueError("physical mode requires injection_point=self_attn_kv")
+        if point not in {InjectionPoint.SELF_ATTN_KV, InjectionPoint.BLOCK_INPUT}:
+            raise ValueError(
+                "physical mode requires injection_point=self_attn_kv or block_input"
+            )
         if not has_physical:
             raise ValueError("physical mode requires a real sequence-compression operator")
         if any(not bool(getattr(op, "driveva_compatible", False)) for op in operators):
             raise ValueError("physical mode operator is not DriveVA K/V compatible")
+        if point is InjectionPoint.BLOCK_INPUT and any(
+            not bool(getattr(op, "block_input_compatible", False)) for op in operators
+        ):
+            raise ValueError("block_input requires a hidden-token-compatible operator")
     if point is InjectionPoint.VIDEO_INPUT and any(
         not bool(getattr(op, "preserves_sequence_length", False)) for op in operators
     ):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..core.budget import budget_stats, history_retention_stats, resolve_budget
+from ..core.budget import budget_stats, future_retention_stats, history_retention_stats, resolve_budget
 from ..core.persistence import CrossLayerPersistence
 from ..core.registry import register_press
 from ..core.result import CompressionResult
@@ -78,6 +78,14 @@ class ScorerPress(BaseVideoPress):
 
     def apply_with_selection(self, ctx, scores, selection) -> CompressionResult:
         operator_result = self.operator.apply(ctx, selection)
+        if str(ctx.domain.name).startswith("future"):
+            latent_retention = future_retention_stats(
+                ctx.layout, ctx.domain, selection.keep_global_indices
+            )
+        else:
+            latent_retention = history_retention_stats(
+                ctx.layout, ctx.domain, selection.keep_global_indices
+            )
         metadata = {
             "press": self.name,
             "scorer": self.scorer.describe() if hasattr(self.scorer, "describe") else type(self.scorer).__name__,
@@ -87,7 +95,7 @@ class ScorerPress(BaseVideoPress):
             "injection_point": self.injection_point.value,
             "budget": {"type": self.budget.type, "value": self.budget.value, "reference": self.budget.reference},
             **budget_stats(ctx.layout, ctx.domain, selection.K),
-            **history_retention_stats(ctx.layout, ctx.domain, selection.keep_global_indices),
+            **latent_retention,
             "selection_metadata": dict(selection.metadata),
             **operator_result.metadata,
         }

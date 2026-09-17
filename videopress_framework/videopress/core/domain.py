@@ -105,6 +105,32 @@ class HistoryLatentDomain(DomainBuilder):
         return _range_domain(layout, self.name, layout.frame_range(self.latent_index), device)
 
 
+class FutureLatentDomain(DomainBuilder):
+    """One future VAE latent in storage order (0 = nearest future).
+
+    DriveVA stores video latents in temporal order: history frames first, then
+    future frames.  ``future_latent_0`` is therefore the nearest future latent
+    (the first generated frame after history) and ``future_latent_1`` is the
+    next one.  The underlying global frame index is
+    ``layout.num_cond_latents + latent_index``.
+    """
+
+    def __init__(self, latent_index: int) -> None:
+        self.latent_index = int(latent_index)
+        self.name = f"future_latent_{self.latent_index}"
+
+    def build(self, layout: TokenLayout, device: torch.device | str) -> TokenDomain:
+        if self.latent_index < 0:
+            raise ValueError(f"future latent_index {self.latent_index} is negative")
+        frame_index = int(layout.num_cond_latents) + self.latent_index
+        if frame_index >= int(layout.video_f):
+            raise ValueError(
+                f"future latent_index {self.latent_index} is outside future "
+                f"(num_cond_latents={layout.num_cond_latents}, video_f={layout.video_f})"
+            )
+        return _range_domain(layout, self.name, layout.frame_range(frame_index), device)
+
+
 def build_domain(
     name: str | DomainBuilder,
     layout: TokenLayout,
@@ -126,6 +152,8 @@ def build_domain(
     }
     if key.startswith("history_latent_"):
         return HistoryLatentDomain(int(key.rsplit("_", 1)[1])).build(layout, device)
+    if key.startswith("future_latent_"):
+        return FutureLatentDomain(int(key.rsplit("_", 1)[1])).build(layout, device)
     if key not in builders:
         raise ValueError(f"Unknown token domain: {name}")
     return builders[key]().build(layout, device)
