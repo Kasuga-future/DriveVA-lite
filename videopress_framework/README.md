@@ -12,8 +12,24 @@ The two evaluation protocols are intentionally separate:
 | --- | --- | --- | --- |
 | `causal` | `VIDEO_INPUT` | Zero/Mean/Shuffle | token length is unchanged; token content is changed before trajectory concatenation |
 | `physical` | `SELF_ATTN_KV` | `KVPrune`/`KVMerge` | Q remains full length; post-RoPE K/V length is reduced and mapping is recorded |
+| `physical` | `BLOCK_INPUT` | `HiddenPrune` | selected history tokens are removed before DiT block 0; Q/K/V, residual and MLP paths all run at the shorter length, then the layout is restored before the heads |
 
-`BLOCK_INPUT` and `SELF_ATTN_OUTPUT` are currently unsupported and fail fast.
+`SELF_ATTN_OUTPUT` is currently unsupported and fails fast.
+
+True pre-DiT pilot (use a truncated scene count before any full protocol run):
+
+```bash
+CUDA_VISIBLE_DEVICES=0 /home/cpj/miniconda3/envs/DriveVA/bin/python \
+  scripts/run_official_navsim_press.py \
+  --pre-dit-token-matrix --domain history --max-eval-tokens 16 \
+  --poc-test-derived --output-root outputs/pre_dit_token_pilot
+```
+
+Use `--pre-dit-token-matrix-profile conservative` for the 90%/95% random and
+TokenNorm controls. `--pre-dit-token-methods METHOD[,METHOD...]` selects an
+independent subset so those arms can be sharded across GPUs without sharing
+output state. The runner keeps truncated results marked test-derived and fails
+the final official-scope guard by design.
 
 ## Layout
 
@@ -469,3 +485,55 @@ broadcasts that resolved path to every rank, so rank-local event journals and
 official CSVs remain in one auditable suite. If the requested directory
 already exists, either use `--allow-existing-output` intentionally or let the
 runner choose a single shared `*_rerunNN` directory.
+
+### Future video token compression
+
+The physical runtime supports `future_video` and per-latent future domains
+using the same layout / cross-layer persistence path as history. Future latent
+order is fixed to storage order: `future_latent_0` is nearest to the history
+block and `future_latent_1` is farther ahead.
+
+```bash
+# Generic no-training scorer on both future latents.
+python scripts/run_official_navsim_press.py \
+  --domain future_video \
+  --persistent-layer-sweep 15 \
+  --persistent-mode hidden_sequence \
+  --persistent-scorer action_attention_vnorm \
+  --persistent-selector topk \
+  --persistent-keep-ratio 0.5 \
+  --max-eval-tokens 1 --poc-test-derived \
+  --output-root outputs/future_action_attention_smoke
+
+# History-trained learned selector, zero-shot per-latent future thresholds.
+python scripts/run_official_navsim_press.py \
+  --domain future_video \
+  --persistent-layer-sweep 15 \
+  --persistent-mode hidden_sequence \
+  --persistent-scorer learned_planning_selector \
+  --persistent-learned-checkpoint <checkpoint.safetensors> \
+  --persistent-feature-layer 15 \
+  --persistent-selector future_threshold \
+  --per-future-latent-thresholds 0.05,0.40 \
+  --persistent-future-position-mode history_compatible \
+  --output-root outputs/future_learned_smoke
+```
+
+`--persistent-future-position-mode` controls the learned selector temporal
+feature:
+
+- `storage` uses the true latent storage index (`t=2,3` for the default
+  two-history/two-future layout);
+- `history_compatible` remaps near/far future to the history range
+  (`t=0,1`) to reduce OOD position features.
+
+`future_quota` uses `--per-future-latent-keep-ratios` in the same near-to-far
+order. `--retention-policy` remains history-only and fails loudly on future
+domains. Matched random controls are available through
+`--persistent-scorer random`.
+
+Current 64-scene POC results are **not** a full-protocol conclusion: future
+hard prune was not near-lossless and the zero-shot history selector did not
+beat matched random. See
+`outputs/future_poc64_report_20260917.md` before starting a future-selector
+training run.
