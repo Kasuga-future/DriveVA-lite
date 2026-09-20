@@ -1,9 +1,9 @@
 # AGENTS.md — DriveVA-lite Video Token Compression 交接文件
 
-> 最后更新：2026-09-20 13:05 CST
-> 当前分支：`main`，当前 HEAD：`717c7fb`（当前进度共 3 个 commit）
-> 当前工作区：8 个 modified + 5 个 untracked（含 token-level set-level oracle 新代码，
-> 尚未 commit，见 §6）
+> 最后更新：2026-09-20 23:50 CST
+> 当前分支：`main`，当前 HEAD：`d6a423d`（已与 `origin/main` 同步）
+> 当前工作区：**clean**，唯一 untracked 是排除项
+> `videopress_framework/scripts/pre_dit_gpu_smoke.py`（见 §6）
 > 当前主任务：Future token compression 现状：
 > 1. future 直接 select：Phase F0 已打通；噪声上选 future 与随机接近，hard prune 明显掉 PDM。
 > 2. **history-guided future select**：已实现 `HistoryGuidedFutureSelector`、
@@ -16,18 +16,23 @@
 >    trajectory/PDM tile oracle 均已完成，**tile oracle 失败**（512 面板 keep0.5
 >    ΔPDM `−0.0424`；4-seed `combined keep0.5` ΔPDM `−0.0182`）。结论指向 **tile
 >    粒度本身**：tile 子集空间可能不包含 near-lossless token 子集。
-> 4. **token-level set-level oracle（本次实现：代码 + 单测完成，实验未跑）**：
+> 4. **token-level set-level oracle（已完成，代码 + 单测 + 1024 场景实验）**：
 >    - `videopress/oracle/`：token 分组（token/linear/block/random）+ set-level
 >      联合打分搜索（best-of-N random / greedy forward / greedy backward / beam）
 >      + per-scene best-of-N 聚合 + trajectory displacement / planning harm；
 >    - `oracle_future_token_mask` selector（显式 token 索引 mask，物理 kv_prune）；
 >    - runner `--future-oracle-token-mask-json` / `--future-oracle-token-mask-jsons`
 >      （一个候选 mask 一个 method，整批候选一次 runner 调用）；
->    - `scripts/search_future_token_set_oracle.py` 搜索驱动；
->    - `outputs/future_token_set_oracle_queue_20260920/run_queue.sh` 4-GPU 队列脚本。
->    **本次没有产生新的 PDM 结论**；§4 的结论仍是 tile oracle 的失败结论。
-> **资源约束（用户 2026-09-17 明确要求）**：通用最多同时占用 **4 张 GPU**；
-> **提交约束**：frontier sweep 新代码暂不自动 commit；用户要求阶段性成果后再 commit。
+>    - `scripts/search_future_token_set_oracle.py` 搜索驱动。
+>    **结论：future hard prune 不可部署（1024 场景 keep0.5 随机 `−0.0483`）**，见 §4。
+> 5. **history+future 联合 press（已完成 7/7 臂 + matched-K 随机对照）**：
+>    `union_history` K=1149 / `same_latent` K=989 等联合臂前沿单调无拐点；
+>    **联合 selector 相对 matched-K 全 video 随机剪枝有显著正贡献**
+>    （`union_history` paired `+0.023` CI 不含 0），但绝对水平仍只有 `−0.016`，
+>    **联合最佳可部署点仍然是 history-only**（`−0.0039`），见 §4 / §12。
+> **资源约束（用户 2026-09-20 23:15/23:2x 明确要求）**：最多同时占用 **2 张 GPU**，
+> 且必须**只使用真正空闲的卡**（free ≥ 40 GiB）；没有空闲就等待。
+> **提交约束**：阶段性成果需用户发话后再 commit。
 >
 > **维护要求（强制）**：以后每个 agent 会话结束前，必须更新本文件：
 > 1. 更新顶部“最后更新 / HEAD / 工作区”；
@@ -65,7 +70,8 @@
 - 未来 token 很可能是 planning 的关键输入：报告里 DriveVA `Video+Action=90.9 PDMS`，
   `Action Only=47.0`；上述 POC 与这个警告一致。下一步应先做 future oracle/上界分析，
   再决定是否投入 future selector 训练，不能直接上 hard prune。
-- **资源约束**：最多同时占用 4 张 GPU；本文件 §10 已同步。
+- **资源约束（2026-09-20 23:15 更新）**：最多同时占用 **2 张 GPU**，且只使用真正空闲的卡
+  （free ≥ 40 GiB，优先 0/1）；没有空闲 GPU 就等待，不与他人共卡。本文件 §3.1/§10 已同步。
 
 ---
 
@@ -716,54 +722,30 @@ oracle 上界都不如随机，没有可蒸馏的信号。
 
 ---
 
-## 6. 当前工作区未提交状态（2026-09-20）
+## 6. 当前工作区未提交状态（2026-09-20 23:50 更新）
 
-`git status`：`main @ 717c7fb`，8 个 modified + 5 个 untracked（glob 展开后 8 个
-untracked 文件）；`pre_dit_gpu_smoke.py` 为排除项。用户要求后续不自动 commit。
+`git status`：`main @ d6a423d`，**与 `origin/main` 同步，工作区 clean**；唯一 untracked 是
+排除项 `videopress_framework/scripts/pre_dit_gpu_smoke.py`（按 §9.6 不进 git）。
+token-level oracle 的全部代码、测试、文档与联合 frontier 结果**已提交并推送**。
 
-### 6.1 Modified（counterfactual / token-level oracle 代码、文档，尚未 commit）
+### 6.1 已提交内容（本阶段）
 
-```text
-M AGENTS.md
-M examples/wanvideo/driveva_infer/eval_navsim_pdm.py
-M videopress_framework/README.md
-M videopress_framework/scripts/run_official_navsim_press.py
-M videopress_framework/tests/test_framework_repairs.py
-M videopress_framework/videopress/factory.py
-M videopress_framework/videopress/selectors/__init__.py
-M videopress_framework/videopress/selectors/history_guided.py
-```
+| commit | 内容 |
+|---|---|
+| `87376e8` | token-level set-level oracle 代码（`videopress/oracle/`、selector、runner CLI、搜索驱动）+ 39 单测 |
+| `9549593` | README / AGENTS.md 文档同步 |
+| `a82a849` | 收尾检查 + 结论报告索引 |
+| `d6a423d` | runner 新增 `--domain all_video`（联合 matched-K 对照必需）+ 单测 + 联合结果与 2-GPU 资源规则 |
 
-### 6.2 Untracked（核心 selector/脚本/测试 + 排除项）
+### 6.2 未提交 / 排除项
 
 ```text
-?? videopress_framework/scripts/build_future_oracle_masks.py
-?? videopress_framework/scripts/build_future_oracle_masks_multiseed.py
-?? videopress_framework/scripts/pre_dit_gpu_smoke.py
-?? videopress_framework/scripts/search_future_token_set_oracle.py
-?? videopress_framework/tests/test_future_token_oracle.py
-?? videopress_framework/videopress/oracle/{__init__,token_set,metrics}.py
-?? videopress_framework/videopress/selectors/future_oracle.py
+?? videopress_framework/scripts/pre_dit_gpu_smoke.py   # 排除项，GPU smoke 临时脚本
 ```
 
-`outputs/future_token_set_oracle_queue_20260920/run_queue.sh` 与 GPU smoke 产物放在
-`outputs/` 下，按 §9.6 不进 git。
-
-这些改动主要覆盖：
-
-- `BLOCK_INPUT` / pre-DiT hidden pruning；
-- hidden-sequence cross-layer controller；
-- pre-DiT merge / learnable merge / register bottleneck；
-- online selector 的 `pre_dit` counterfactual injection、planning-harm 指标透传；
-- `2026-09-17` 的 learned history + `history_threshold` 最佳配置；
-- future 迁移：future latent domain / budget / threshold/quota selector、
-  runner future CLI、learned selector future positions、persistent random control；
-- **2026-09-20 token-level set-level oracle**：`videopress/oracle/`、
-  `oracle_future_token_mask` selector、runner `--future-oracle-token-mask-jsons`、
-  搜索驱动与 35 个新单测。
-
-**注意**：当前工作区不是 clean state。新 agent 在切换任务/提交前先看清楚 diff，
-不要覆盖别人的未提交工作；运行测试至少覆盖本次修改。
+`outputs/`（含 `joint_history_future_1024_20260920/`、
+`joint_history_future_control_1024_20260920/`、`future_token_set_oracle_*_20260920/`、
+各类 `run_*.sh` 队列脚本与报告）按 §9.6 不进 git。
 
 ---
 
@@ -1666,9 +1648,63 @@ MPLCONFIGDIR=/tmp/driveva_mpl \
 - **面板口径**：官方 evaluator 按 rank 分块（rank r 取第 r 块再截断 `--max-eval-tokens`），
   所以 world_size=2/max=256 覆盖 `[0,256)+[N/2,N/2+256)` = 512 场景，是 1024 联合面板的
   **子集**；分析脚本自动取共同子集做配对比较。
-- **资源收紧**：用户 23:15 要求**只能用 2 张 GPU**；AGENTS §3.1/§10 已同步，队列改用
-  `wait_for_two_gpus`（优先 0/1，被占用则取最空闲两张）。实测 GPU 1 的 22 GiB 属
-  zhanglizhong 的 dino_dit 任务（非本会话残留），故控制使用 0+2。
+- **资源收紧**：用户 23:15 要求**只能用 2 张 GPU**，23:2x 进一步要求**只占用空闲卡**；
+  AGENTS §3.1/§10 已同步，队列改用 `acquire_gpus()`（free ≥ 40 GiB 才算空闲）。实测 GPU 1
+  的 22 GiB 属 zhanglizhong 的 dino_dit 任务（非本会话残留），故控制最终跑在 **0+3**。
 - **进程审计**：GPU 上无本会话孤儿；3228545=zhanglizhong dino_dit、3235490/91=xiangyike
   hidden_gradient_ablation、3191529/30=VLLM。注意：本会话曾用 `pkill -f run_official_navsim_press`
   误匹配到 xiangyike 的同名脚本（TERM 未生效，任务存活），后续必须按 PID/仓库路径确认归属。
+
+### 2026-09-20 — matched-K 全 video 随机对照完成：联合 selector 有真实信号，但绝对损失仍不可部署
+
+4 臂控制 23:20:50→23:40:09 完成（`outputs/joint_history_future_control_1024_20260920/`，
+`--domain all_video --persistent-scorer random --persistent-selector topk`，nproc=2/max=256 →
+**共同 512 场景子集**，NoPress `0.911362`）。预算匹配已逐臂校验：
+ratio 0.7365 → `n_kept=1149`/`hidden=1158`（正好等于 `union_history`），
+ratio 0.6340 → `n_kept=989`/`hidden=998`（正好等于 `same_latent`）。
+
+| arm | K | hidden | ΔPDM vs NoPress | 95% CI | lat ms | zero cand/base |
+|---|---:|---:|---:|---|---:|---:|
+| `union_history` | 1149 | 1158 | **−0.0158** | [−0.0281,−0.0051] | 573.7 | 25/15 |
+| `same_latent` | 989 | 998 | −0.0321 | [−0.0486,−0.0165] | 557.8 | 27/15 |
+| `history_only` | 490 | 1279 | −0.0060 | [−0.0130,−0.0005] | 582.5 | 18/15 |
+| `random_k1149_seed0` | 1149 | 1158 | −0.0386 | [−0.0557,−0.0228] | 583.7 | 35/15 |
+| `random_k1149_seed1` | 1149 | 1158 | −0.0396 | [−0.0585,−0.0220] | 580.4 | 36/15 |
+| `random_k989_seed0` | 989 | 998 | −0.0332 | [−0.0516,−0.0156] | 525.7 | 30/15 |
+| `random_k989_seed1` | 989 | 998 | −0.0501 | [−0.0699,−0.0317] | 532.5 | 40/15 |
+
+配对（同 512 场景，bootstrap 20000，seed 20260920）：
+
+- `union_history − random_k1149_seed0` = **`+0.0228`** CI `[+0.0081,+0.0387]`，**不含 0**
+- `union_history − random_k1149_seed1` = **`+0.0238`** CI `[+0.0062,+0.0420]`，**不含 0**
+  → **`union_history` 胜过 2/2 matched-K 随机臂**（随机均值 `−0.0391`）
+- `same_latent − random_k989_seed0` = `+0.0011` CI `[−0.0174,+0.0199]`，跨 0
+- `same_latent − random_k989_seed1` = `+0.0181` CI `[−0.0023,+0.0393]`，跨 0
+  → `same_latent` 名义上 2/2 更好，但**优势不显著**（两个随机 seed 自身差 0.0169，
+  该预算下随机 band 噪声更大）
+
+**结论（verified）**：
+
+1. **history-guided 的 selection 信号是真实的**：`union_history` 在完全相同的 K=1149 /
+   hidden=1158 上比随机全 video 剪枝高 `+0.023` PDM，两个 seed 的 CI 都不跨 0。
+   这是本项目少见的“selector 显著优于 matched random”的正向证据（此前多为不显著或更差）。
+2. **但绝对损失仍是门槛的 8 倍**：`union_history` 自身 ΔPDM `−0.0158`，离 near-lossless
+   `−0.002` 还差一个数量级；`same_latent` `−0.0321` 更差。→ **联合 press 依然不可部署**。
+3. **`same_latent` 丢掉了信号**：把 history mask 原样复制到同一 latent 的 future，虽然
+   压缩更多，但相对随机的优势不再显著（`+0.001`/`+0.018`）。用户“同位置复制 ⇒ 乘 2”
+   的直觉在 union 形态下成立、在 same-latent 形态下不成立。
+4. **面板交叉校验通过**：512 子集与 1024 面板同向（union `−0.0158` vs `−0.0121`；
+   same_latent `−0.0321` vs `−0.0280`；history_only `−0.0060` vs `−0.0039`），
+   512 子集略悲观但排序一致。
+5. **延迟有未解释的结构性差异**：`same_latent` 比同长度随机慢 `+25…+32 ms`
+   （CI 不含 0），而 `union_history` 比同长度随机快 `−7…−10 ms`。两者 hidden 长度相同，
+   说明**延迟不只由隐藏序列长度决定**，可能与 kept 索引的分布/分配器状态有关；
+   引用时只能写“同批实测 + CI”，不要归因机制。
+6. **零分尾部**：控制臂 30–40，联合臂 18–27（基线 15）——联合臂的零分尾部反而比
+   同等预算随机更小，与 selection 有信号一致，但仍高于 NoPress。
+
+**下一步（本轮结束）**：future hard prune 与联合 press 两条线都已在 1024 场景上关闭；
+联合最佳可部署点仍是已部署的 history-only press。若要继续，方向是
+structured attention / training-time bottleneck / merge / quantization，而**不是**
+继续搜索 token 子集。产物：`/tmp/joint_control_analysis.py`（分析脚本，未入库）
+与上述 `outputs/` 目录。
