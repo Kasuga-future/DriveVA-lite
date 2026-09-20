@@ -931,6 +931,7 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
         selector_counterfactual_abstain_eps: float = 0.0,
         selector_counterfactual_noise_seed: int = 1234,
         selector_counterfactual_latent_index: str = "0",
+        selector_candidate_latents: str = "",
         selector_counterfactual_jsonl_dir: Optional[str] = None,
         selector_teacher_disp_scale: float = 0.01,
         selector_teacher_disp_normalize: str = "scene",
@@ -1038,6 +1039,39 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
                 "selector counterfactual latent indices must be non-negative "
                 "(they count back from the newest history latent)"
             )
+        # Candidate latent range for the online-selector teacher, in *storage*
+        # coordinates: history latents are 0..num_cond_latents-1 and future
+        # latents follow them.  ``""`` keeps the historical single-history-latent
+        # behaviour driven by ``selector_counterfactual_latent_index``; ``"2,3"``
+        # trains a future selector and ``"0,1,2,3"`` trains a joint
+        # history+future selector over all video candidates (2026-09-21, F3).
+        # The range must be contiguous ascending because the teacher splices the
+        # candidates into the DiT sequence as one block.
+        self.selector_candidate_latents: tuple[int, ...] = tuple(
+            int(value.strip())
+            for value in str(selector_candidate_latents).split(",")
+            if value.strip()
+        )
+        if self.selector_candidate_latents:
+            if any(
+                value < 0 for value in self.selector_candidate_latents
+            ):
+                raise ValueError(
+                    "selector candidate latents must be non-negative storage "
+                    "indices"
+                )
+            expected = tuple(
+                range(
+                    self.selector_candidate_latents[0],
+                    self.selector_candidate_latents[0]
+                    + len(self.selector_candidate_latents),
+                )
+            )
+            if self.selector_candidate_latents != expected:
+                raise ValueError(
+                    "selector candidate latents must be a contiguous ascending "
+                    f"range, got {self.selector_candidate_latents}"
+                )
         self.selector_counterfactual_jsonl_dir = (
             None
             if selector_counterfactual_jsonl_dir in (None, "")
@@ -1503,6 +1537,16 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
             inputs["capture_planning_graph"] = not counterfactual_step
             inputs["capture_training_replay"] = counterfactual_step
             inputs["selector_layer"] = self.selector_layer
+            if self.selector_candidate_latents:
+                # Train over an explicit storage-coordinate latent range
+                # (future-only or joint history+future) instead of the legacy
+                # single newest history latent.
+                inputs["candidate_latent_start"] = int(
+                    self.selector_candidate_latents[0]
+                )
+                inputs["candidate_latent_end"] = int(
+                    self.selector_candidate_latents[-1] + 1
+                )
         if counterfactual_step:
             # The main (baseline) forward captures the token grid of the first
             # requested history latent; every probe below then re-points the
@@ -2483,6 +2527,17 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--selector-candidate-latents",
+        type=str,
+        default=str(_env_first("SELECTOR_CANDIDATE_LATENTS", default="")),
+        help=(
+            "storage-coordinate latent range the online-selector teacher "
+            "captures, e.g. '2,3' for the two future latents (F3 future "
+            "selector) or '0,1,2,3' for joint history+future candidates; "
+            "empty keeps the historical single newest-history-latent behaviour"
+        ),
+    )
+    parser.add_argument(
         "--selector-counterfactual-jsonl-dir",
         type=str,
         default=_env_first("SELECTOR_COUNTERFACTUAL_JSONL_DIR", default=""),
@@ -2574,6 +2629,32 @@ def main(argv: Optional[list[str]] = None) -> int:
             raise ValueError(
                 "--selector-counterfactual-latent-index must be a non-negative "
                 f"integer or comma-separated list of them, got '{token}'"
+            )
+    candidate_latent_tokens = [
+        value.strip()
+        for value in str(args.selector_candidate_latents).split(",")
+        if value.strip()
+    ]
+    for token in candidate_latent_tokens:
+        if not token.lstrip("+-").isdigit() or int(token) < 0:
+            raise ValueError(
+                "--selector-candidate-latents must be a comma-separated list of "
+                f"non-negative storage indices, got '{token}'"
+            )
+    if candidate_latent_tokens:
+        candidate_latents = [int(token) for token in candidate_latent_tokens]
+        if candidate_latents != list(
+            range(candidate_latents[0], candidate_latents[0] + len(candidate_latents))
+        ):
+            raise ValueError(
+                "--selector-candidate-latents must be a contiguous ascending "
+                f"range, got {candidate_latents}"
+            )
+        if args.selector_teacher_mode in {"signed_hybrid", "displacement", "planning_harm"}:
+            raise ValueError(
+                "--selector-candidate-latents is only supported with the "
+                "gradient_abs teacher; the counterfactual tile teacher still "
+                "assumes a single conditioned history latent"
             )
     if args.enable_online_selector and args.selector_mask_start_step >= 0 and args.selector_mask_start_step <= args.selector_warmup_steps:
         raise ValueError("--selector-mask-start-step must be greater than --selector-warmup-steps")
@@ -2722,6 +2803,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         selector_counterfactual_abstain_eps=args.selector_counterfactual_abstain_eps,
         selector_counterfactual_noise_seed=args.selector_counterfactual_noise_seed,
         selector_counterfactual_latent_index=args.selector_counterfactual_latent_index,
+        selector_candidate_latents=args.selector_candidate_latents,
         selector_counterfactual_jsonl_dir=args.selector_counterfactual_jsonl_dir,
         selector_teacher_disp_scale=args.selector_teacher_disp_scale,
         selector_teacher_disp_normalize=args.selector_teacher_disp_normalize,

@@ -1627,6 +1627,8 @@ def model_fn_wan_video(
     counterfactual_layer: Optional[int] = None,
     counterfactual_physical_prune: bool = False,
     counterfactual_latent_index: int = 0,
+    candidate_latent_start: int = -1,
+    candidate_latent_end: int = -1,
     capture_history_tokens: bool = False,
     selector_layer: int = 15,
     **kwargs,
@@ -1766,6 +1768,58 @@ def model_fn_wan_video(
     f, h, w = x.shape[2:]
     x = rearrange(x, 'b c f h w -> b (f h w) c').contiguous()
     num_cond_tokens = int(num_cond_latents * h * w) if num_cond_latents > 0 else 0
+    # Explicit candidate latent range for the online-selector teacher, in
+    # storage coordinates (history = 0..num_cond_latents-1, then future
+    # latents).  ``-1`` keeps the historical behaviour where the range comes
+    # from ``counterfactual_latent_index`` (a single history latent counted
+    # back from the newest one).  This is what makes a future-only ("2,3") or
+    # joint history+future ("0,1,2,3") selector trainable (2026-09-21, F3).
+    explicit_candidate_range = None
+    if int(candidate_latent_start) >= 0 or int(candidate_latent_end) >= 0:
+        range_start = int(candidate_latent_start)
+        range_end = int(candidate_latent_end)
+        if not 0 <= range_start < range_end <= int(f):
+            raise ValueError(
+                "candidate_latent_start/candidate_latent_end must describe a "
+                f"non-empty storage range inside [0, {int(f)}), got "
+                f"[{range_start}, {range_end})"
+            )
+        explicit_candidate_range = (range_start, range_end)
+    # Legacy selector-teacher coordinate: which conditioned history latent the
+    # counterfactual intervention and the history-token capture apply to,
+    # counted back from the newest history latent (0 == newest).  Resolved here
+    # so both the token-range helper and the block loop below agree on it.
+    cf_latent_index = int(counterfactual_latent_index)
+    if num_cond_latents > 0 and not (
+        0 <= cf_latent_index <= num_cond_latents - 1
+    ):
+        raise ValueError(
+            "counterfactual_latent_index "
+            f"{cf_latent_index} is out of range for "
+            f"{num_cond_latents} conditioned history latents"
+        )
+
+    def resolve_candidate_range() -> tuple[int, int]:
+        """Token range of the selector candidates inside the video block."""
+        if explicit_candidate_range is not None:
+            return (
+                explicit_candidate_range[0] * h * w,
+                explicit_candidate_range[1] * h * w,
+            )
+        if num_cond_latents <= 0:
+            raise RuntimeError(
+                "selector teacher requires conditioned history latents"
+            )
+        return (
+            (num_cond_latents - 1 - cf_latent_index) * h * w,
+            (num_cond_latents - cf_latent_index) * h * w,
+        )
+
+    if explicit_candidate_range is not None and history_token_mask is not None:
+        raise ValueError(
+            "history_token_mask only covers the conditioned history block; it "
+            "cannot be combined with an explicit candidate latent range"
+        )
     if num_cond_tokens > 0 and history_token_mask is not None:
         mask = history_token_mask[:, :num_cond_tokens].to(device=x.device, dtype=x.dtype).unsqueeze(-1)
         x[:, :num_cond_tokens] = x[:, :num_cond_tokens] * mask
@@ -1921,23 +1975,8 @@ def model_fn_wan_video(
         # Each latent frame contributes h * w video patch tokens.
         counterfactual_keep = None
         counterfactual_original_length = None
-        # Which conditioned history latent the counterfactual intervention (and
-        # the history-token capture) applies to, counted back from the newest
-        # history latent: 0 == newest (the historical default), 1 == the one
-        # before it, ...  The spatial patch grid is shared by every latent, so
-        # the tile membership computed outside this function is valid for all of
-        # them; only the token *range* changes (route-temporal-key-set probe,
-        # 2026-09-11).
-        cf_latent_index = int(counterfactual_latent_index)
-        if num_cond_latents > 0 and not (
-            0 <= cf_latent_index <= num_cond_latents - 1
-        ):
-            raise ValueError(
-                "counterfactual_latent_index "
-                f"{cf_latent_index} is out of range for "
-                f"{num_cond_latents} conditioned history latents"
-            )
-
+        # ``cf_latent_index`` and the explicit candidate range were resolved
+        # right after patchify; see ``resolve_candidate_range``.
         def apply_counterfactual_mask(x, freqs, t_mod):
             """Apply one history-token intervention and retain restore indices.
 
@@ -1946,14 +1985,11 @@ def model_fn_wan_video(
             layers preserve the historical post-block intervention semantics.
             """
             nonlocal counterfactual_keep, counterfactual_original_length
-            if num_cond_latents <= 0:
+            if num_cond_latents <= 0 and explicit_candidate_range is None:
                 raise RuntimeError(
                     "counterfactual mask requires conditioned history latents"
                 )
-            candidate_start = int(
-                (num_cond_latents - 1 - cf_latent_index) * h * w
-            )
-            candidate_end = int((num_cond_latents - cf_latent_index) * h * w)
+            candidate_start, candidate_end = resolve_candidate_range()
             mask = counterfactual_history_token_mask.to(
                 device=x.device, dtype=x.dtype
             )
@@ -2030,24 +2066,34 @@ def model_fn_wan_video(
                 # over the requested history latent; the default (index 0) is
                 # the most recent history latent, which is the deployment
                 # candidate domain (390 tokens at 480x832).
-                candidate_start = int(
-                    (num_cond_latents - 1 - cf_latent_index) * h * w
-                )
-                candidate_end = int((num_cond_latents - cf_latent_index) * h * w)
+                candidate_start, candidate_end = resolve_candidate_range()
                 history_tokens = x[:, candidate_start:candidate_end].detach().requires_grad_(True)
                 x = torch.cat(
                     [x[:, :candidate_start], history_tokens, x[:, candidate_end:]],
                     dim=1,
                 )
                 pipe._last_history_tokens = history_tokens
-                r_idx = torch.arange(h, device=x.device).repeat_interleave(w)
-                c_idx = torch.arange(w, device=x.device).repeat(h)
-                # Temporal coordinate = index of this latent inside the latent
-                # sequence.  For the default newest latent with two conditioned
-                # latents this is exactly the previous constant 1.0.
-                t_idx = torch.full_like(
-                    r_idx, int(num_cond_latents - 1 - cf_latent_index)
+                # ``t_idx`` tiles the storage index over each captured latent's
+                # patch grid; r/c repeat the shared spatial grid once per
+                # latent.  A single-latent candidate range reproduces the
+                # previous constant-t behaviour exactly.
+                num_cand_latents = (candidate_end - candidate_start) // (h * w)
+                r_idx = torch.arange(h, device=x.device).repeat_interleave(w).repeat(
+                    num_cand_latents
                 )
+                c_idx = torch.arange(w, device=x.device).repeat(h).repeat(
+                    num_cand_latents
+                )
+                # Temporal coordinate = index of this latent inside the latent
+                # sequence, i.e. its storage index.  For the default newest
+                # history latent with two conditioned latents this is exactly
+                # the previous constant 1.0; a multi-latent candidate range
+                # (future-only or joint history+future) tiles the storage index
+                # over each latent's patch grid so the selector sees the same
+                # coordinate the deployment-time ``_positions()`` builds.
+                t_idx = torch.arange(
+                    num_cand_latents, device=x.device
+                ).repeat_interleave(h * w) + int(candidate_start // (h * w))
                 denom = torch.tensor(
                     [1, max(h - 1, 1), max(w - 1, 1)],
                     device=x.device,

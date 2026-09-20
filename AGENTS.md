@@ -1,9 +1,10 @@
 # AGENTS.md — DriveVA-lite Video Token Compression 交接文件
 
-> 最后更新：2026-09-20 23:50 CST
-> 当前分支：`main`，当前 HEAD：`d6a423d`（已与 `origin/main` 同步）
-> 当前工作区：**clean**，唯一 untracked 是排除项
-> `videopress_framework/scripts/pre_dit_gpu_smoke.py`（见 §6）
+> 最后更新：2026-09-21 00:15 CST
+> 当前分支：`main`，当前 HEAD：`91740d0`（已与 `origin/main` 同步）
+> 当前工作区：F3/联合训练侧代码 + 新单测（未 commit，见 §6）
+> **当前主任务：F3（训练 future selector）与 history+future 联合 selector 训练中**
+> （用户 2026-09-21 明确要求启动，覆盖了此前"F3 取消"的门控结论）。见 §12。
 > 当前主任务：Future token compression 现状：
 > 1. future 直接 select：Phase F0 已打通；噪声上选 future 与随机接近，hard prune 明显掉 PDM。
 > 2. **history-guided future select**：已实现 `HistoryGuidedFutureSelector`、
@@ -715,27 +716,38 @@ oracle 上界都不如随机，没有可蒸馏的信号。
 | history-guided future mask transfer | 已实现 | `history_guided_future` selector、`all_video_history_only` scorer、`future_keep_ratio` cap、runner CLI；1024/512 POC + frontier sweep 未找到 near-lossless 乘 2 工作点 |
 | future domain 官方 runner | **已开放** | `--domain future_video/future_latent_0/future_latent_1` 可用 |
 | future latent 单独 domain/budget | **已实现** | `future_latent_i`、`each_future` reference 已加入并有测试 |
-| future online selector 训练 | **未实现** | `capture_history_tokens` / `history_token_mask` / `counterfactual_latent_index` 仍只覆盖 history |
+| future / 联合 online selector 训练 | **已实现（2026-09-21）** | `--selector-candidate-latents` 支持 storage 坐标连续区间：`"2,3"`=future（780）、`"0,1,2,3"`=history+future 联合（1560）；仅 `gradient_abs` teacher；训练 temporal 坐标 = storage index，与部署 `_positions()` 一致。`history_token_mask`（sparse step）仍只覆盖 history，与 candidate range 同时使用会显式报错 |
 | future oracle/上界分析 | random-mask / tile / token-level set-level 三种 oracle 均已完成，**全部否定** | 1024 场景 keep0.5：随机 band `−0.0483`，搜索 mask 不优于随机（13 分位 / 输给全部臂）；tile `combined keep0.5` `−0.0182`；下一步只测 keep-ratio frontier |
 | **token-level set-level future oracle** | **已实现并跑完（代码 + 39 单测）；1024 场景验证为否定结果** | `oracle_future_token_mask` selector、`--future-oracle-token-mask-json(s)`、`videopress/oracle/`（token 分组 + set-level greedy/beam/random）、`scripts/search_future_token_set_oracle.py` |
 | future physical smoke | 已跑通 official single scene + 64-scene POC | `outputs/future_token_smoke_20260918/`、`outputs/future_poc64_report_20260917.md` |
 
 ---
 
-## 6. 当前工作区未提交状态（2026-09-20 23:50 更新）
+## 6. 当前工作区未提交状态（2026-09-21 00:20 更新）
 
-`git status`：`main @ d6a423d`，**与 `origin/main` 同步，工作区 clean**；唯一 untracked 是
-排除项 `videopress_framework/scripts/pre_dit_gpu_smoke.py`（按 §9.6 不进 git）。
-token-level oracle 的全部代码、测试、文档与联合 frontier 结果**已提交并推送**。
+`git status`：`main @ 91740d0`；**本轮新增 F3/联合训练侧代码 + 8 个单测 + AGENTS.md**
+（见 §6.3）。`outputs/f3_joint_selector_train_20260921/` 与
+`outputs/f3_joint_selector_eval_1024_20260921/`（driver、分析脚本、训练产物、checkpoint）
+按 §9.6 **不进 git**。
 
-### 6.1 已提交内容（本阶段）
+### 6.1 已提交内容（此前阶段）
 
 | commit | 内容 |
 |---|---|
 | `87376e8` | token-level set-level oracle 代码（`videopress/oracle/`、selector、runner CLI、搜索驱动）+ 39 单测 |
 | `9549593` | README / AGENTS.md 文档同步 |
 | `a82a849` | 收尾检查 + 结论报告索引 |
-| `d6a423d` | runner 新增 `--domain all_video`（联合 matched-K 对照必需）+ 单测 + 联合结果与 2-GPU 资源规则 |
+| `d6a423d` | runner 新增 `--domain all_video`（联合 matched-K 对照必需）+ 单测 |
+| `91740d0` | 联合 matched-K 随机对照结论 + idle-GPU 资源规则 |
+
+### 6.3 本轮（F3 训练解禁）
+
+```text
+M diffsynth/pipelines/wan_video_new.py          # candidate_latent_start/end + resolve_candidate_range
+M examples/wanvideo/driveva_train/train_navsim_v1.py  # --selector-candidate-latents
+A videopress_framework/tests/test_selector_candidate_latents.py  # 8 测试
+M AGENTS.md
+```
 
 ### 6.2 未提交 / 排除项
 
@@ -1708,3 +1720,69 @@ ratio 0.6340 → `n_kept=989`/`hidden=998`（正好等于 `same_latent`）。
 structured attention / training-time bottleneck / merge / quantization，而**不是**
 继续搜索 token 子集。产物：`/tmp/joint_control_analysis.py`（分析脚本，未入库）
 与上述 `outputs/` 目录。
+
+---
+
+### 2026-09-21 — F3 训练解禁 + 训练侧 candidate latent range（代码完成，实验进行中）
+
+**用户指令**：2026-09-21「请开始 f3 训练与测试，并另尝试 history 与 future 联合压缩」。
+用户明确要求执行 F3，**覆盖此前 §4 的「F3 取消」门控结论**——该门控（oracle 必须显著优于
+matched random 且高保留率近无损）依据的是 oracle 上界不足，不是"训练不可能有用"。
+本轮把 F3 当作用户指定的实验执行，**并在结论中保留“门控未通过”这一事实**。
+
+**代码改动（本轮，训练侧首次支持 future / 联合候选域）**
+
+此前训练侧只能捕获「最新一个 history latent」（390 token），这是 §8 Phase F3 的关键 gap。
+新增**storage 坐标的连续 latent 区间**机制：
+
+| 取值 | 候选 | N | 用途 |
+|---|---|---|---|
+| `""`（默认） | 最新 history latent | 390 | 原行为，逐位复现 |
+| `"2,3"` | 两个 future latent | 780 | **F3 future selector** |
+| `"0,1,2,3"` | 全部 4 个 video latent | 1560 | **history+future 联合 selector** |
+
+- `diffsynth/pipelines/wan_video_new.py`：`model_fn_wan_video` 新增
+  `candidate_latent_start/end`；新增共享闭包 `resolve_candidate_range()`，capture 与
+  counterfactual mask 共用同一区间；`cf_latent_index` 的定义/校验上提到 patchify 之后
+  （原先在 `tea_cache_update` 的 `else` 块内，闭包看不到）。
+- `examples/wanvideo/driveva_train/train_navsim_v1.py`：`--selector-candidate-latents`
+  （env `SELECTOR_CANDIDATE_LATENTS`），连续性 / 非负校验，且**只允许 `gradient_abs`
+  teacher**（counterfactual tile teacher 仍假设单 history latent）。
+- `videopress_framework/tests/test_selector_candidate_latents.py`（新增 8 测试）。
+
+**关键契约（已用测试钉死）**：训练时 temporal 坐标 = **storage index**，与部署端
+`LearnedPlanningSelectorScorer._positions` 一致（future→`t=2,3`，joint→`t=0,1,2,3`）。
+否则训练出的 checkpoint 会在评测时被静默 OOD。测试断言「同一 latent 的所有 token
+共享同一 t」以及「legacy history 仍为 `t∈{0,1}`」。
+
+**冒烟（3 种模式，全 rc=0）**：
+
+| 模式 | 捕获张量 | position_range |
+|---|---|---|
+| `smoke_history`（回归） | `(1, 390, 3072)` | `(0.000, 1.000)` ← 与原行为一致 |
+| `smoke_future` | `(1, 780, 3072)` | `(0.000, 3.000)` |
+| `smoke_joint` | `(1, 1560, 3072)` | `(0.000, 3.000)` |
+
+冒烟抓到并修掉一个真 bug：`r_idx/c_idx` 只按单 latent 构造、`t_idx` 已跨 latent，
+导致 `torch.stack` 尺寸不匹配。
+
+**全量训练（`outputs/f3_joint_selector_train_20260921/run_selector_train.sh`）**：
+配方与已部署 history selector 逐字一致（`selector_only`、lr 3e-4、1 epoch、3190 windows、
+layer 15、`gradient_abs` teacher、keep 0.375），**唯一差异是候选区间**。GPU 0+3（仅空闲卡），
+1.10–1.23 it/s，`selector_bce` 从 0.694 降到 0.343（在学）。future 臂先跑，随后 joint 臂。
+
+**全量测试**：`252 passed`（244 → +8），含 legacy history 路径回归。
+
+**评测方案（`outputs/f3_joint_selector_eval_1024_20260921/`）**：每个 keep ratio **刻意对准
+已测过的 matched-K 随机带的 K**，因此"训练 selector vs 同预算随机"无需新随机臂：
+
+- F3：0.875→K=682、0.75→K=585、0.50→K=390、0.346→K=270
+- 联合：0.7365→K=1149（= `random_k1149` / `union_history`）、0.6340→K=989
+  （= `random_k989` / `same_latent`）、外加 0.50→K=780 延伸前沿
+
+分析脚本 `analyze_f3_joint.py` 已用现有数据试跑通过：公共面板 **512 场景、NoPress
+`0.911362`**，与联合对照面板一致。
+
+**下一步**：训练完成后跑 7 个评测臂 + 配对 bootstrap（vs NoPress / vs matched-K 随机带 /
+vs `union_history` / vs `same_latent` / vs `history_only`），把结论写入 §4/§5 并提交。
+**结果尚未产生，本条不含任何 PDM 结论。**
