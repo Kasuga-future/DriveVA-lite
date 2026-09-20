@@ -668,6 +668,14 @@ keep-ratio frontier（matched-budget **随机**控制，NoPress `0.911205`）：
 6. 未测但已知：所有结论只覆盖 trajectory PDM；`hidden_sequence` 在 Head 前把 dropped token
    置零，future video decode 质量必然受损，不能用 PDM 近似代表。
 
+**收尾检查（keep 0.875 上的可部署 scorer，22:25→22:30，1024 场景）**：
+`action_attention_vnorm` top-k → ΔPDM **`−0.0133`** CI `[−0.0211,−0.0058]`，
+只胜过 33% 的随机臂，paired vs best random `−0.0065` `[−0.0155,+0.0024]`，
+zero `44/30`。近无损门槛（CI 下界 > `−0.002`）**未通过**，
+在唯一近中性档位（−6.2% 序列长度）上**可部署 scorer 仍不如随机**。
+→ 最后一个漏洞关闭。产物：`outputs/future_keep0875_avnorm_1024_20260920/`。
+结论报告：`outputs/future_token_level_oracle_conclusion_20260920.md`。
+
 **下一步选项（推荐 #1）**：
 1. 关闭这条线，写 F1/F4 结论报告；能力侧转 structured attention / training-time
    bottleneck / merge / quantization；
@@ -1610,3 +1618,20 @@ MPLCONFIGDIR=/tmp/driveva_mpl \
   取消 F3**；保留 history press；能力侧转 structured attention / training-time bottleneck。
 - 未解决项：只测了 trajectory PDM；video decode 质量必然因 hidden_sequence 置零而受损；
   keep 0.875 上的可部署 scorer 未测（可选 5 min 补测）。
+
+### 2026-09-20 — 收尾：future hard prune 关闭，仓库上传，转入 history+future 联合搜索
+
+- **收尾检查**（keep 0.875，1024 场景）：可部署 `action_attention_vnorm` ΔPDM `−0.0133`
+  CI `[−0.0211,−0.0058]`，只胜过 33% 随机臂，paired vs best random `−0.0065`
+  `[−0.0155,+0.0024]`，zero 44/30 → **唯一近中性档位也不可用**；
+- 结论报告：`outputs/future_token_level_oracle_conclusion_20260920.md`
+  （含全部结果、被推翻/更正的旧结论、可复用方法学、原始输出索引）；
+- **仓库上传**：commit `87376e8`（token-level oracle 代码 + 39 单测）与
+  `9549593`（文档/交接）已 push 到 `origin/main`
+  (`https://github.com/Kasuga-future/DriveVA-lite.git`)，author/committer 均为
+  `Kasuga-future <kasuga.chen@sjtu.edu.cn>`（按 §9.6 约定）；
+  `outputs/` 产物与 `scripts/pre_dit_gpu_smoke.py`（smoke/临时脚本）按 hygiene 未入库；
+- **下一步（已启动）**：history+future 联合最佳点搜索
+  `outputs/joint_history_future_1024_20260920/run_joint.sh`（1024 场景，
+  以部署的 history-only press 为参照，测 `union_history` / `same_latent` 及 future cap
+  0.875/0.75 的联合 PDM / 延迟 / K / 零分尾部；tmux `joint_search`，约 40 min）。
