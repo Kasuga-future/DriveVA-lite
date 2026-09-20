@@ -562,7 +562,107 @@ history mask one-to-one (`future latent 0 <- history latent 0`), which doubles
 physical deletion when history and future have equal candidate counts.
 `union_history` keeps a future position when either history latent keeps it.
 
-Current 1024-scene POC conclusion: direct `same_latent` doubles compression but
-costs about 2.8 PDM points, and the safer `union_history` still costs about 1.2
-PDM points.  This is not yet a deployable near-lossless future Press.  See
-`outputs/history_guided_future_poc1024_report_20260917.md`.
+`--history-guided-future-keep-ratio <r>` adds an optional per-future-latent cap:
+positions inside the mapped history mask are ranked by transferred history score
+and only the top `round(r * tokens_per_latent)` are kept.  This is useful for
+frontier sweeps but is not required for plain mask copying.
+
+Current 512/1024-scene POC conclusions:
+
+- `same_latent` doubles compression but costs about 2.8 PDM points;
+- `union_history` is safer but still costs about 1.2 PDM points at the default
+  thresholds;
+- keep-ratio caps below the natural union mask make quality worse quickly;
+- the only nearly neutral guided point (`union_history [0.02,0.40]`) compresses
+  less than history-only best and is slower.
+
+This is not a deployable near-lossless future Press.  See
+`outputs/history_guided_future_poc1024_report_20260917.md` and
+`outputs/history_guided_future_frontier_512_report_20260917.md`.
+
+For oracle headroom experiments, `--persistent-random-seed` fixes the random
+future-mask seed.  A 64-scene best-of-N random-mask oracle found that at 50%
+future retention the oracle upper bound is statistically indistinguishable from
+NoPress, while 25-37.5% retention still loses quality.  See
+`outputs/oracle_future_subset_upper_bound_20260917.md`.  The oracle is optimistic
+by construction and is not a deployable selector.
+
+### Token-level set-level future oracle
+
+The 2026-09-18/20 tile oracle (12 normalized tiles per future latent, ~30 tokens
+each) was not near-lossless even at keep 0.50 (`dPDM -0.0182`), and the
+conclusion report attributed part of that to the tile granularity.  The
+token-level instrument replaces tiles with explicit token sets:
+
+- `videopress/oracle/token_set.py` -- token grouping (`token` / `linear` /
+  `block` / `random`), set-level (jointly scored) searches: best-of-N random,
+  greedy forward, greedy backward, beam, plus per-scene best-of-N aggregation;
+- `videopress/oracle/metrics.py` -- trajectory displacement / planning harm /
+  combined harm, so PDM and the trajectory objectives are always reported
+  together;
+- `videopress/selectors/future_oracle.py::OracleFutureTokenMaskSelector`
+  (`oracle_future_token_mask`) -- applies a token mask as a real physical
+  `hidden_sequence` prune;
+- `scripts/search_future_token_set_oracle.py` -- the GPU-facing driver.
+
+A token mask JSON maps scene token -> per-latent local token indices (a flat
+list of future offsets is also accepted; missing latents mean "keep nothing"):
+
+```json
+{
+  "scene-token": {
+    "future_latent_0": [0, 5, 17, 389],
+    "future_latent_1": [1, 2, 3]
+  }
+}
+```
+
+Evaluate one mask (or a whole candidate batch, one physical method per file, in
+a single runner invocation):
+
+```bash
+python scripts/run_official_navsim_press.py \
+  --future-oracle-token-mask-jsons outputs/cand_a.json,outputs/cand_b.json \
+  --future-counterfactual-layer 15 \
+  --dump-trajectories --dump-target-trajectories \
+  --max-eval-tokens 64 --poc-test-derived --skip-plots \
+  --output-root outputs/token_mask_eval
+```
+
+Search for a near-lossless token subset with the driver (it runs its own
+no-press baseline unless `--baseline-method-dir` is given):
+
+```bash
+# Per-scene best-of-N random token masks (N samples = N physical methods).
+python scripts/search_future_token_set_oracle.py \
+  --mode random-best-of-n --n-samples 16 --keep-ratio 0.5 \
+  --max-eval-tokens 64 --output-root outputs/token_oracle_random
+
+# Token-group leave-one-out importance, then top-K composition.
+python scripts/search_future_token_set_oracle.py \
+  --mode independent-topk --group-mode linear --group-size 8 \
+  --keep-ratio 0.5 --max-eval-tokens 64 --output-root outputs/token_oracle_topk
+
+# Set-level greedy forward / backward / beam search.
+python scripts/search_future_token_set_oracle.py \
+  --mode greedy-forward --group-mode linear --group-size 30 \
+  --keep-ratio 0.5 --max-eval-tokens 64 --output-root outputs/token_oracle_greedy
+```
+
+By default each candidate runner call passes `--persistent-skip-baseline`: the
+driver already holds a baseline (external `--baseline-method-dir` or its own
+first run), so re-evaluating `physical_no_press` in every candidate batch is
+pure overhead.  Pass `--keep-suite-baseline` when you want each suite to be
+self-contained instead.
+
+Each mode writes `oracle_search_report.json` plus a markdown table with PDM,
+PDM harm, trajectory displacement and planning harm per candidate, and records
+every runner command in `search/commands.jsonl`.  Adaptive modes also evaluate a
+budget-matched random control; `--objective` chooses which signal drives the
+search (`pdm`, `pdm_harm`, `traj_disp`, `planning_harm`, `combined`).
+
+The prepared 4-GPU queue is
+`outputs/future_token_set_oracle_queue_20260920/run_queue.sh` (random best-of-N,
+independent top-K, greedy forward, beam).  GPU work must stay queued: at most
+four GPUs, never preempt a running job.
+

@@ -1,20 +1,33 @@
 # AGENTS.md — DriveVA-lite Video Token Compression 交接文件
 
-> 最后更新：2026-09-17 21:05 CST
-> 当前分支：`main`，当前 HEAD：`c0625c9`（已按用户要求把当前进度提交为 2 个 commit）
-> 当前工作区：9 个 modified + 2 个 untracked（history-guided future 新代码，见 §6）
-> 当前主任务：Future token compression 已有两条路线：
-> 1. future 直接 select：Phase F0 已打通，64/1024-scene POC 显示噪声上选 future 与随机
->    接近且 hard prune 明显掉 PDM；
-> 2. **history-guided future select（用户 2026-09-17 提出的新主线）**：history selector
->    只在 history 上打分，保留位置复制到 future。已实现 `HistoryGuidedFutureSelector`、
->    `all_video_history_only` scorer 和 runner CLI，并完成 1024-scene POC。
->    结论：`same_latent` 直接同位置复制把压缩近似乘 2，但 ΔPDM `−0.0280`；
->    `union_history` 较稳但仍 ΔPDM `−0.0121`，**尚未 near-lossless**。
->    下一步是在此机制上找安全 frontier（调阈值/keep cap），不要立即训练 future selector。
-> **资源约束（用户 2026-09-17 明确要求）**：任何实验/agent 任务最多同时占用
-> **4 张 GPU**，超过 4 个进程必须排队。
-> **提交约束**：已实现代码暂不自动 commit；用户要求阶段性成果后再 commit。
+> 最后更新：2026-09-20 13:05 CST
+> 当前分支：`main`，当前 HEAD：`717c7fb`（当前进度共 3 个 commit）
+> 当前工作区：8 个 modified + 5 个 untracked（含 token-level set-level oracle 新代码，
+> 尚未 commit，见 §6）
+> 当前主任务：Future token compression 现状：
+> 1. future 直接 select：Phase F0 已打通；噪声上选 future 与随机接近，hard prune 明显掉 PDM。
+> 2. **history-guided future select**：已实现 `HistoryGuidedFutureSelector`、
+>    `all_video_history_only` scorer、`future_keep_ratio` cap 和 runner CLI；
+>    做过 64 / 1024 / common-512 paired POC。
+>    结论：`same_latent` 压缩近似乘 2 但 ΔPDM `−0.0280`；`union_history [0.05,0.40]`
+>    仍 ΔPDM `−0.0121`；threshold/future-keep-ratio frontier sweep 后，唯一近无损点
+>    `[0.02,0.40]` 压缩更少且更慢，没有找到 near-lossless 的乘 2 工作点。
+> 3. **oracle future subset 上界（已完成）**：random-mask 上界 + multi-seed
+>    trajectory/PDM tile oracle 均已完成，**tile oracle 失败**（512 面板 keep0.5
+>    ΔPDM `−0.0424`；4-seed `combined keep0.5` ΔPDM `−0.0182`）。结论指向 **tile
+>    粒度本身**：tile 子集空间可能不包含 near-lossless token 子集。
+> 4. **token-level set-level oracle（本次实现：代码 + 单测完成，实验未跑）**：
+>    - `videopress/oracle/`：token 分组（token/linear/block/random）+ set-level
+>      联合打分搜索（best-of-N random / greedy forward / greedy backward / beam）
+>      + per-scene best-of-N 聚合 + trajectory displacement / planning harm；
+>    - `oracle_future_token_mask` selector（显式 token 索引 mask，物理 kv_prune）；
+>    - runner `--future-oracle-token-mask-json` / `--future-oracle-token-mask-jsons`
+>      （一个候选 mask 一个 method，整批候选一次 runner 调用）；
+>    - `scripts/search_future_token_set_oracle.py` 搜索驱动；
+>    - `outputs/future_token_set_oracle_queue_20260920/run_queue.sh` 4-GPU 队列脚本。
+>    **本次没有产生新的 PDM 结论**；§4 的结论仍是 tile oracle 的失败结论。
+> **资源约束（用户 2026-09-17 明确要求）**：通用最多同时占用 **4 张 GPU**；
+> **提交约束**：frontier sweep 新代码暂不自动 commit；用户要求阶段性成果后再 commit。
 >
 > **维护要求（强制）**：以后每个 agent 会话结束前，必须更新本文件：
 > 1. 更新顶部“最后更新 / HEAD / 工作区”；
@@ -155,8 +168,9 @@ DriveVA-lite/
 - 另一等价路径：`/mnt/nvme/chenpeijian/miniconda3/envs/DriveVA/bin/python`。
 - 分布式运行使用 `torch.distributed.run`；历史 full run 常用 6 卡（logical GPU 0–5），
   单卡 smoke 用 `CUDA_VISIBLE_DEVICES=0`。
-- **并发上限（2026-09-17 用户要求）**：最多同时占用 4 张 GPU，最多 4 个模型/训练/
-  评测进程；多余任务排队，启动前用 `nvidia-smi` 和 `ps` 检查。
+- **并发上限（2026-09-20 用户更新）**：当前允许最多同时占用 **4 张 GPU**。所有 GPU
+  任务必须通过 tmux 队列 `outputs/future_oracle_queue_v3_20260918/run_queue.sh` 排队执行，
+  启动前检查 `nvidia-smi` 与 `ps`，不允许直接抢占 GPU。
 - 绘图前设 `MPLCONFIGDIR=/tmp/driveva_mpl`，避免 matplotlib 写 home 失败。
 
 ### 3.2 模型与 checkpoint
@@ -499,6 +513,178 @@ Layer 15 + `hidden_sequence` + `kv_prune`，learned checkpoint 为当前 history
 
 ---
 
+### 2026-09-17 — history-guided future frontier sweep（common 512 scenes）
+
+在 `history_guided_future` 机制上做了 threshold / future keep-ratio sweep，并加入其他路线
+对比。所有行用同一组 512 paired scenes（NoPress PDM `0.911362`；POC，非 full 7,876）。
+
+| 路线 | ΔPDM | 95% CI | hidden length | latency ms | 说明 |
+|---|---:|---:|---:|---:|---|
+| `union_history` `[0.02,0.40]` | −0.0004 | [−0.0074,+0.0064] | 1330.8 | 578.3 | 近无损但比 history-only 更慢、压缩更少 |
+| `union_history` `[0.03,0.40]` | −0.0105 | [−0.0219,−0.0001] | 1296.2 | 568.9 | 同长度下不如 history-only |
+| `union_history` `[0.04,0.40]` | −0.0093 | [−0.0203,+0.0006] | 1249.2 | 564.5 | 有加速但 CI 上界贴 0 |
+| `union_history` `[0.05,0.40]` | −0.0158 | [−0.0281,−0.0050] | 1198.1 | 557.0 | 当前 guided 基准 |
+| `union_history` cap 0.85 | −0.0162 | [−0.0295,−0.0042] | 1165.2 | 555.1 | cap 开始明显掉点 |
+| `union_history` cap 0.80 | −0.0201 | [−0.0344,−0.0069] | 1135.7 | 552.8 | 更差 |
+| `same_latent` | −0.0321 | [−0.0486,−0.0164] | 1038.5 | 538.1 | 压缩乘 2 假设失败 |
+| history-only best | −0.0060 | [−0.0130,−0.0004] | 1292.2 | 569.7* | *full-run latency，matched PDM |
+| future direct `action_attention_vnorm` topk0.75 | −0.0276 | [−0.0455,−0.0113] | 1374.0 | 572.4 | 直接 future selector 更差 |
+| future direct `action_attention_vnorm` adaptive | −0.0094 | [−0.0208,+0.0013] | 1507.3 | 591.4 | 几乎不压缩且更慢 |
+
+结论：
+
+- future keep-ratio cap 越小越差；
+- 唯一近无损的 guided 点 `[0.02,0.40]` 压缩比 history-only best 少且更慢；
+- 在相近 physical length 下，guided future 仍比 history-only best 多掉约 0.5 PDM 点；
+- 因此当前 mask-copy history-guided future **没有找到 near-lossless 的乘 2 工作点**。
+
+产物：`outputs/history_guided_future_frontier_512_report_20260917.md`。
+
+---
+
+### 2026-09-17 — Future subset oracle 上界初测
+
+方法：官方 runner `future_video` + Layer15 hidden_sequence + random masks；每个 scene
+从 N 个随机 mask 的 official PDM 里取 max，作为“随机子集 oracle 上界”。POC 64 scenes，
+NoPress PDM `0.940644`；该 oracle 有明显选择偏差，只能用于判断 headroom。
+
+| future keep | K/780 | N | single-seed ΔPDM | random-oracle ΔPDM | oracle 95% CI | oracle PDM |
+|---|---:|---:|---:|---:|---:|---:|
+| 0.500 | 390 | 16 | −0.0671 | **+0.0026** | [−0.0038,+0.0084] | 0.9432 |
+| 0.375 | 292 | 16 | −0.1092 | −0.0209 | [−0.0300,−0.0124] | 0.9197 |
+| 0.250 | 195 | 8 | −0.1608 | −0.0709 | [−0.0983,−0.0485] | 0.8697 |
+
+结论：
+
+- 50% future keep 的 oracle 上界与 NoPress 不可区分，说明该预算下存在大量 planning
+  冗余子集，这是目前最强的 positive signal；
+- 37.5% oracle 仍掉 0.0209，但比 single-seed random 好很多，不能排除更强 teacher
+  能找到更好子集；
+- 25% oracle 明显掉点，冗余不是无限；
+- 随机 seed 不是部署方法，下一步必须做 counterfactual tile / planning-gradient oracle。
+
+产物：`outputs/oracle_future_subset_upper_bound_20260917.md`、
+`outputs/oracle_random_k50_seed1001..1016_20260918/` 等。
+
+---
+
+### 2026-09-18 — future counterfactual tile oracle 完成：失败结论
+
+tmux 队列 `driveva_oracle` 已完成 matrix128 + matrix512 及三档 oracle eval（每阶段最多 2 GPU）。
+结果如下：
+
+| Panel | keep | ΔPDM vs NoPress | 95% CI |
+|---|---:|---:|---:|
+| 128 scenes | 0.500 | −0.0610 | [−0.1099,−0.0170] |
+| 128 scenes | 0.375 | −0.1080 | [−0.1583,−0.0631] |
+| 128 scenes | 0.250 | −0.1082 | [−0.1529,−0.0681] |
+| 512 scenes | 0.500 | −0.0424 | [−0.0637,−0.0220] |
+| 512 scenes | 0.375 | −0.0891 | [−0.1129,−0.0665] |
+| 512 scenes | 0.250 | −0.1129 | [−0.1385,−0.0882] |
+
+matrix512 的 tile-level 统计：mean harm 约 `[-0.004,+0.009]`，SE 约 `0.003–0.006`，
+`harm>0` 比例 `0.23–0.45`。说明单次 PDM leave-one-tile-out 信号接近噪声，
+per-scene tile ranking 不可靠。
+
+结论：
+
+- 当前 counterfactual tile oracle **不是有效 oracle**，在 keep0.5 的 512 面板上 ΔPDM
+  `−0.0424`，明显差于 history-guided union（约 `−0.012`）和 attention-vnorm adaptive
+  （约 `−0.009`）；
+- tile 重要性不满足可加性，单 tile PDM 差异无法外推到组合子集；
+- 该结果既不能证明 future 可压缩，也不能证明不可压缩，只证明此构造方法失败；
+- 下一步应使用 trajectory displacement / multi-replay、set-level greedy/beam oracle，
+  并补 matched random control。
+
+产物：`outputs/future_oracle_counterfactual_conclusion_20260918.md` 及
+`outputs/future_oracle_*_20260918/`。
+
+---
+
+### 2026-09-20 — token-level set-level oracle 全部完成：1024 场景判决性否定结果
+
+**最终验证面板**：`--max-eval-tokens 256` × 4 rank = **1024 个不同场景**（不是 4 个 seed × 256，
+实测四个 v3 "seed" 面板是**同一组 256 场景**）；Layer 15 + `hidden_sequence` + `kv_prune`，
+keep 0.50（K=390/780）。NoPress 基线 **0.911205**（与历史 1024-scene POC 基线一致，交叉校验通过）。
+运行 19:25:32 → 20:35:33，报告
+`outputs/future_token_set_oracle_verify_1024_20260920/run/oracle_search_report.{json,md}`。
+
+| arm | K | ΔPDM vs NoPress | 95% CI | 在随机 band 中的位置 | zero cand/base | extreme |
+|---|---:|---:|---|---|---:|---:|
+| 随机 band（15 个 mask） | 390 | min −0.0557 / mean **−0.0483** / max −0.0413（sd 0.0036） | — | — | — | — |
+| stage2 independent top-K 组合 | 390 | −0.0534 | [−0.0686,−0.0386] | 只胜过 **13%** 随机臂 | 80/30 | 71 |
+| stage3 greedy 搜索 mask | 270 | −0.0726 | [−0.0882,−0.0575] | 胜过 **0%** 随机臂（**预算不匹配**，待公平复核） | 81/30 | 73 |
+
+**结论（verified）**：
+
+1. **在 1024 场景上，future keep 50% 的随机 hard prune 就要掉 `−0.048`**，远不是近无损；
+   此前"50% 预算存在大量冗余"的乐观结论建立在 64 场景（best-of-16 oracle +0.0026）与
+   256 场景（random −0.0142）之上，**在更大面板上不成立**（`[已被新结果推翻]`）。
+2. **没有任何被搜索/构造出来的 mask 优于 matched random**：预算匹配的 independent top-K
+   组合只排在随机 band 的 13 分位（paired vs best random `−0.0121`，CI `[−0.0273,+0.0027]`）；
+   greedy 搜索出的 270-token mask 在 1024 场景上比所有 15 个随机臂都差
+   （paired vs best random `−0.0313`，CI `[−0.0471,−0.0158]`）。
+3. **小面板搜索会过拟合**：stage3 在 64 场景上选出 270 token 的 mask，面板内 +0.0189 且优于
+   best-of-16 随机（+0.0092）；到 1024 场景变成 −0.0726、输给全部随机臂。64 场景的
+   配对分辨率只有 ±0.025，搜索只是在拟合噪声。**不要用小面板搜索来选择可部署 pattern。**
+4. **zero-score 尾部恶化**：候选引入的新零分场景 71–81 个（基线仅 30 个），与 zero-tail 一致。
+5. **采样噪声标定**（v3 matrix：同一 24 个 mask × 4 个 `--sample-seed`，256 场景）：
+   绝对 NoPress panel 均值随种子 `0.880333/0.904601/0.911602/0.901051`（极差 **0.0313**）；
+   同一固定 mask 的**配对** ΔPDM 跨种子 sd 仅 **0.0067**。→ 绝对 PDM 不能跨采样种子比较；
+   配对 ΔPDM 才有效；功效主要靠增加**场景数**（不是种子数）。
+
+
+**后续补测完成（21:24→22:09，同一 1024 场景面板，`outputs/future_token_set_oracle_followup_20260920/`）**：
+
+keep-ratio frontier（matched-budget **随机**控制，NoPress `0.911205`）：
+
+| keep | K | ΔPDM（各臂 CI） | zero cand/base | per-scene best-of-N oracle |
+|---|---:|---|---:|---|
+| 0.346 | 270 | −0.0952…−0.1018，CI 上界均 ≤ −0.0767 | 65–77 / 30 | **−0.0324**（仍然很差） |
+| 0.500 | 390 | mean −0.0483（15 臂） | ~? | （256 场景上 +0.059，选择偏差） |
+| 0.750 | 585 | −0.0204…−0.0234，CI 上界 −0.0102…−0.0132 | 51–55 / 30 | +0.0079 |
+| 0.875 | 682 | −0.0068…−0.0149，CI 上界 −0.0002…−0.0077 | 37–45 / 30 | +0.0050 |
+
+**预算匹配复核（重要修正）**：stage3 greedy 搜索出的 **270-token** mask 与 **270-token**
+随机 band 对比：searched `−0.0726` CI `[−0.0882,−0.0575]`，随机 band `−0.1018…−0.0913`
+（mean `−0.0978`），**searched 胜过 100% 随机臂，paired `+0.0187` CI `[+0.0029,+0.0339]`
+（不跨 0）**。
+→ 之前"没有任何 mask 优于 matched random"的说法**是 K=270 vs K=390 预算不匹配造成的假象，予以更正**：
+**selection 在匹配预算下确实有信号（+0.019），但绝对水平只有 −0.073，救不回来。**
+
+**最终结论（本阶段）**：
+
+1. **问题答案是否定的**：不存在使 future hard prune 近无损的 token-level set-level oracle。
+   keep 0.5 上任何构造/搜索的 mask 都在 −0.05 量级；即使 keep 0.875（只丢 12.5% future
+   token ≈ 6.2% 序列长度）随机控制最好也只有 `−0.0068`，仍比 `−0.002` 的 near-lossless
+   门槛差 3 倍，且所有臂 CI 均不跨 0（显著变差）。
+2. **selection 信号真实但太弱**：K=270 时 searched 比随机好 `+0.019`（CI 不跨 0），
+   说明 future token 重要性不是纯噪声；但预算太小时绝对损失无法挽回。
+3. **零分尾部随压缩加深单调恶化**：30 → 37–45（keep .875）→ 51–55（.75）→ 65–77（.346）。
+4. **50% future keep 不存在"大量冗余"**：1024 场景随机控制 `−0.0483`，推翻 64/256 场景
+   小面板给出的乐观读数。
+5. **F3（训练 future selector）取消**；**future hard prune 停止**；保留已部署的 history press
+   （7,876：`0.911143`，延迟 −2.84%/−3.41%，CI 跨 0）。
+6. 未测但已知：所有结论只覆盖 trajectory PDM；`hidden_sequence` 在 Head 前把 dropped token
+   置零，future video decode 质量必然受损，不能用 PDM 近似代表。
+
+**下一步选项（推荐 #1）**：
+1. 关闭这条线，写 F1/F4 结论报告；能力侧转 structured attention / training-time
+   bottleneck / merge / quantization；
+2. 若仍想确认唯一近中性档位：keep 0.875 上跑一次**可部署** `action_attention_vnorm`
+   scorer（1 臂，1024 场景，约 5 min），看它能否超过随机 band（现随机最好 −0.0068）；
+3. 若目标是 history+future 联合 press：在 1024 场景上测联合工作点（约 15 min）。
+
+**下一步（已启动）**：`outputs/future_token_set_oracle_followup_20260920/run_followup.sh`
+（21:24 起，约 50 min）补两件事：
+1. **预算匹配复核**：270-token 随机 band（5 臂），公平判定 greedy mask；
+2. **keep-ratio frontier**：同一 1024 场景面板上随机控制在 keep 0.75 / 0.875 的水平，
+   回答"future token 到底能压多少"。
+
+若 keep 0.75 仍远非近无损 → **彻底放弃 future hard prune**，转 structured attention /
+training-time bottleneck / merge；并且 **F3（训练 future selector）直接取消**：
+oracle 上界都不如随机，没有可蒸馏的信号。
+
 ## 5. 当前框架能力矩阵
 
 | 能力 | 状态 | 说明 |
@@ -512,39 +698,48 @@ Layer 15 + `hidden_sequence` + `kv_prune`，learned checkpoint 为当前 history
 | Learned planning selector | 部署已支持 future；训练仍只支持 history | 部署 `_positions()` 支持 storage / history_compatible future 模式；训练 capture/mask/teacher 未扩展 |
 | history 双 latent threshold/quota | 已实现 | `history_threshold`、`history_quota` 只对 history |
 | future 双 latent threshold/quota | 已实现 | `future_threshold`、`future_quota`，顺序固定 near-to-far |
-| history-guided future mask transfer | 已实现 | `history_guided_future` selector、`all_video_history_only` scorer、runner CLI；1024-scene POC 尚未 near-lossless |
+| history-guided future mask transfer | 已实现 | `history_guided_future` selector、`all_video_history_only` scorer、`future_keep_ratio` cap、runner CLI；1024/512 POC + frontier sweep 未找到 near-lossless 乘 2 工作点 |
 | future domain 官方 runner | **已开放** | `--domain future_video/future_latent_0/future_latent_1` 可用 |
 | future latent 单独 domain/budget | **已实现** | `future_latent_i`、`each_future` reference 已加入并有测试 |
 | future online selector 训练 | **未实现** | `capture_history_tokens` / `history_token_mask` / `counterfactual_latent_index` 仍只覆盖 history |
-| future oracle/上界分析 | **未实现** | `counterfactual_latent_index` 只覆盖 history；这是 F3 训练前的 gate |
+| future oracle/上界分析 | random-mask / tile / token-level set-level 三种 oracle 均已完成，**全部否定** | 1024 场景 keep0.5：随机 band `−0.0483`，搜索 mask 不优于随机（13 分位 / 输给全部臂）；tile `combined keep0.5` `−0.0182`；下一步只测 keep-ratio frontier |
+| **token-level set-level future oracle** | **已实现并跑完（代码 + 39 单测）；1024 场景验证为否定结果** | `oracle_future_token_mask` selector、`--future-oracle-token-mask-json(s)`、`videopress/oracle/`（token 分组 + set-level greedy/beam/random）、`scripts/search_future_token_set_oracle.py` |
 | future physical smoke | 已跑通 official single scene + 64-scene POC | `outputs/future_token_smoke_20260918/`、`outputs/future_poc64_report_20260917.md` |
 
 ---
 
-## 6. 当前工作区未提交状态（2026-09-17）
+## 6. 当前工作区未提交状态（2026-09-20）
 
-`git status`：`main @ c0625c9`，9 个 modified + 2 个 untracked（不含已排除的 one-off `pre_dit_gpu_smoke.py` 外，它仍为 untracked 但不会提交）。用户要求后续不自动 commit。
+`git status`：`main @ 717c7fb`，8 个 modified + 5 个 untracked（glob 展开后 8 个
+untracked 文件）；`pre_dit_gpu_smoke.py` 为排除项。用户要求后续不自动 commit。
 
-### 6.1 Modified（history-guided future 新代码，尚未 commit）
+### 6.1 Modified（counterfactual / token-level oracle 代码、文档，尚未 commit）
 
 ```text
 M AGENTS.md
+M examples/wanvideo/driveva_infer/eval_navsim_pdm.py
 M videopress_framework/README.md
 M videopress_framework/scripts/run_official_navsim_press.py
 M videopress_framework/tests/test_framework_repairs.py
-M videopress_framework/tests/test_online_selector.py
 M videopress_framework/videopress/factory.py
-M videopress_framework/videopress/presses/scorer_press.py
-M videopress_framework/videopress/scorers/learned_selector.py
 M videopress_framework/videopress/selectors/__init__.py
+M videopress_framework/videopress/selectors/history_guided.py
 ```
 
-### 6.2 Untracked（不自动提交；`history_guided.py` 属核心源码）
+### 6.2 Untracked（核心 selector/脚本/测试 + 排除项）
 
 ```text
+?? videopress_framework/scripts/build_future_oracle_masks.py
+?? videopress_framework/scripts/build_future_oracle_masks_multiseed.py
 ?? videopress_framework/scripts/pre_dit_gpu_smoke.py
-?? videopress_framework/videopress/selectors/history_guided.py
+?? videopress_framework/scripts/search_future_token_set_oracle.py
+?? videopress_framework/tests/test_future_token_oracle.py
+?? videopress_framework/videopress/oracle/{__init__,token_set,metrics}.py
+?? videopress_framework/videopress/selectors/future_oracle.py
 ```
+
+`outputs/future_token_set_oracle_queue_20260920/run_queue.sh` 与 GPU smoke 产物放在
+`outputs/` 下，按 §9.6 不进 git。
 
 这些改动主要覆盖：
 
@@ -553,8 +748,11 @@ M videopress_framework/videopress/selectors/__init__.py
 - pre-DiT merge / learnable merge / register bottleneck；
 - online selector 的 `pre_dit` counterfactual injection、planning-harm 指标透传；
 - `2026-09-17` 的 learned history + `history_threshold` 最佳配置；
-- 本次 future 迁移：future latent domain / budget / threshold/quota selector、
-  runner future CLI、learned selector future positions、persistent random control。
+- future 迁移：future latent domain / budget / threshold/quota selector、
+  runner future CLI、learned selector future positions、persistent random control；
+- **2026-09-20 token-level set-level oracle**：`videopress/oracle/`、
+  `oracle_future_token_mask` selector、runner `--future-oracle-token-mask-jsons`、
+  搜索驱动与 35 个新单测。
 
 **注意**：当前工作区不是 clean state。新 agent 在切换任务/提交前先看清楚 diff，
 不要覆盖别人的未提交工作；运行测试至少覆盖本次修改。
@@ -730,6 +928,16 @@ CUDA_VISIBLE_DEVICES=0 /home/cpj/miniconda3/envs/DriveVA/bin/python \
 - 如果 oracle ≈ random 或删除少量 future token 就大幅掉 PDM → 不要硬删 future token，
   应转向 training-time bottleneck / structured attention / merge，或放弃 future token 压缩。
 
+F1 进展（2026-09-20）：
+
+- tile-level oracle 已做完并失败（§4 的 2026-09-18 / 2026-09-20 条目）；
+- **token-level set-level instrument 已实现**（代码 + 35 单测，见 §5/§6）：
+  `videopress/oracle/`、`oracle_future_token_mask`、runner
+  `--future-oracle-token-mask-jsons`、`scripts/search_future_token_set_oracle.py`；
+- 队列脚本 `outputs/future_token_set_oracle_queue_20260920/run_queue.sh` 已就绪但**尚未启动**；
+- 判定标准不变：只有 token-level oracle 明显优于 matched random 且高保留率近无损，
+  才进入 F3 训练 future selector；否则按结论报告停止 future hard prune。
+
 ### Phase F2 — 零样本复用 history select 参数（已完成 64-scene POC，结论：零样本不迁移）
 
 目标：回答“future 能不能直接用 history 的 select 参数”。
@@ -847,7 +1055,8 @@ cd /mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework
 /home/cpj/miniconda3/envs/DriveVA/bin/python -m pytest -q
 ```
 
-当前基线：`184 passed in 83.32s`（2026-09-17）。
+当前基线：`243 passed in 82.62s`（2026-09-20；其中
+`tests/test_future_token_oracle.py` 39 个为本次 token-level oracle 新增）。
 
 ### 9.2 synthetic 功能验证
 
@@ -963,9 +1172,10 @@ MPLCONFIGDIR=/tmp/driveva_mpl \
 14. **future 顺序要钉死**：storage order、near/far 顺序、threshold 顺序必须文档化并在
     test 中固定，避免像 history temporal coordinate 那样发生静默反转。
 15. **Press 的定位**：近无损加速，不保证质量提升；全量正向 ΔPDM 若不显著，不要写成提升。
-16. **GPU 并发上限（2026-09-17 用户要求）**：任何实验/agent 任务最多同时占用
-    **4 张 GPU**；一次最多启动 4 个模型/训练/评测进程，多出的必须排队。写入命令
-    前检查 `nvidia-smi` 与 `ps`，确认没有超额进程。
+16. **GPU 并发上限（2026-09-20 用户更新）**：当前允许最多同时占用 **4 张 GPU**。
+    所有 GPU 任务必须写入 tmux 队列
+    `outputs/future_oracle_queue_v3_20260918/run_queue.sh`，由队列等待空闲 GPU 并执行；
+    禁止直接 `nohup` 抢占 GPU。
 
 ---
 
@@ -1073,3 +1283,330 @@ MPLCONFIGDIR=/tmp/driveva_mpl \
 - 新增报告：`outputs/history_guided_future_poc1024_report_20260917.md`。
 - 测试：`199 passed`（增加 history-guided selector、runner、scorer 测试）。
 - 说明：本次没有自动再 commit；用户已明确后续阶段性成果后再要求 commit。
+
+### 2026-09-17 — history-guided frontier sweep（用户要求）
+
+- 先按用户要求 `git` 保存进度：新增 commit `717c7fb Add history-guided future token compression`。
+- 在 `history_guided_future` 上增加 `future_keep_ratio` per-future-latent cap；CLI 参数
+  `--history-guided-future-keep-ratio`。
+- 用同一组 common 512 paired scenes 做 sweep（NoPress PDM `0.911362`）：
+  - `union_history [0.02,0.40]`：ΔPDM `−0.0004`，CI `[−0.0074,+0.0064]`，hidden 1330.8，
+    latency 578.3 ms；近无损但比 history-only best 压缩更少且更慢；
+  - `[0.03,0.40]`：ΔPDM `−0.0105`，hidden 1296.2；同长度下明显差于 history-only；
+  - `[0.04,0.40]`：ΔPDM `−0.0093`，hidden 1249.2；
+  - `[0.05,0.40]`：ΔPDM `−0.0158`，hidden 1198.1；
+  - future cap 0.85/0.80/0.75/0.65：逐步变差，cap 越小 PDM 掉得越快；
+  - route control：future direct `action_attention_vnorm` topk0.75 ΔPDM `−0.0276`；
+    adaptive ΔPDM `−0.0094` 但 hidden 1507、latency 591.4；history-only best 在同
+    512 scenes 为 ΔPDM `−0.0060`、hidden 1292.2。
+- 结论：**没有找到 near-lossless 的 future 压缩乘 2 工作点**。唯一近无损的 guided 点
+  压缩比 history-only 少且更慢；在相近 physical length 下 guided future 仍多掉约 0.5 PDM。
+- 测试：`200 passed`；frontier 代码尚未 commit（用户要求阶段性成果后由用户发指令）。
+- 新增报告：`outputs/history_guided_future_frontier_512_report_20260917.md`。
+- 下一步建议：停止简单 mask-copy 调参，转向 oracle/结构化 attention / 训练期 bottleneck。
+
+### 2026-09-17 — future subset oracle 上界初测
+
+- 新增 `--persistent-random-seed`，用于固定/采样 matched random future mask。
+- 做 best-of-N random-mask oracle（每 scene 取 N 个随机 mask 的 official PDM 最大值）：
+  - 64 scenes，NoPress PDM `0.940644`；
+  - future keep 0.50，N=16：single-seed ΔPDM `−0.0671`，oracle ΔPDM `+0.0026`，
+    CI `[−0.0038,+0.0084]`，oracle PDM `0.9432`；
+  - future keep 0.375，N=16：single `−0.1092`，oracle `−0.0209`，
+    CI `[−0.0300,−0.0124]`，oracle PDM `0.9197`；
+  - future keep 0.25，N=8：single `−0.1608`，oracle `−0.0709`，
+    CI `[−0.0983,−0.0485]`。
+- 结论：50% future keep 的 oracle 上界与 NoPress 不可区分，是 positive signal：
+  存在大量 future planning 冗余子集；37.5% 仍掉 0.0209，但比随机好很多；25% 明显掉点。
+  该 oracle 有选择偏差，只是 headroom upper bound，不是部署 selector。
+- 下一步：实现 future counterfactual tile / planning-gradient oracle，把随机 oracle headroom
+  转成可实现的 selector；再上 256/1024 面板。
+- 产物：`outputs/oracle_future_subset_upper_bound_20260917.md`、
+  `outputs/oracle_random_k50_seed1001..1016_20260918/` 等。
+
+### 2026-09-18 — future counterfactual tile/mask oracle 队列
+
+- 已实现：
+  - `FutureFixedTileSelector`（`future_fixed_tiles`）：单 future latent 删除一个
+    确定性 normalized tile，用于 leave-one-tile-out PDM 矩阵；
+  - `OracleFutureMaskSelector`（`oracle_future_mask`）：读取 per-scene oracle tile mask JSON；
+  - runner：`--future-counterfactual-tile-matrix`、`--future-counterfactual-layer`、
+    `--future-counterfactual-tile-h/w`、`--future-oracle-mask-json`；
+  - `scripts/build_future_oracle_masks.py`：从 matrix suite 生成
+    keep-ratio 0.5/0.375/0.25 的 per-scene oracle tile mask。
+- tmux 持久队列已启动：
+  - session：`driveva_oracle`
+  - 脚本：`outputs/future_oracle_queue_20260918/run_queue.sh`
+  - 约束：**本阶段最多 2 张 GPU**；队列等待至少 2 张 GPU 各有 >=32GiB free 才启动，
+    否则 sleep 60 继续等待；
+  - 队列内容：2-rank x 64 = 128-scene counterfactual matrix → 三档 mask 分析 →
+    oracle eval；随后 2-rank x 256 = 512-scene matrix → 三档分析 → oracle eval；
+  - 当前所有物理 GPU 被 VLLM 进程占用，队列正在等待中。
+- 测试：`204 passed`；matrix/oracle selector + runner builder + analysis script 均有 CPU 测试。
+- 注意：本阶段新代码尚未 commit。
+
+### 2026-09-18 — future counterfactual tile oracle 完成与结论
+
+- tmux 队列 `driveva_oracle` 全部完成；本阶段最多 2 GPU：
+  - matrix128（2×64）完成；
+  - matrix512（2×256）完成；
+  - 128/512 两套面板 × keep 0.50/0.375/0.25 的 oracle eval 完成。
+- 512-scene oracle eval：
+  - keep0.50：ΔPDM `−0.0424`，95% CI `[−0.0637,−0.0220]`；
+  - keep0.375：ΔPDM `−0.0891`，CI `[−0.1129,−0.0665]`；
+  - keep0.25：ΔPDM `−0.1129`，CI `[−0.1385,−0.0882]`。
+- 128-scene oracle eval 同样差：keep0.50 `−0.0610`，keep0.375 `−0.1080`，
+  keep0.25 `−0.1082`。
+- matrix512 tile-level 统计：mean harm `[-0.004,+0.009]`，SE `0.003–0.006`，
+  `harm>0` 比例 `0.23–0.45`；单次 PDM tile 排序基本被噪声/交互主导。
+- 结论：
+  - 当前 counterfactual tile oracle 不是有效 oracle，明显差于 history-guided 和
+    attention-vnorm controls；
+  - tile 重要性不满足可加性，不能用“单 tile 删除 PDM”外推组合子集；
+  - 该结果不证明 future 不可压缩，只证明该 oracle 构造失败；
+  - 下一步改 trajectory displacement / multi-replay / set-level greedy/beam oracle，
+    并补 matched random control。
+- 产物：`outputs/future_oracle_counterfactual_conclusion_20260918.md`。
+
+### 2026-09-20 — multi-seed trajectory/planning-harm oracle 队列启动
+
+- 根据用户要求，不再只用单次 PDM：
+  - runner 增加 `--dump-target-trajectories`，由官方 target builder 自动保存 GT trajectory；
+  - 已有 `--dump-trajectories` 保存预测 trajectory；
+  - 新增 `scripts/build_future_oracle_masks_multiseed.py`，可对多个 seed 的
+    `pdm_harm` / `traj_disp` / `planning_harm` 聚合，按 `traj_disp`、
+    `planning_harm`、`combined` 等 ranking 生成 oracle mask。
+- 新 tmux 队列 `driveva_oracle_v2`：
+  - 脚本：`outputs/future_oracle_queue_v2_20260918/run_queue.sh`
+  - 4 个 sample seed：1001/1002/1003/1004；
+  - 每个 seed 跑 2-rank × 64 = 128-scene counterfactual tile matrix，同时 dump
+    predicted + target trajectories；
+  - 然后对 3 种 ranking（`traj_disp`、`planning_harm`、`combined`）× 3 个 keep ratio
+    （0.50/0.375/0.25）生成 mask 并跑官方 oracle eval；
+  - 本阶段严格最多 2 张 GPU。
+- 队列启动时间：`2026-09-20 10:08:58`，当前 seed1001 matrix 正在运行。
+- 说明：这一版的目标是确认 oracle upper bound，而不是优化 oracle 分数；如果发现对正常
+  pipeline 有效的选择 trick，则优先接入正常 selector。
+
+### 2026-09-20 — 切换到 4 GPU / multi-seed trajectory oracle
+
+- 用户更新资源约束：自此可同时使用 **4 张 GPU**；已同步 §3.1、§10、§11。
+- 旧 v2 2-GPU 队列已停止；新队列：
+  - tmux：`driveva_oracle_v3`
+  - 脚本：`outputs/future_oracle_queue_v3_20260918/run_queue.sh`
+  - 4 ranks × `--max-eval-tokens 64` = 每个 seed 约 256 个独立 scene；
+  - 4 个 sample seed：1001/1002/1003/1004；
+  - 同时 dump predicted trajectory + target trajectory；
+  - 使用 `scripts/build_future_oracle_masks_multiseed.py` 聚合
+    `pdm_harm` / `traj_disp` / `planning_harm`，生成
+    `traj_disp`、`planning_harm`、`combined` 三类 mask；
+  - 最后对 3 ranking × 3 keep ratio = 9 个 oracle eval。
+- 当前 `matrix_seed1001` 正在 GPU 0/2/3/4 上运行。
+- 目的：确认 oracle 上界，寻找对正常 pipeline 有效的 selection trick，而不是优化 oracle
+  分数本身。
+
+### 2026-09-20 — 4-GPU multi-seed trajectory/planning oracle 完成
+
+- `driveva_oracle_v3` 全部完成，最多 4 GPU：
+  - 4 sample seeds × 256 scenes；
+  - 每个 tile 同时有 PDM、predicted trajectory、target trajectory；
+  - 3 ranking（traj_disp / planning_harm / combined）× 3 keep ratio。
+- 最终 oracle eval：
+  - 最好的是 `combined keep=0.50`：ΔPDM `−0.0182`，CI `[−0.0445,+0.0074]`；
+  - `traj_disp keep=0.50`：ΔPDM `−0.0453`；
+  - `planning_harm keep=0.50`：ΔPDM `−0.0473`；
+  - keep 越低越差。
+- 结论：
+  - tile-level oracle 仍不 near-lossless，且不如 history-guided / attention-vnorm controls；
+  - trajectory displacement / planning harm 比单次 PDM 稳定，但没有转化成有效 token 重要性标签；
+  - 更根本的问题可能是 **tile 粒度**：之前 64-scene token-level best-of-N random-mask oracle
+    在 50% keep 接近 NoPress，而 tile oracle 只能选 12 个 tile 子集；
+  - 因此这是 tile-constrained oracle 失败，不是 future token 不可压缩的证明。
+- 下一步：token-level set-level oracle（best-of-N random token masks、greedy/beam），
+  继续同时测 PDM + trajectory displacement + planning harm。
+- 产物：`outputs/future_oracle_multiseed4_conclusion_20260920.md`。
+
+### 2026-09-20 — token-level set-level future oracle 实现（代码 + 测试完成，实验未跑）
+
+- 用户要求把 future token oracle 从 tile 级细化到 **token-level set-level**，并按
+  `outputs/future_oracle_multiseed4_conclusion_20260920.md` 的“下一步建议”完成代码与测试。
+- 本次新增（尚未 commit，均为工作区内改动）：
+  - `videopress/oracle/token_set.py`：token 分组（`token`/`linear`/`block`/`random`，绝不跨
+    latent）、flat offset ↔ per-latent JSON 互转、`SetScorer`（联合打分 + 缓存 + 批量）、
+    `greedy_forward_selection` / `greedy_backward_elimination` / `beam_search` /
+    `random_search`（matched-budget random）、`random_token_masks`（per-scene best-of-N）、
+    `per_scene_oracle`。
+  - `videopress/oracle/metrics.py`：`trajectory_displacement` / `planning_harm` /
+    `combined_harm`（z-score）/ `OBJECTIVES` / `objective_higher_is_better`。
+  - `videopress/selectors/future_oracle.py`：新增 `oracle_future_token_mask`（per-scene
+    per-latent token 索引或 flat offset，越界/缺场景显式报错），并把 tile/token 两个 oracle
+    selector 的公共物理应用逻辑抽成 `_FutureMaskSelector`；tile oracle 行为保持不变
+    （原测试继续通过）。
+  - runner：`--future-oracle-token-mask-json` / `--future-oracle-token-mask-jsons`
+    （后者每个 mask 文件一个 physical method，整批候选一次 runner 调用）；
+    `_future_oracle_token_mask_paths` / `_mask_method_tag` / `_future_token_mask_specs`。
+  - `scripts/search_future_token_set_oracle.py`：模式 `random-best-of-n` /
+    `independent-topk` / `greedy-forward` / `greedy-backward` / `beam` / `evaluate-masks`；
+    每个候选同时记录 PDM / pdm_harm / traj_disp / planning_harm；自适应模式附 matched
+    random control；所有 runner 命令写入 `search/commands.jsonl`；容忍 truncated POC 的
+    runner exit 1（artifacts 完整时继续）；支持 `--dry-run`。
+  - `tests/test_future_token_oracle.py`：36 个 CPU 单测（分组、搜索、序列化、per-scene
+    oracle、metric、selector、runner spec、driver 命令/dry-run 辅助）；其中
+    `test_beam_search_spends_the_budget_on_score_ties` 是队列启动后发现的回归测试：
+    原 `beam_search` 在候选分数完全打平时会停在更小的子集（甚至空集），等于用
+    “少压缩”伪装成 oracle 更优；已改为同分时优先选 token 更多的状态。
+  - `outputs/future_token_set_oracle_queue_20260920/run_queue.sh`：4-GPU 队列脚本
+    （random best-of-N / independent top-K / greedy forward / beam），**已就绪但未启动**。
+  - `videopress_framework/README.md`：新增 “Token-level set-level future oracle” 章节。
+- 测试与验证：
+  - `python -m pytest -q`：**240 passed**（新增文件 35 个测试全通过；此前 184/195/199/204
+    的历史计数见 §9/§12）；
+  - `python -m compileall` 通过；
+  - driver `--dry-run` 可生成 mask JSON 并打印完整 runner 命令；
+  - **GPU 1-scene official smoke 通过**（`--max-eval-tokens 1`，2 个随机 token mask，
+    keep 0.5）：
+    - 产物 `outputs/future_token_set_oracle_smoke_20260920/`；
+    - baseline（NoPress）PDM `0.928989`（单场景，sample seed 默认）；
+    - `sample000` PDM `0.482048`，`sample001` PDM `0.943476`，per-scene best-of-2 oracle
+      `0.943476`；
+    - 物理路径确认：`K=390/780`，`hidden_sequence_length=1179`（1569−390），
+      selector=`oracle_future_token_mask`；
+    - 该 smoke 只证明 token mask 能真正走物理 `kv_prune`+`hidden_sequence` 且 driver 端到端
+      可跑，**不是 PDM 结论**（单场景 + truncated）。
+- 注意：**本次没有产生新的 PDM 结论**。tile oracle 的失败结论仍然有效；token-level
+  set-level 只是把 instrument 做对，需要跑队列才有结论。
+- 下一步：
+  1. 启动 `outputs/future_token_set_oracle_queue_20260920/run_queue.sh`（保持 ≤4 GPU）；
+  2. 先看 `random-best-of-n` 的 per-scene oracle 能否在 256-scene 面板复现“50% keep
+     接近 NoPress”；再看 greedy/beam 是否显著优于 matched random；
+  3. 若 token-level set-level oracle 也失败，按结论报告停止 future hard prune，
+     转向 structured attention / training-time bottleneck。
+
+### 2026-09-20 — token-level oracle 队列已启动 + ETA
+
+- tmux `token_oracle` 启动 `outputs/future_token_set_oracle_queue_20260920/run_queue.sh`
+  （13:19:40 起，最多 4 GPU）：`random_best_of_n`（256 场景）→ `independent_topk_g8`
+  → `greedy_forward_g30` → `beam_w2_g30`（后三档用 64 场景 panel）。
+- 实测吞吐（4 ranks、每 method 256 场景）：**63 s/method**；v3 matrix 校准一致
+  （25 methods / 26m35s）。
+- ETA（按各阶段 method 数与 invocation 数估算，含每次 runner 调用的约 45 s 固定开销）：
+  - stage1 `random_best_of_n`：17 methods ≈ 19 min → **约 13:38 出报告**；
+  - stage2 `independent_topk_g8`：101 methods（含 compose）≈ 1h48m → 约 15:26；
+  - stage3 `greedy_forward_g30`：294 methods / 16 invocations ≈ 5h21m → 约 20:47；
+  - stage4 `beam_w2_g30`：517 methods / 16 invocations ≈ 9h15m → 约次日 06:02；
+  - 合计约 **16h42m**，预计 **2026-09-21 06:00 左右**全部完成。
+- 备注：每个 candidate runner 调用都会附带一次 in-suite `physical_no_press`（driver 已有
+  外部 baseline），全部阶段合计约 29 个冗余 method ≈ 30 min；若需要可加
+  `--persistent-skip-baseline` 收紧，但需在阶段边界改代码。
+- 测试：beam tie 回归修复后 full run **240 passed**。
+
+### 2026-09-20 — stage1 结果 + `--persistent-skip-baseline`
+
+- stage1 `random_best_of_n` 13:38:33 完成 rc=0（256 场景，基线 NoPress PDM `0.880333`）：
+  - 单个随机 token mask（keep 0.5）panel 均值 PDM `0.866133`，ΔPDM `−0.0142`；
+  - 16 个 mask 的 per-scene best-of-16 oracle `0.939807`，ΔPDM `+0.059474`，
+    paired bootstrap 95% CI `[+0.0331, +0.0889]`（不跨 0）；
+  - 已用原始 records 独立复核：oracle 与报告**逐场景完全一致**；
+  - **重要 caveat**：144/256（56%）场景没有任何一个 mask 能超过 NoPress；per-scene
+    跨 16 个 mask 的 PDM 极差均值 `0.200`、逐场景 sd 均值 `0.068`，而 16 个 arm 的
+    panel 均值只散布在 `0.8513–0.8825`。即 per-scene max 主要是在大噪声上取最大值，
+    选择偏差很重，`+0.059` **不能读成"存在可部署的近无损子集"**。可部署的对照应是
+    matched random 的 panel 均值 `0.866`，看 greedy/beam 能否超过它。
+- 代码：driver 新增 `--keep-suite-baseline`；默认给 candidate runner 调用加
+  `--persistent-skip-baseline`（driver 已有外部 baseline）。stage2 的 driver 进程在
+  改动前已启动，因此 stage2 不受影响；stage3/4 生效，各节省 16 个冗余 method
+  （约 17 min/阶段）。测试 `240 passed`；dry-run 已确认命令带该 flag。
+- 更新后的 ETA：stage2 ≈ 15:30；stage3（5h04m）≈ 20:35；stage4（8h58m）≈ 次日 05:30。
+
+### 2026-09-20 — stage2 结果、64-scene 噪声地板与“是否需要继续测试”的决策
+
+- stage2 `independent_topk_g8`（15:27:19 rc=0，64 场景，基线 PDM `0.872972`）：
+  - leave-one-8-token-group-out（保留 772/780）98 个组：**全部 dPDM 为正**，
+    均值 `+0.0279`，组间 sd `0.0075`，min `+0.0029`，max `+0.0441`；
+  - independent top-K 组合（保留 390）：PDM `0.844794`，dPDM `−0.0282`，
+    paired 95% CI `[−0.0925,+0.0330]`，improved/tied/worse `20/20/24`。
+  - 结论：token-group 粒度上“独立排序再组合”**再次失败**（与 tile oracle 同结论）；
+    而且“丢掉 1% token 反而 +2.8 分”直接暴露了面板噪声量级。
+- **64-scene 面板噪声地板（用 stage1 的 16 个随机 mask 在同一 64 场景上测）**：
+  - 单个随机 mask dPDM 范围 `−0.0685…−0.0075`，均值 `−0.0343`，sd `0.0197`；
+  - 固定 mask vs NoPress 的 paired 95% CI 宽度 ≈ `0.057`（256 场景 ≈ `0.051`，
+    1024 场景外推 ≈ `0.026`）；
+  - 随机 mask 两两之间 |dPDM| 均值 `0.0098`、最大 `0.0313`；
+  - **1 个场景翻转 = 0.0156 PDM（64 场景）/ 0.0039（256）/ 0.0010（1024）**。
+  - 即 stage3/stage4 在 64 场景上的关键比较分辨率只有 ±0.025–0.05，
+    而我们要找的是 <1 分的效应 → **stage3 结构上无法给出结论，stage4 预期信息增益更低**。
+- 决策建议（待用户确认）：**取消 stage4（beam，约 9h）**，保留 stage3 以产出候选 mask，
+  然后把 stage3 的 `search_final`（+ stage2 的 composed 作为对照）放到
+  **1024 场景（4 个 v3 seed 面板）**上做配对验证（约 15–25 min），
+  判定规则预先固定：必须优于同面板 best-of-16 随机 mask 且 paired ΔPDM 的 CI 下界 > `−0.002`，
+  否则停止 future hard prune，转 structured attention / training-time bottleneck。
+- driver 已补上决策级统计：每个候选输出 `vs_baseline`（paired ΔPDM、95% CI、
+  improved/tied/worse、extreme flips、zero cand/base），自适应模式另外输出
+  `final_vs_matched_random` paired CI；测试 `241 passed`。
+
+### 2026-09-20 — 采样种子噪声标定 + 取消 beam、改为 1024 场景判决性验证
+
+- 用户决定：**取消 stage4（beam）**，保留 stage3，随后跑 1024 场景验证。
+- **采样种子噪声标定（用 v3 matrix：同一个 24 个 tile mask × 4 个 `--sample-seed`，
+  同样 256 场景）**——这是本项目一个重要方法学结论：
+  - NoPress 的**绝对** panel 均值随采样种子变化 `0.880333 / 0.904601 / 0.911602 / 0.901051`，
+    极差 `0.0313`；**绝对 PDM 不能跨采样种子比较**；
+  - 但同一个固定 mask 的**配对** ΔPDM 跨种子只有 sd `0.0067`、极差 `0.0171`；
+  - 另一个标定：随机 mask 两两之间 |ΔPDM| 均值 `0.0098`、最大 `0.0313`；
+    固定 mask vs NoPress 的 paired 95% CI 宽度 ≈ `0.057`（64 场景）/ `0.051`（256）
+    / 外推 `0.026`（1024）。
+  - 结论：**配对比较是唯一有效货币**；提升功效主要靠**增加场景数**（而不是加种子），
+    因为 256 场景上总噪声 sd≈0.013，其中种子分量≈0.007、场景×mask 交互≈0.011。
+- 因此 stage3/4 在 64 场景上的关键比较分辨率只有 ±0.025–0.05，**结构上无法判定 <1 分的效应**。
+- 已实现（未 commit）：
+  - 守卫脚本 `outputs/future_token_set_oracle_queue_20260920/stop_after_stage3.sh`
+    （tmux `oracle_guard`）：stage3 一结束就杀掉队列、阻止 beam，并自动在
+    tmux `token_verify` 里启动验证；
+  - 验证脚本 `outputs/future_token_set_oracle_verify_1024_20260920/run_verify.sh`：
+    把 stage3 的 `search_final` 与 stage2 的 `topk_composed` 折叠成 `{"*": pattern}`
+    广播 mask，在 **4 rank × `--max-eval-tokens 256` = 1024 场景**上评估，
+    同时跑 15 个同预算随机 mask 作为 matched random band（约 76 min）；
+  - selector 支持 `"*"` 广播条目（共享 pattern 不再需要逐场景展开）；
+  - driver `--mode evaluate-masks --include-random-masks N`：同一次 runner 调用里
+    同时评估命名 mask 与随机 band。
+- 预先固定的判定规则：搜索 mask 必须 (a) 超过随机 band，(b) 相对 NoPress 的 paired
+  ΔPDM 的 CI 下界 > `−0.002`；否则**停止 future hard prune**，转 structured attention /
+  training-time bottleneck。
+- 测试：新增 2 个（`"*"` 广播语义、`build_evaluate_mask_candidates` 随机 band）。
+
+### 2026-09-20 — 1024 场景验证完成：结论与下一步判断
+
+- 全部完成：stage1 `random_best_of_n`（13:38）、stage2 `independent_topk_g8`（15:27）、
+  stage3 `greedy_forward_g30`（15:27→19:25）、**stage4 beam 被看门狗按计划阻止**、
+  1024 场景验证（19:25→20:35）。
+- 1024 场景 keep 0.5 结果（基线 `0.911205`）：
+  - 随机 band（15 臂，K=390）ΔPDM `−0.0557…−0.0413`（mean `−0.0483`，sd `0.0036`）；
+  - stage2 composed（K=390）ΔPDM `−0.0534` CI `[−0.0686,−0.0386]`，只胜过 13% 随机臂；
+  - stage3 greedy（K=270，预算不匹配）ΔPDM `−0.0726`，输给全部 15 个随机臂；
+  - zero-score：候选 80/81 vs 基线 30；extreme 71/73。
+- **判断**：
+  1. F1 gate **否定关闭**——没有 token-level oracle 子集在 50% keep 上优于 matched random；
+     **取消 F3（训练 future selector）**，没有可蒸馏信号；
+  2. 已推翻"50% future keep 存在大量冗余"的旧乐观结论（64/256 场景 POC 的产物）；
+  3. 唯一还值得测的是 **keep-ratio frontier**（不是更多搜索）：已在
+     `outputs/future_token_set_oracle_followup_20260920/` 启动（270-token 预算匹配随机 band
+     + keep 0.75/0.875 的 1024 场景随机控制，约 50 min）；
+  4. 若 keep 0.75 仍远非近无损 → 彻底放弃 future hard prune，保留已部署的 history press，
+     转 structured attention / training-time bottleneck / merge / quantization；
+  5. 方法学教训写入 §10：小面板搜索会过拟合，禁止用 64 场景搜索结果作为可部署 pattern。
+- 测试：`243 passed`。
+
+### 2026-09-20 — 补测完成：keep-ratio frontier 与预算匹配修正（本阶段定论）
+
+- follow-up（21:24→22:09，1024 场景、NoPress `0.911205`）结果：
+  - keep 0.346 / 0.500 / 0.750 / 0.875 的随机控制 dPDM 分别为 `−0.0978` / `−0.0483` /
+    `−0.0216` / `−0.0096`；**所有 keep ≤ 0.875 的臂 CI 均不跨 0（显著差于 NoPress）**；
+  - **预算匹配修正**：searched 270-token mask `−0.0726` vs 270-token 随机 band `−0.0978`，
+    searched 胜 `+0.0187` CI `[+0.0029,+0.0339]` → selection 匹配预算下**确实有信号**，
+    但绝对水平不可用；此前"不优于随机"的说法是预算不匹配造成的假象，已更正；
+  - zero-score：30 → 37–45(.875) → 51–55(.75) → 65–77(.346)。
+- **本阶段结论**：token-level set-level oracle 无法让 future hard prune 近无损；keep≥0.875 的
+  代价（−0.007~−0.015）换不到有意义的加速（仅 6.2% 序列长度）。→ **停止 future hard prune，
+  取消 F3**；保留 history press；能力侧转 structured attention / training-time bottleneck。
+- 未解决项：只测了 trajectory PDM；video decode 质量必然因 hidden_sequence 置零而受损；
+  keep 0.875 上的可部署 scorer 未测（可选 5 min 补测）。
