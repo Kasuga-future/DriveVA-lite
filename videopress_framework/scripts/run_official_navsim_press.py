@@ -638,13 +638,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "last_history",
             "history",
             "all_history",
+            "all_video",
             "future_video",
             "future_latent_0",
             "future_latent_1",
         ),
         help=(
             "token selection domain; future_video covers both future latents "
-            "(near,far storage order)"
+            "(near,far storage order); all_video covers history+future and is "
+            "what matched-K controls for the joint press need"
         ),
     )
     parser.add_argument(

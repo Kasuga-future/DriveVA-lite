@@ -168,7 +168,7 @@ DriveVA-lite/
 - 另一等价路径：`/mnt/nvme/chenpeijian/miniconda3/envs/DriveVA/bin/python`。
 - 分布式运行使用 `torch.distributed.run`；历史 full run 常用 6 卡（logical GPU 0–5），
   单卡 smoke 用 `CUDA_VISIBLE_DEVICES=0`。
-- **并发上限（2026-09-20 用户更新）**：当前允许最多同时占用 **4 张 GPU**。所有 GPU
+- **并发上限（2026-09-20 23:15 用户再次收紧）**：当前仅允许同时占用 **2 张 GPU**（建议 0/1，但 0/1 若被他人占用则用最空闲的两张）。所有 GPU
   任务必须通过 tmux 队列 `outputs/future_oracle_queue_v3_20260918/run_queue.sh` 排队执行，
   启动前检查 `nvidia-smi` 与 `ps`，不允许直接抢占 GPU。
 - 绘图前设 `MPLCONFIGDIR=/tmp/driveva_mpl`，避免 matplotlib 写 home 失败。
@@ -1180,7 +1180,7 @@ MPLCONFIGDIR=/tmp/driveva_mpl \
 14. **future 顺序要钉死**：storage order、near/far 顺序、threshold 顺序必须文档化并在
     test 中固定，避免像 history temporal coordinate 那样发生静默反转。
 15. **Press 的定位**：近无损加速，不保证质量提升；全量正向 ΔPDM 若不显著，不要写成提升。
-16. **GPU 并发上限（2026-09-20 用户更新）**：当前允许最多同时占用 **4 张 GPU**。
+16. **GPU 并发上限（2026-09-20 23:15 用户更新）**：当前**仅允许 2 张 GPU**（优先 0/1）。队列脚本的 wait_for_two_gpus 必须显式检查，且不得因他人占用而超限。
     所有 GPU 任务必须写入 tmux 队列
     `outputs/future_oracle_queue_v3_20260918/run_queue.sh`，由队列等待空闲 GPU 并执行；
     禁止直接 `nohup` 抢占 GPU。
@@ -1635,3 +1635,40 @@ MPLCONFIGDIR=/tmp/driveva_mpl \
   `outputs/joint_history_future_1024_20260920/run_joint.sh`（1024 场景，
   以部署的 history-only press 为参照，测 `union_history` / `same_latent` 及 future cap
   0.875/0.75 的联合 PDM / 延迟 / K / 零分尾部；tmux `joint_search`，约 40 min）。
+
+### 2026-09-20 — history+future 联合搜索完成（1024 场景）+ 资源收紧到 2 GPU
+
+- **联合搜索 7/7 臂完成**（23:05:22，1024 场景，NoPress `0.911205`，全部同一面板）：
+
+| arm | K | hidden | lat ms | ΔPDM | 95% CI | zero |
+|---|---:|---:|---:|---:|---|---:|
+| **history_only（部署参照）** | 490 | 1279 | 575.9 | **−0.0039** | [−0.0081,−0.0004] | 34/30 |
+| union_history | 1149 | 1158 | 571.1 | −0.0121 | [−0.0203,−0.0046] | 44/30 |
+| union_history_cap0875 | 1133 | 1142 | 578.6 | −0.0160 | [−0.0257,−0.0069] | 49/30 |
+| same_latent | 989 | 998 | 556.0 | −0.0280 | [−0.0395,−0.0167] | 49/30 |
+| union_history_cap075 | 1072 | 1081 | 570.1 | −0.0280 | [−0.0392,−0.0174] | 60/30 |
+| same_latent_cap0875 | 982 | 991 | 570.1 | −0.0285 | [−0.0403,−0.0169] | 50/30 |
+| same_latent_cap075 | 955 | 964 | 545.7 | −0.0299 | [−0.0421,−0.0182] | 54/30 |
+
+- **结论**：联合前沿**单调、无拐点**——在 history-only 之上每多砍 ~120–150 hidden token
+  约付 1 个 PDM 点；延迟不与 hidden 单调（union 571 ms vs history-only 576 ms，几乎无收益，
+  cap0.875 反而 578.6 ms），只有 `same_latent*` 有 6–30 ms 明确加速；**没有任何联合臂达到
+  近无损门槛**（CI 下界 > −0.002，最好 union_history 为 −0.0203）。**联合最佳可部署点仍是
+  history-only**。零分尾部随压缩单调恶化：30 → 34 → 44 → 49 → 54–60。
+- **matched-K 随机对照**：原控制脚本用了 `--domain all_video`，而 runner 的 `--domain`
+  choices 里没有它 → 4 臂 argparse 立即失败（已修：runner 新增 `all_video` choice + 单测；
+  测试 `244 passed`）。重启后 4 臂由 `run_joint_control_2gpu.sh` 在
+  `outputs/joint_history_future_control_1024_20260920/` 下运行。
+- **只占用真正空闲的 GPU（用户 23:2x 要求）**：`acquire_gpus()` 只接受 free ≥ 40 GiB 的卡；
+  有两张空闲就用两张（nproc=2），一张空闲都没有就等待，只有一张长期空闲（>15 min）才降级到
+  nproc=1，绝不与他人共卡。首次启动选中的 0+2 是错的：GPU 2 上 zhanglizhong 的 dino_dit
+  评测 3 分钟内从 24 GiB 涨到 48 GiB；已终止并改到 **0+3**（两张均只有 3 MiB 占用）。
+- **面板口径**：官方 evaluator 按 rank 分块（rank r 取第 r 块再截断 `--max-eval-tokens`），
+  所以 world_size=2/max=256 覆盖 `[0,256)+[N/2,N/2+256)` = 512 场景，是 1024 联合面板的
+  **子集**；分析脚本自动取共同子集做配对比较。
+- **资源收紧**：用户 23:15 要求**只能用 2 张 GPU**；AGENTS §3.1/§10 已同步，队列改用
+  `wait_for_two_gpus`（优先 0/1，被占用则取最空闲两张）。实测 GPU 1 的 22 GiB 属
+  zhanglizhong 的 dino_dit 任务（非本会话残留），故控制使用 0+2。
+- **进程审计**：GPU 上无本会话孤儿；3228545=zhanglizhong dino_dit、3235490/91=xiangyike
+  hidden_gradient_ablation、3191529/30=VLLM。注意：本会话曾用 `pkill -f run_official_navsim_press`
+  误匹配到 xiangyike 的同名脚本（TERM 未生效，任务存活），后续必须按 PID/仓库路径确认归属。

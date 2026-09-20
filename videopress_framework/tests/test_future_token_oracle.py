@@ -729,3 +729,35 @@ def test_build_evaluate_mask_candidates_adds_matched_random_control(tmp_path):
             [named],
         )
     ) == ["mask000"]
+
+
+def test_runner_accepts_all_video_domain_for_joint_controls():
+    # The matched-K control for the joint history+future press is a random cut
+    # over all 1560 video candidates, which needs --domain all_video.
+    from scripts.run_official_navsim_press import parse_args
+
+    args = parse_args(["--domain", "all_video", "--output-root", "/tmp/x"])
+    assert args.domain == "all_video"
+    specs = _method_specs_for_run(
+        SimpleNamespace(
+            domain="all_video",
+            methods=None,
+            retention_policy=None,
+            persistent_layer_sweep="15",
+            persistent_keep_ratio=0.7365,
+            persistent_end_layer=None,
+            persistent_mode="hidden_sequence",
+            persistent_oneshot=False,
+            persistent_skip_baseline=True,
+            persistent_scorer="random",
+            persistent_selector="topk",
+            persistent_random_seed=9001,
+        ),
+        round_seed=7,
+    )
+    assert len(specs) == 1
+    assert specs[0]["press"]["domain"] == "all_video"
+    scorer = specs[0]["press"]["scorer"]
+    assert scorer["name"] == "random"
+    assert scorer["seed"] == 9001
+    assert scorer["scope"] == "scene"
