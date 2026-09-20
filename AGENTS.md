@@ -1,8 +1,8 @@
 # AGENTS.md — DriveVA-lite Video Token Compression 交接文件
 
-> 最后更新：2026-09-21 00:15 CST
-> 当前分支：`main`，当前 HEAD：`91740d0`（已与 `origin/main` 同步）
-> 当前工作区：F3/联合训练侧代码 + 新单测（未 commit，见 §6）
+> 最后更新：2026-09-21 00:35 CST
+> 当前分支：`main`，当前 HEAD：`41abd22`（已与 `origin/main` 同步）
+> 当前工作区：clean（唯一 untracked 为排除项 `pre_dit_gpu_smoke.py`）
 > **当前主任务：F3（训练 future selector）与 history+future 联合 selector 训练中**
 > （用户 2026-09-21 明确要求启动，覆盖了此前"F3 取消"的门控结论）。见 §12。
 > 当前主任务：Future token compression 现状：
@@ -717,6 +717,7 @@ oracle 上界都不如随机，没有可蒸馏的信号。
 | future domain 官方 runner | **已开放** | `--domain future_video/future_latent_0/future_latent_1` 可用 |
 | future latent 单独 domain/budget | **已实现** | `future_latent_i`、`each_future` reference 已加入并有测试 |
 | future / 联合 online selector 训练 | **已实现（2026-09-21）** | `--selector-candidate-latents` 支持 storage 坐标连续区间：`"2,3"`=future（780）、`"0,1,2,3"`=history+future 联合（1560）；仅 `gradient_abs` teacher；训练 temporal 坐标 = storage index，与部署 `_positions()` 一致。`history_token_mask`（sparse step）仍只覆盖 history，与 candidate range 同时使用会显式报错 |
+| **组合式 history+future selector** | **已实现（2026-09-21）** | `composed_learned_planning_selector`：一次 `all_video` press，history 候选交给 history 训练的网络（domain view `history`，`t=0,1`），future 候选交给 F3 网络（view `future_video`，`t=2,3`），两个网络互不见对方 block。复用 `LearnedPlanningSelectorScorer` 不改坐标/缓存逻辑；runner 新增 `--persistent-history-selector-checkpoint` / `--persistent-future-selector-checkpoint`；非 `all_video` domain 显式报错。测试断言组合输出在各自 block 上**逐位等于**对应单网络 |
 | future oracle/上界分析 | random-mask / tile / token-level set-level 三种 oracle 均已完成，**全部否定** | 1024 场景 keep0.5：随机 band `−0.0483`，搜索 mask 不优于随机（13 分位 / 输给全部臂）；tile `combined keep0.5` `−0.0182`；下一步只测 keep-ratio frontier |
 | **token-level set-level future oracle** | **已实现并跑完（代码 + 39 单测）；1024 场景验证为否定结果** | `oracle_future_token_mask` selector、`--future-oracle-token-mask-json(s)`、`videopress/oracle/`（token 分组 + set-level greedy/beam/random）、`scripts/search_future_token_set_oracle.py` |
 | future physical smoke | 已跑通 official single scene + 64-scene POC | `outputs/future_token_smoke_20260918/`、`outputs/future_poc64_report_20260917.md` |
@@ -1785,4 +1786,58 @@ layer 15、`gradient_abs` teacher、keep 0.375），**唯一差异是候选区�
 
 **下一步**：训练完成后跑 7 个评测臂 + 配对 bootstrap（vs NoPress / vs matched-K 随机带 /
 vs `union_history` / vs `same_latent` / vs `history_only`），把结论写入 §4/§5 并提交。
+**结果尚未产生，本条不含任何 PDM 结论。**
+
+### 2026-09-21 — 组合式 history+future selector + 全量 7,876 持久队列（实验进行中）
+
+**用户新增要求**：「history+future」不是 mask 迁移，而是**两个已训练 selector 的组合式同时压缩**
+（此 selector 当时不存在，本轮实现）。
+
+**新代码：`composed_learned_planning_selector`（`composed` commit）**
+
+- 一次 `all_video` press，**按 block 路由**：history 候选 → history 训练的网络，在
+  `history` domain view 上评估（temporal 坐标仍是训练用的 `t=0,1`）；future 候选 → F3 网络，
+  在 `future_video` view 上评估（`t=2,3`）。两个网络**互不见对方 block**。
+- 实现上**不改动** `LearnedPlanningSelectorScorer`：对每个 block 用
+  `replace(ctx, domain=...)` 造一个受限 view 交给对应子网络，因此坐标与特征缓存逻辑零重复。
+  输出按 `layout.history_video` / `layout.future_video` 的成员掩码散射回候选向量，
+  并要求「候选域恰好等于 history+future 两块」，否则显式报错。
+- runner 新增 `--persistent-history-selector-checkpoint` /
+  `--persistent-future-selector-checkpoint`；`--persistent-scorer` choices 增加该 scorer；
+  非 `all_video` domain 或缺少任一 checkpoint 时显式报错；`--persistent-feature-layer`
+  同时允许它。
+- **测试锁死的核心性质**：组合输出在 history slot 上**逐位等于** history 单网络、在 future
+  slot 上**逐位等于** F3 单网络；并额外断言两个子网络确实不同（否则「用同一个 net 跑两遍」
+  也能通过）。`256 passed`。
+
+**四个对比类别的最终定义（本轮确定）**
+
+| 类别 | 实现 | 训练? |
+|---|---|---|
+| only-future | `--domain future_video` + F3 checkpoint | 新训练 |
+| only-history | `--domain history` + 已部署 history checkpoint | 已部署 |
+| history+future | `--domain all_video` + **`composed_learned_planning_selector`**（两个已训练 selector 组合） | 组合推理 |
+| joint h-f | `--domain all_video` + **单个**在 `0,1,2,3` 上训练的 joint selector | 新训练 |
+
+（`hist_future_union`（未训练的 mask 迁移）仍保留在队列里作为第 5 个参照臂，但不再是
+用户所指的「history+future」。）
+
+**持久队列 `outputs/f3_joint_full_7876_20260921/run_full_queue.sh`（tmux `f3_full`）**
+
+全部走**官方全量 navtest-7876**（`--force-full-scene-set`）。按优先级：① `baseline_only_history`
+（**故意不加** `--persistent-skip-baseline`，一次产出「当前代码的 NoPress 基线 + only-history」，
+避免拿 09-12 旧基线配对）② `hist_future_union` ③ **`hist_future_composed_k1149`（组合式）**
+④ `joint_k1149` ⑤ `only_future_k682`（keep 0.875）⑥ `joint_k989` ⑦ `hist_future_composed_k989`。
+等待空闲 GPU、跳过已完成臂、等待 checkpoint、超过 30 min 只有 2 张卡则降级 2 卡模式。
+
+**ETA 标定**：实测 joint search「7 臂 × 1024 场景 / nproc=4 = 33.7 min」→ **0.28 s/场景（4 卡）**
+→ 全量 7,876 ≈ **39 min/臂**。7 臂 ≈ **4.5 h**；若降级 2 卡则 ≈ 74 min/臂。
+
+**训练（并行，4 卡）**：future selector GPU 0,3（ETA ~00:51）、joint selector GPU 5,6（ETA ~01:03），
+均为同一配方，仅 `--selector-candidate-latents` 不同；`selector_bce` 0.694 → ~0.34 在学。
+
+**踩到的坑**：① `PIN_GPUS` 单卡被 `case "$gpus" in *,*)` 拒掉（"bad GPU set '5'"）→ 改为
+「非空且与 nproc 一致」，三个脚本同步修；② 首次把 joint 放 4,5 时**另一个用户的 3 卡任务
+30 秒内落到 4,6,7**（GPU 4 只剩 13 GiB）→ 在其分配显存前 kill 并重排到 5,6。
+
 **结果尚未产生，本条不含任何 PDM 结论。**
