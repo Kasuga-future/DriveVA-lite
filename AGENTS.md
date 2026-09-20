@@ -1841,3 +1841,40 @@ vs `union_history` / vs `same_latent` / vs `history_only`），把结论写入 �
 30 秒内落到 4,6,7**（GPU 4 只剩 13 GiB）→ 在其分配显存前 kill 并重排到 5,6。
 
 **结果尚未产生，本条不含任何 PDM 结论。**
+
+### 2026-09-21 — 四段式自动队列链（训练 → 全量测试 → 门控加训 → 全量重测）
+
+**用户追加要求**：① 加回 `only_future` keep 0.75；② 测试效果不佳则在测试结束后加训；
+③ 加训结束后安排全量重测。三条都已落成**无人值守的队列链**（各自独立 tmux 会话，
+互不改脚本——bash 按字节偏移增量读脚本，运行中改文件是自改脚本陷阱）。
+
+| 会话 | 脚本 | 职责 | 触发条件 |
+|---|---|---|---|
+| `f3_full` | `run_full_queue.sh` | 主队列 7 臂全量 7876 | 立即 |
+| `f3_extra` | `run_extra_queue.sh` | `only_future_k585`（keep 0.75，K=585） | 立即 |
+| `f3_retrain` | `run_retrain_queue.sh` | 等两个测试队列 → 门控 → 条件加训 | 测试完成 |
+| `f3_retest` | `run_retest_queue.sh` | 加训 checkpoint 的全量重测 5 臂 | 加训完成 |
+
+**门控判据（在见结果前写死，`gate_retrain.py`）**：两条**同时**成立才算 PASS（不加训）：
+(a) 组合式在同一 K=1149/hidden=1158 上显著优于 `hist_future_union`（配对 95% CI 不含 0）；
+(b) 组合式 ΔPDM vs NoPress 的 CI 下界 > −0.002（近无损门槛）。
+
+**加训的三个旋钮（各有据可依，不是乱试）**：发现训练 teacher 用
+`SELECTOR_TEACHER_KEEP_RATIO=0.375`（标签取前 37.5%）而**部署 topk 保留 0.7365/0.875** —— 
+0.375–0.7365 段的 token 训练时标「丢」、推理时却保留，这是**监督/部署预算错配**。故：
+`teacher_keep` 对齐部署点（0.7365 / 0.875）+ 加 `SELECTOR_RANKING_LOSS_WEIGHT=0.5`
+（部署吃排序、BCE 只校准概率；仓库已有 `selector_pairwise_ranking_loss`）+
+`NUM_EPOCHS=2`（1 epoch 末 BCE 仍 0.22–1.04 抖动）。**已实测确认
+`load_yaml_config.py` 中 env 优先于 yaml**，因此无需改共享配置文件。两个加训臂
+**并行**（各 2 卡）把该阶段从 ~3.1 h 压到 ~1.6 h。
+
+**重测 5 臂（优先级=决策顺序）**：`retrain_joint_k1149`（对 `joint_k1149`/组合式/union 同 K 头对头）、
+`retrain_composed_k1149`（history + **future_v2**，隔离「重训 future 网是否改善组合式」）、
+`retrain_future_k682`、`retrain_joint_k989`、`retrain_future_k585`。若门控 PASS，
+重测队列检测到无 v2 checkpoint 会**直接退出、不耗 GPU**。
+
+**实测吞吐标定（修正）**：**0.269 s/场景（4 卡）** → 全量 7876 = **35.3 min/臂（4 卡）**、
+**70.6 min/臂（2 卡）**。
+
+**结果尚未产生，本条不含任何 PDM 结论。**
+
