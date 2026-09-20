@@ -50,6 +50,7 @@ class HistoryGuidedFutureSelector(TokenSelector):
         self,
         thresholds: Sequence[float],
         future_mapping: str = "same_latent",
+        future_keep_ratio: float | None = None,
         require_num_history_latents: int = 2,
         require_num_future_latents: int = 2,
     ):
@@ -69,6 +70,13 @@ class HistoryGuidedFutureSelector(TokenSelector):
                 f"future_mapping must be one of {sorted(_FUTURE_MAPPINGS)}, got {future_mapping!r}"
             )
         self.future_mapping = mapping
+        self.future_keep_ratio = (
+            None if future_keep_ratio is None else float(future_keep_ratio)
+        )
+        if self.future_keep_ratio is not None and not (
+            0.0 < self.future_keep_ratio <= 1.0
+        ):
+            raise ValueError("future_keep_ratio must be within (0, 1] or None")
 
     def _latent_masks(self, domain, ctx, latent_indices, device):
         candidate = domain.candidate_indices.to(device)
@@ -84,10 +92,13 @@ class HistoryGuidedFutureSelector(TokenSelector):
             masks.append(mask)
         return masks
 
-    def _future_masks(self, history_masks, device):
-        stacked = torch.stack(history_masks, dim=0)
+    def _map_history_values(self, history_values, device):
+        """Map a list of per-history-latent tensors to future latents."""
+
+        stacked = torch.stack(history_values, dim=0)
         num_history = int(stacked.shape[0])
         num_future = int(self.require_num_future_latents)
+        is_bool = stacked.dtype == torch.bool
         future = []
         for future_index in range(num_future):
             if self.future_mapping == "same_latent":
@@ -101,12 +112,19 @@ class HistoryGuidedFutureSelector(TokenSelector):
             elif self.future_mapping == "oldest_history":
                 future.append(stacked[0])
             elif self.future_mapping == "union_history":
-                future.append(stacked.any(dim=0))
+                future.append(
+                    stacked.any(dim=0) if is_bool else stacked.max(dim=0).values
+                )
             elif self.future_mapping == "intersection_history":
-                future.append(stacked.all(dim=0))
+                future.append(
+                    stacked.all(dim=0) if is_bool else stacked.min(dim=0).values
+                )
             elif self.future_mapping == "majority_history":
-                majority = (num_history + 1) // 2
-                future.append(stacked.sum(dim=0) >= majority)
+                if is_bool:
+                    majority = (num_history + 1) // 2
+                    future.append(stacked.sum(dim=0) >= majority)
+                else:
+                    future.append(stacked.mean(dim=0))
             else:  # pragma: no cover - constructor validates.
                 raise RuntimeError(f"unsupported future_mapping {self.future_mapping!r}")
         return future
@@ -149,10 +167,33 @@ class HistoryGuidedFutureSelector(TokenSelector):
             domain, ctx, future_indices, device
         )
 
-        history_latent_keep = []
-        for threshold, mask in zip(self.thresholds, history_candidate_masks):
-            history_latent_keep.append(scores[:, mask] >= float(threshold))
-        future_latent_keep = self._future_masks(history_latent_keep, device)
+        history_latent_scores = [scores[:, mask] for mask in history_candidate_masks]
+        history_latent_keep = [
+            values >= float(threshold)
+            for values, threshold in zip(history_latent_scores, self.thresholds)
+        ]
+        future_latent_keep = self._map_history_values(history_latent_keep, device)
+        future_keep_cap = None
+        if self.future_keep_ratio is not None:
+            future_keep_cap = max(
+                1, int(round(int(ctx.layout.tokens_per_latent) * self.future_keep_ratio))
+            )
+            priorities = self._map_history_values(history_latent_scores, device)
+            capped = []
+            for keep, priority in zip(future_latent_keep, priorities):
+                keep = keep.clone()
+                for batch_index in range(ctx.batch_size):
+                    selected = keep[batch_index].nonzero(as_tuple=False).flatten()
+                    if selected.numel() <= future_keep_cap:
+                        continue
+                    local_priority = priority[batch_index, selected]
+                    local_order = torch.argsort(
+                        local_priority, descending=True, stable=True
+                    )
+                    keep[batch_index] = False
+                    keep[batch_index, selected[local_order[:future_keep_cap]]] = True
+                capped.append(keep)
+            future_latent_keep = capped
 
         keep_candidate = torch.zeros(
             (ctx.batch_size, domain.n_candidate), dtype=torch.bool, device=device
@@ -205,6 +246,8 @@ class HistoryGuidedFutureSelector(TokenSelector):
                 "dynamic": True,
                 "history_thresholds_oldest_to_newest": list(self.thresholds),
                 "future_mapping": self.future_mapping,
+                "future_keep_ratio": self.future_keep_ratio,
+                "future_keep_cap_per_latent": future_keep_cap,
                 "proposed_K_per_batch": proposed.detach().cpu().tolist(),
                 "proposed_K_per_history_latent": history_counts.detach().cpu().tolist(),
                 "proposed_K_per_future_latent": future_counts.detach().cpu().tolist(),
@@ -220,6 +263,7 @@ class HistoryGuidedFutureSelector(TokenSelector):
             "name": self.name,
             "thresholds": list(self.thresholds),
             "future_mapping": self.future_mapping,
+            "future_keep_ratio": self.future_keep_ratio,
             "latent_order": "history oldest_to_newest; future near_to_far",
             "require_num_history_latents": self.require_num_history_latents,
             "require_num_future_latents": self.require_num_future_latents,

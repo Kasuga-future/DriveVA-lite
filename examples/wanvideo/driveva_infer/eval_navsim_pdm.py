@@ -277,6 +277,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         help="Compute nuScenes-style L2 (m) and Collision (%%) metrics at requested horizons.",
     )
     parser.add_argument(
+        "--dump_target_trajectories",
+        action="store_true",
+        help="Save the per-scene ground-truth target trajectory for offline planning-harm analysis.",
+    )
+    parser.add_argument(
         "--nuscenes_metric_horizons_s",
         type=str,
         default="1,2,3",
@@ -2094,7 +2099,11 @@ def run_eval(args: argparse.Namespace, external_pipe: Optional[WanVideoPipeline]
         normalize="[-1,1]",
         view_mode="surround6" if args.surround_view else "front",
     )
-    need_future_targets = bool(args.save_viz) or bool(args.enable_nuscenes_metrics)
+    need_future_targets = (
+        bool(args.save_viz)
+        or bool(args.enable_nuscenes_metrics)
+        or bool(getattr(args, "dump_target_trajectories", False))
+    )
     target_builder = None
     viz_dir = None
     if need_future_targets:
@@ -2245,6 +2254,10 @@ def run_eval(args: argparse.Namespace, external_pipe: Optional[WanVideoPipeline]
                 targets = target_builder.compute_targets(scene)
                 gt_traj = np.asarray(targets["trajectory"], dtype=np.float32)
                 gt_traj = _safe_traj_np(gt_traj, scene_filter.num_future_frames)
+                if bool(getattr(args, "dump_target_trajectories", False)):
+                    target_dir = Path(args.output_dir) / "target_trajectories"
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    np.save(target_dir / f"{token}.npy", gt_traj)
                 if bool(args.save_viz):
                     future_frames = targets.get("future_image_paths") or targets.get("future_frames")
                     if future_frames is None:

@@ -526,6 +526,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--persistent-random-seed",
+        type=int,
+        default=None,
+        help=(
+            "explicit random scorer seed for --persistent-scorer random; "
+            "defaults to round_seed+101"
+        ),
+    )
+    parser.add_argument(
         "--persistent-future-position-mode",
         choices=("storage", "history_compatible"),
         default="storage",
@@ -639,6 +648,53 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--future-counterfactual-tile-matrix",
+        action="store_true",
+        help=(
+            "run physical leave-one-tile-out future counterfactuals: one method "
+            "per future latent and deterministic tile, plus the NoPress baseline"
+        ),
+    )
+    parser.add_argument(
+        "--future-counterfactual-layer",
+        type=int,
+        default=15,
+        help="source/compression layer for future counterfactual tile matrix",
+    )
+    parser.add_argument(
+        "--future-counterfactual-tile-h",
+        type=int,
+        default=3,
+        help="normalized future tile grid height",
+    )
+    parser.add_argument(
+        "--future-counterfactual-tile-w",
+        type=int,
+        default=4,
+        help="normalized future tile grid width",
+    )
+    parser.add_argument(
+        "--future-oracle-mask-json",
+        type=Path,
+        default=None,
+        help="precomputed per-scene oracle future tile mask JSON",
+    )
+    parser.add_argument(
+        "--future-oracle-token-mask-json",
+        type=Path,
+        default=None,
+        help="precomputed per-scene token-level future oracle mask JSON",
+    )
+    parser.add_argument(
+        "--future-oracle-token-mask-jsons",
+        default=None,
+        help=(
+            "comma-separated token-level future oracle mask JSONs; one physical "
+            "method is built per file so a set-level oracle search can evaluate "
+            "a whole candidate batch in a single runner invocation"
+        ),
+    )
+    parser.add_argument(
         "--history-guided-future-mapping",
         choices=(
             "same_latent",
@@ -666,6 +722,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=None,
         help="optional learned feature-read layer for history-guided compression",
+    )
+    parser.add_argument(
+        "--history-guided-future-keep-ratio",
+        type=float,
+        default=None,
+        help=(
+            "optional per-future-latent keep cap for history-guided compression; "
+            "positions inside the mapped history mask are ranked by history score"
+        ),
     )
     parser.add_argument(
         "--history-guided-thresholds",
@@ -704,6 +769,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "write one .npz per evaluated scene into <method_dir>/trajectories/ "
             "containing the raw ego-relative predicted trajectory (float32, metres) "
             "returned by the diffusion planner; used for best-of-N oracle analysis"
+        ),
+    )
+    parser.add_argument(
+        "--dump-target-trajectories",
+        action="store_true",
+        help=(
+            "write one .npy per evaluated scene into <output_dir>/target_trajectories/ "
+            "containing the ground-truth target trajectory used for planning-harm "
+            "analysis; enables the target builder automatically"
         ),
     )
     parser.add_argument(
@@ -857,6 +931,103 @@ def _pre_dit_learned_specs(args, round_seed, pre_dit_spec, baseline) -> list[dic
             domain=domain,
         ),
     ]
+
+
+def _mask_method_tag(path: Path) -> str:
+    """Filesystem-stable, method-name-safe tag for a token-mask JSON file."""
+
+    cleaned = []
+    for char in path.stem.lower():
+        cleaned.append(char if char.isalnum() else "_")
+    tag = "".join(cleaned).strip("_")
+    while "__" in tag:
+        tag = tag.replace("__", "_")
+    return tag or "mask"
+
+
+def _future_oracle_token_mask_paths(args: argparse.Namespace) -> list[Path]:
+    """Resolve single + comma-separated token-mask JSON paths, order preserved."""
+
+    raw: list[str] = []
+    single = getattr(args, "future_oracle_token_mask_json", None)
+    if single is not None:
+        raw.append(str(single))
+    batch = getattr(args, "future_oracle_token_mask_jsons", None)
+    if batch:
+        raw.extend(str(batch).split(","))
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for value in raw:
+        value = value.strip()
+        if not value:
+            continue
+        path = Path(value).expanduser().resolve()
+        if str(path) in seen:
+            continue
+        seen.add(str(path))
+        paths.append(path)
+    return paths
+
+
+def _future_token_mask_specs(
+    args: argparse.Namespace,
+    paths: list[Path],
+    round_seed: int,
+) -> list[dict[str, Any]]:
+    """One physical method per token-mask JSON, sharing the tile-oracle press.
+
+    The press is byte-identical to the tile oracle arm except for the selector,
+    so a set-level search is compared against the tile oracle under the same
+    injection point, layer, operator and ``hidden_sequence`` persistence.
+    """
+
+    layer = int(getattr(args, "future_counterfactual_layer", 15))
+    if layer < 0 or layer >= 30:
+        raise ValueError("--future-counterfactual-layer must be within [0, 29]")
+    baseline = next(
+        spec
+        for spec in method_specs(round_seed, domain="future_video")
+        if spec["name"] == "physical_no_press"
+    )
+    specs = [] if getattr(args, "persistent_skip_baseline", False) else [baseline]
+    used_tags: dict[str, int] = {}
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(f"token oracle mask JSON not found: {path}")
+        tag = _mask_method_tag(path)
+        if tag in used_tags:
+            used_tags[tag] += 1
+            tag = f"{tag}_{used_tags[tag]}"
+        else:
+            used_tags[tag] = 0
+        press = {
+            "name": "scorer_press",
+            "injection_point": "self_attn_kv",
+            "domain": "future_video",
+            "scorer": {"name": "random", "seed": 0, "scope": "scene", "layer": layer},
+            "selector": {
+                "name": "oracle_future_token_mask",
+                "path": str(path),
+            },
+            "operator": {"name": "kv_prune"},
+            "budget": {"type": "ratio", "value": 1.0, "reference": "eligible"},
+            "cross_layer_persistence": {
+                "enabled": True,
+                "end_layer": None,
+                "mode": "hidden_sequence",
+            },
+        }
+        specs.append(
+            {
+                "name": (
+                    f"physical_oracle_future_token_mask_{tag}"
+                    f"_hidden_persistent_layer_{layer:02d}"
+                ),
+                "mode": "physical",
+                "press": press,
+            }
+        )
+    return specs
 
 
 def _method_specs_for_run(args: argparse.Namespace, round_seed: int) -> list[dict[str, Any]]:
@@ -1161,6 +1332,18 @@ def _method_specs_for_run(args: argparse.Namespace, round_seed: int) -> list[dic
             "physical_history_guided_future_"
             f"{str(guided_mapping).lower()}_hidden_persistent_layer_{layer:02d}"
         )
+        guided_selector_config = {
+            "name": "history_guided_future",
+            "thresholds": thresholds,
+            "future_mapping": str(guided_mapping).lower(),
+        }
+        guided_future_keep_ratio = getattr(
+            args, "history_guided_future_keep_ratio", None
+        )
+        if guided_future_keep_ratio is not None:
+            guided_selector_config["future_keep_ratio"] = float(
+                guided_future_keep_ratio
+            )
         press = {
             "name": "scorer_press",
             "injection_point": "self_attn_kv",
@@ -1172,11 +1355,7 @@ def _method_specs_for_run(args: argparse.Namespace, round_seed: int) -> list[dic
                 "checkpoint": str(Path(learned_checkpoint).expanduser().resolve()),
                 "all_video_history_only": True,
             },
-            "selector": {
-                "name": "history_guided_future",
-                "thresholds": thresholds,
-                "future_mapping": str(guided_mapping).lower(),
-            },
+            "selector": guided_selector_config,
             "operator": {"name": "kv_prune"},
             "budget": {"type": "ratio", "value": 1.0, "reference": "eligible"},
             "cross_layer_persistence": {
@@ -1187,6 +1366,110 @@ def _method_specs_for_run(args: argparse.Namespace, round_seed: int) -> list[dic
         }
         specs = [] if getattr(args, "persistent_skip_baseline", False) else [baseline]
         specs.append({"name": guided_name, "mode": "physical", "press": press})
+        return specs
+
+    if bool(getattr(args, "future_counterfactual_tile_matrix", False)):
+        if getattr(args, "methods", None):
+            raise ValueError(
+                "--future-counterfactual-tile-matrix cannot be combined with --methods"
+            )
+        layer = int(getattr(args, "future_counterfactual_layer", 15))
+        if layer < 0 or layer >= 30:
+            raise ValueError("--future-counterfactual-layer must be within [0, 29]")
+        tile_h = int(getattr(args, "future_counterfactual_tile_h", 3))
+        tile_w = int(getattr(args, "future_counterfactual_tile_w", 4))
+        if tile_h <= 0 or tile_w <= 0:
+            raise ValueError("future counterfactual tile grid must be positive")
+        baseline = next(
+            spec
+            for spec in method_specs(round_seed, domain="future_video")
+            if spec["name"] == "physical_no_press"
+        )
+        specs = [] if getattr(args, "persistent_skip_baseline", False) else [baseline]
+        common_press = {
+            "name": "scorer_press",
+            "injection_point": "self_attn_kv",
+            "domain": "future_video",
+            "scorer": {"name": "random", "seed": 0, "scope": "scene", "layer": layer},
+            "operator": {"name": "kv_prune"},
+            "budget": {"type": "ratio", "value": 1.0, "reference": "eligible"},
+            "cross_layer_persistence": {
+                "enabled": True,
+                "end_layer": None,
+                "mode": "hidden_sequence",
+            },
+        }
+        for latent_index in range(2):
+            for tile_id in range(tile_h * tile_w):
+                press = dict(common_press)
+                press["selector"] = {
+                    "name": "future_fixed_tiles",
+                    "latent_index": latent_index,
+                    "drop_tiles": [tile_id],
+                    "tile_h": tile_h,
+                    "tile_w": tile_w,
+                }
+                specs.append(
+                    {
+                        "name": (
+                            f"physical_future_latent{latent_index}_"
+                            f"drop_tile{tile_id:02d}_hidden_persistent_layer_{layer:02d}"
+                        ),
+                        "mode": "physical",
+                        "press": press,
+                    }
+                )
+        return specs
+
+    token_mask_paths = _future_oracle_token_mask_paths(args)
+    if token_mask_paths:
+        if getattr(args, "methods", None):
+            raise ValueError(
+                "--future-oracle-token-mask-jsons cannot be combined with --methods"
+            )
+        return _future_token_mask_specs(args, token_mask_paths, round_seed)
+
+    if getattr(args, "future_oracle_mask_json", None) is not None:
+        oracle_json = Path(args.future_oracle_mask_json).expanduser().resolve()
+        if not oracle_json.is_file():
+            raise FileNotFoundError(f"oracle mask JSON not found: {oracle_json}")
+        layer = int(getattr(args, "future_counterfactual_layer", 15))
+        if layer < 0 or layer >= 30:
+            raise ValueError("--future-counterfactual-layer must be within [0, 29]")
+        tile_h = int(getattr(args, "future_counterfactual_tile_h", 3))
+        tile_w = int(getattr(args, "future_counterfactual_tile_w", 4))
+        baseline = next(
+            spec
+            for spec in method_specs(round_seed, domain="future_video")
+            if spec["name"] == "physical_no_press"
+        )
+        press = {
+            "name": "scorer_press",
+            "injection_point": "self_attn_kv",
+            "domain": "future_video",
+            "scorer": {"name": "random", "seed": 0, "scope": "scene", "layer": layer},
+            "selector": {
+                "name": "oracle_future_mask",
+                "path": str(oracle_json),
+                "tile_h": tile_h,
+                "tile_w": tile_w,
+            },
+            "operator": {"name": "kv_prune"},
+            "budget": {"type": "ratio", "value": 1.0, "reference": "eligible"},
+            "cross_layer_persistence": {
+                "enabled": True,
+                "end_layer": None,
+                "mode": "hidden_sequence",
+            },
+        }
+        specs = [] if getattr(args, "persistent_skip_baseline", False) else [baseline]
+        specs.append(
+            {
+                "name": f"physical_oracle_future_mask_hidden_persistent_layer_{layer:02d}",
+                "mode": "physical",
+                "press": press,
+            }
+        )
         return specs
 
     c4_checkpoint = getattr(args, "c4_replica_triad_checkpoint", None)
@@ -1657,9 +1940,12 @@ def _method_specs_for_run(args: argparse.Namespace, round_seed: int) -> list[dic
         )
     scorer_options: dict[str, Any] = {}
     if scorer_name == "random":
+        explicit_random_seed = getattr(args, "persistent_random_seed", None)
         scorer_options.update(
             {
-                "seed": int(round_seed) + 101,
+                "seed": int(round_seed) + 101
+                if explicit_random_seed is None
+                else int(explicit_random_seed),
                 "scope": "scene",
             }
         )
@@ -2981,6 +3267,8 @@ def _official_args(args: argparse.Namespace, output_dir: Path, official_eval) ->
             "--viz_max_tokens",
             str(args.viz_max_tokens),
         ])
+    if bool(getattr(args, "dump_target_trajectories", False)):
+        argv.append("--dump_target_trajectories")
     if args.enable_nuscenes_metrics:
         argv.append("--enable_nuscenes_metrics")
     official_args = official_eval.parse_args(argv)
@@ -3243,6 +3531,9 @@ def method_config_dict(
             "sample_seed_override": args.sample_seed,
         },
         "dump_trajectories": bool(args.dump_trajectories),
+        "dump_target_trajectories": bool(
+            getattr(args, "dump_target_trajectories", False)
+        ),
         # Scope flags that change WHAT was evaluated, persisted so a run is
         # self-describing.  Without these a `--max-eval-tokens 4` smoke run is
         # indistinguishable from a full-protocol run in every artifact: it still
@@ -3457,6 +3748,9 @@ def run(args: argparse.Namespace) -> int:
         "sample_seed_override": args.sample_seed,
         "seed_base": int(args.seed_base),
         "dump_trajectories": bool(args.dump_trajectories),
+        "dump_target_trajectories": bool(
+            getattr(args, "dump_target_trajectories", False)
+        ),
         "retention_policy": args.retention_policy,
         "persistent_layer_sweep": (
             parse_layer_sweep(args.persistent_layer_sweep)

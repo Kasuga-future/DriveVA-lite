@@ -1,4 +1,5 @@
 from dataclasses import replace
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -44,6 +45,8 @@ from videopress.selectors import (
     AdaptiveSpatialMassSelector,
     FutureQuotaSelector,
     FutureThresholdSelector,
+    OracleFutureMaskSelector,
+    FutureFixedTileSelector,
     HistoryGuidedFutureSelector,
     HistoryQuotaSelector,
     HistoryThresholdSelector,
@@ -246,6 +249,59 @@ def test_future_quota_enforces_independent_per_latent_counts():
         FutureQuotaSelector([0.5, 0.25]).select(scores, domain, K=4, ctx=ctx)
 
 
+def test_future_fixed_tiles_keeps_all_but_one_tile():
+    layout = build_driveva_layout(4, 15, 26, 2, 2, 1)
+    domain = build_domain("future_video", layout, "cpu")
+    ctx = TokenContext(
+        tokens=torch.zeros(1, layout.total_length, 1), layout=layout, domain=domain
+    )
+    result = FutureFixedTileSelector(
+        latent_index=0, drop_tiles=[0], tile_h=3, tile_w=4
+    ).select(torch.zeros(1, domain.n_candidate), domain, K=None, ctx=ctx)
+    assert result.K == domain.n_candidate - 35
+    # Every dropped global index is outside the selection.
+    frame = layout.frame_range(2)
+    dropped = {
+        frame.start + int(index)
+        for index in _tile_membership_for_test(15, 26, 3, 4, 0).tolist()
+    }
+    assert dropped.isdisjoint(set(result.keep_global_indices[0].tolist()))
+
+
+def test_oracle_future_mask_reads_scene_json(tmp_path):
+    layout = build_driveva_layout(4, 15, 26, 2, 2, 1)
+    domain = build_domain("future_video", layout, "cpu")
+    mask_path = tmp_path / "oracle.json"
+    mask_path.write_text(
+        json.dumps(
+            {
+                "scene-A": {
+                    "future_latent_0": [0, 1],
+                    "future_latent_1": [2, 3],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    ctx = TokenContext(
+        tokens=torch.zeros(1, layout.total_length, 1),
+        layout=layout,
+        domain=domain,
+        scene_token="scene-A",
+    )
+    result = OracleFutureMaskSelector(
+        str(mask_path), tile_h=3, tile_w=4
+    ).select(torch.zeros(1, domain.n_candidate), domain, K=None, ctx=ctx)
+    assert result.K > 0
+    assert result.K <= domain.n_candidate
+
+
+def _tile_membership_for_test(h, w, th, tw, tile_id):
+    from videopress.selectors.future_oracle import _tile_membership
+
+    return _tile_membership(h, w, th, tw, tile_id)
+
+
 def test_history_guided_future_copies_same_latent_positions():
     layout = build_driveva_layout(4, 2, 2, 2, 3, 1)
     domain = build_domain("all_video", layout, "cpu")
@@ -264,6 +320,22 @@ def test_history_guided_future_copies_same_latent_positions():
     assert result.metadata["future_mapping"] == "same_latent"
     assert result.metadata["proposed_K_per_history_latent"] == [[2, 2]]
     assert result.metadata["proposed_K_per_future_latent"] == [[2, 2]]
+
+
+def test_history_guided_future_keep_ratio_caps_mapped_positions():
+    layout = build_driveva_layout(4, 2, 2, 2, 3, 1)
+    domain = build_domain("all_video", layout, "cpu")
+    ctx = TokenContext(
+        tokens=torch.zeros(1, layout.total_length, 1), layout=layout, domain=domain
+    )
+    history_scores = torch.tensor([[0.9, 0.8, 0.7, 0.6, 0.9, 0.8, 0.7, 0.6]])
+    scores = torch.cat([history_scores, torch.zeros(1, 8)], dim=1)
+    result = HistoryGuidedFutureSelector(
+        [0.5, 0.5], future_mapping="same_latent", future_keep_ratio=0.5
+    ).select(scores, domain, K=None, ctx=ctx)
+    # Per future latent 4 positions map from history, cap 2 keeps highest scores.
+    assert result.metadata["proposed_K_per_future_latent"] == [[2, 2]]
+    assert result.metadata["future_keep_ratio"] == 0.5
 
 
 def test_history_guided_future_supports_union_and_intersection():
@@ -1380,6 +1452,51 @@ def test_history_guided_future_method_builder(tmp_path):
         "end_layer": None,
         "mode": "hidden_sequence",
     }
+
+
+def test_future_counterfactual_tile_matrix_builder():
+    args = SimpleNamespace(
+        future_counterfactual_tile_matrix=True,
+        future_counterfactual_layer=15,
+        future_counterfactual_tile_h=3,
+        future_counterfactual_tile_w=4,
+        persistent_skip_baseline=False,
+        methods=None,
+        retention_policy=None,
+        domain="future_video",
+    )
+    specs = _method_specs_for_run(args, round_seed=7)
+    assert len(specs) == 1 + 2 * 3 * 4
+    assert specs[0]["name"] == "physical_no_press"
+    first = specs[1]
+    assert first["name"] == "physical_future_latent0_drop_tile00_hidden_persistent_layer_15"
+    assert first["press"]["selector"] == {
+        "name": "future_fixed_tiles",
+        "latent_index": 0,
+        "drop_tiles": [0],
+        "tile_h": 3,
+        "tile_w": 4,
+    }
+
+
+def test_future_oracle_mask_builder(tmp_path):
+    mask_path = tmp_path / "mask.json"
+    mask_path.write_text("{}", encoding="utf-8")
+    args = SimpleNamespace(
+        future_oracle_mask_json=mask_path,
+        future_counterfactual_layer=15,
+        future_counterfactual_tile_h=3,
+        future_counterfactual_tile_w=4,
+        persistent_skip_baseline=True,
+        methods=None,
+        retention_policy=None,
+        domain="future_video",
+    )
+    specs = _method_specs_for_run(args, round_seed=7)
+    assert [spec["name"] for spec in specs] == [
+        "physical_oracle_future_mask_hidden_persistent_layer_15"
+    ]
+    assert specs[0]["press"]["selector"]["name"] == "oracle_future_mask"
 
 
 def test_future_retention_policy_is_rejected_by_method_builder(tmp_path):
