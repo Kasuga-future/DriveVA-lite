@@ -499,10 +499,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "action_attention_vnorm_temporal",
             "action_contribution_stability",
             "learned_planning_selector",
+            "composed_learned_planning_selector",
             "random",
         ),
         default="action_attention_vnorm",
         help="source-layer importance scorer used by persistent sweeps",
+    )
+    parser.add_argument(
+        "--persistent-history-selector-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "with --persistent-scorer composed_learned_planning_selector: the "
+            "history-trained checkpoint scoring the history block"
+        ),
+    )
+    parser.add_argument(
+        "--persistent-future-selector-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "with --persistent-scorer composed_learned_planning_selector: the "
+            "future-trained (F3) checkpoint scoring the future block"
+        ),
     )
     parser.add_argument(
         "--persistent-learned-checkpoint",
@@ -1954,10 +1973,13 @@ def _method_specs_for_run(args: argparse.Namespace, round_seed: int) -> list[dic
     feature_layer = getattr(args, "persistent_feature_layer", None)
     if feature_layer is not None:
         feature_layer = int(feature_layer)
-        if scorer_name != "learned_planning_selector":
+        if scorer_name not in {
+            "learned_planning_selector",
+            "composed_learned_planning_selector",
+        }:
             raise ValueError(
                 "--persistent-feature-layer requires --persistent-scorer "
-                "learned_planning_selector"
+                "learned_planning_selector or composed_learned_planning_selector"
             )
         if feature_layer < 0 or feature_layer >= 30:
             raise ValueError("--persistent-feature-layer must be within [0, 29]")
@@ -1984,6 +2006,39 @@ def _method_specs_for_run(args: argparse.Namespace, round_seed: int) -> list[dic
             scorer_options["future_position_mode"] = str(
                 getattr(args, "persistent_future_position_mode", "storage")
             )
+    if scorer_name == "composed_learned_planning_selector":
+        # Compositional arm: two trained selectors, one press over all_video.
+        # History candidates go to the history network, future candidates to the
+        # future (F3) network, each on the domain view it was trained on.
+        if not str(getattr(args, "domain", "")).startswith(
+            ("all_video", "video")
+        ):
+            raise ValueError(
+                "--persistent-scorer composed_learned_planning_selector requires "
+                "--domain all_video (it routes history and future candidates to "
+                "two different networks)"
+            )
+        history_checkpoint = getattr(
+            args, "persistent_history_selector_checkpoint", None
+        )
+        future_checkpoint = getattr(
+            args, "persistent_future_selector_checkpoint", None
+        )
+        if history_checkpoint is None or future_checkpoint is None:
+            raise ValueError(
+                "--persistent-scorer composed_learned_planning_selector requires "
+                "both --persistent-history-selector-checkpoint and "
+                "--persistent-future-selector-checkpoint"
+            )
+        scorer_options["history_checkpoint"] = str(
+            Path(history_checkpoint).expanduser().resolve()
+        )
+        scorer_options["future_checkpoint"] = str(
+            Path(future_checkpoint).expanduser().resolve()
+        )
+        scorer_options["future_position_mode"] = str(
+            getattr(args, "persistent_future_position_mode", "storage")
+        )
     if scorer_name == "action_contribution_stability":
         observation_start = getattr(
             args, "contribution_observation_start_layer", None

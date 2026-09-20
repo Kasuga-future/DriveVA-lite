@@ -13,7 +13,11 @@ from .planning_gradient import (
     original_gradient_input_reduction,
     trajectory_projection_objective,
 )
-from .learned_selector import DynamicTokenSelector, LearnedPlanningSelectorScorer
+from .learned_selector import (
+    ComposedLearnedPlanningSelectorScorer,
+    DynamicTokenSelector,
+    LearnedPlanningSelectorScorer,
+)
 
 __all__ = [
     "ActionAttentionScorer",
@@ -23,6 +27,7 @@ __all__ = [
     "GradientInputScorer",
     "GradientNormScorer",
     "PlanningGradientInputScorer",
+    "ComposedLearnedPlanningSelectorScorer",
     "DynamicTokenSelector",
     "LearnedPlanningSelectorScorer",
     "RandomScorer",

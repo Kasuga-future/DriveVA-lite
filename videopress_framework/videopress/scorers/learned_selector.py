@@ -138,6 +138,197 @@ def _load_selector_state(path: Path) -> dict[str, torch.Tensor]:
     return normalized
 
 
+@register_scorer("composed_learned_planning_selector")
+class ComposedLearnedPlanningSelectorScorer(TokenScorer):
+    """Compositional history+future press driven by TWO trained selectors.
+
+    The joint ``learned_planning_selector`` scores all 1560 video candidates with
+    one network trained on the union.  This scorer instead keeps the two blocks
+    separate and routes each candidate to the network that was trained for it:
+
+    * history candidates -> the history-trained checkpoint, evaluated on a
+      ``history`` domain view so the temporal coordinate stays the history
+      storage index (``t = 0, 1``) it was trained with;
+    * future candidates -> the future-trained (F3) checkpoint, evaluated on a
+      ``future_video`` domain view so the temporal coordinate is the future
+      storage index (``t = 2, 3``).
+
+    Both blocks are therefore compressed *simultaneously by one press over
+    ``all_video``* while each network sees exactly the coordinate convention and
+    candidate set it saw during training.  Neither sub-network ever sees the
+    other block, which is the whole point of the compositional arm.
+
+    This is the "history+future 组合式同时压缩" variant requested on
+    2026-09-21; it is not a trained artefact -- it composes two existing
+    checkpoints at inference time.
+    """
+
+    name = "composed_learned_planning_selector"
+    uses_pre_block_hidden = True
+
+    def __init__(
+        self,
+        history_checkpoint: str,
+        future_checkpoint: str,
+        layer: int = 15,
+        feature_layer: int | None = None,
+        token_dim: int = 3072,
+        action_mode: str | None = None,
+        feature_mode: str = "all",
+        future_position_mode: str = "storage",
+    ):
+        self.history_checkpoint = str(
+            Path(history_checkpoint).expanduser().resolve()
+        )
+        self.future_checkpoint = str(Path(future_checkpoint).expanduser().resolve())
+        self.layer = int(layer)
+        self.feature_layer = self.layer if feature_layer is None else int(feature_layer)
+        if self.feature_layer > self.layer:
+            raise ValueError(
+                "composed selector feature_layer cannot follow its compression layer"
+            )
+        self.action_mode = action_mode
+        self.feature_mode = str(feature_mode)
+        self.future_position_mode = str(future_position_mode).strip().lower()
+        self.history_scorer = LearnedPlanningSelectorScorer(
+            self.history_checkpoint,
+            layer=self.layer,
+            feature_layer=self.feature_layer,
+            token_dim=int(token_dim),
+            action_mode=action_mode,
+            feature_mode=self.feature_mode,
+            future_position_mode=self.future_position_mode,
+        )
+        self.future_scorer = LearnedPlanningSelectorScorer(
+            self.future_checkpoint,
+            layer=self.layer,
+            feature_layer=self.feature_layer,
+            token_dim=int(token_dim),
+            action_mode=action_mode,
+            feature_mode=self.feature_mode,
+            future_position_mode=self.future_position_mode,
+        )
+
+    # -- plumbing -----------------------------------------------------------
+    def reset_observations(self) -> None:
+        self.history_scorer.reset_observations()
+        self.future_scorer.reset_observations()
+
+    def observation_layers(self) -> tuple[int, ...]:
+        return self.history_scorer.observation_layers()
+
+    def _sub_contexts(self, ctx):
+        """Domain-restricted views of ``ctx`` for each trained sub-network."""
+
+        if ctx.domain.name not in {"all_video", "video"}:
+            raise ValueError(
+                "composed learned selector requires an all_video/video domain, "
+                f"got {ctx.domain.name!r}"
+            )
+        history_ctx = replace(
+            ctx,
+            domain=build_domain("history", ctx.layout, ctx.tokens.device),
+            metadata=dict(ctx.metadata),
+        )
+        future_ctx = replace(
+            ctx,
+            domain=build_domain("future_video", ctx.layout, ctx.tokens.device),
+            metadata=dict(ctx.metadata),
+        )
+        return history_ctx, future_ctx
+
+    @torch.no_grad()
+    def observe(self, ctx) -> None:
+        history_ctx, future_ctx = self._sub_contexts(ctx)
+        self.history_scorer.observe(history_ctx)
+        self.future_scorer.observe(future_ctx)
+
+    @torch.no_grad()
+    def score(self, ctx):
+        history_ctx, future_ctx = self._sub_contexts(ctx)
+        history_scores = self.history_scorer.score(history_ctx)
+        future_scores = self.future_scorer.score(future_ctx)
+
+        candidates = ctx.domain.candidate_indices
+        history_span = ctx.layout.history_video
+        future_span = ctx.layout.future_video
+        in_history = (candidates >= int(history_span.start)) & (
+            candidates < int(history_span.end)
+        )
+        in_future = (candidates >= int(future_span.start)) & (
+            candidates < int(future_span.end)
+        )
+        if int(in_history.sum()) != int(history_span.length):
+            raise ValueError(
+                "composed selector could not map every history candidate: "
+                f"{int(in_history.sum())} of {int(history_span.length)}"
+            )
+        if int(in_future.sum()) != int(future_span.length):
+            raise ValueError(
+                "composed selector could not map every future candidate: "
+                f"{int(in_future.sum())} of {int(future_span.length)}"
+            )
+        if int((in_history | in_future).sum()) != int(candidates.numel()):
+            raise ValueError(
+                "composed selector requires the candidate domain to cover exactly "
+                "the history and future video blocks"
+            )
+        if history_scores.shape[-1] != int(in_history.sum()) or (
+            future_scores.shape[-1] != int(in_future.sum())
+        ):
+            raise ValueError(
+                "composed selector sub-scores do not match the block sizes: "
+                f"{tuple(history_scores.shape)} / {tuple(future_scores.shape)}"
+            )
+
+        full = ctx.tokens.new_zeros(
+            (ctx.batch_size, int(candidates.numel())),
+            dtype=history_scores.dtype,
+        )
+        full[:, in_history] = history_scores.to(full.dtype)
+        full[:, in_future] = future_scores.to(full.dtype)
+        ctx.metadata["score_diagnostics"] = {
+            "composed": True,
+            "history_checkpoint": self.history_checkpoint,
+            "future_checkpoint": self.future_checkpoint,
+            "history_candidates": int(in_history.sum()),
+            "future_candidates": int(in_future.sum()),
+            "history_score_mean": float(history_scores.mean().item()),
+            "future_score_mean": float(future_scores.mean().item()),
+            "history_score_std": float(history_scores.std().item()),
+            "future_score_std": float(future_scores.std().item()),
+            "condition_source": "ego_velocity_and_prompt_command",
+            "diffusion_timestep": 0.0
+            if ctx.diffusion_rank is None
+            else float(ctx.diffusion_rank),
+            "feature_layer": self.feature_layer,
+            "compression_source_layer": self.layer,
+        }
+        return full
+
+    def describe(self) -> dict:
+        return {
+            **super().describe(),
+            "layer": self.layer,
+            "feature_layer": self.feature_layer,
+            "history_checkpoint": self.history_checkpoint,
+            "future_checkpoint": self.future_checkpoint,
+            "uses_pre_block_hidden": True,
+            "action_mode": self.action_mode,
+            "feature_mode": self.feature_mode,
+            "future_position_mode": self.future_position_mode,
+        }
+
+    def signature(self) -> str:
+        return (
+            f"composed_learned_planning_selector:layer={self.layer}"
+            f":feature_layer={self.feature_layer}"
+            f":history={self.history_checkpoint}"
+            f":future={self.future_checkpoint}"
+            f":future_position_mode={self.future_position_mode}"
+        )
+
+
 @register_scorer("learned_planning_selector")
 class LearnedPlanningSelectorScorer(TokenScorer):
     """Predict Gradient x Input planning utility without an online probe."""

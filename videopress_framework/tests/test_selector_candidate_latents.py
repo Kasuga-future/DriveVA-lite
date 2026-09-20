@@ -159,3 +159,224 @@ def _minimal_train_argv():
         "--output_path",
         "/tmp/out",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Deployment path for the F3 / joint checkpoints (2026-09-21)
+#
+# The plain (non ``all_video_history_only``) learned scorer had never been
+# scored on ``future_video`` or ``all_video``; only the history-only variant had
+# all_video coverage.  These are exactly the paths the F3 and joint evaluations
+# take, so pin them without needing a GPU.
+# ---------------------------------------------------------------------------
+
+
+def test_plain_learned_scorer_scores_future_and_joint_domains(tmp_path):
+    from safetensors.torch import save_file
+
+    from videopress.core.context import TokenContext
+    from videopress.training.online_selector import (
+        DynamicTokenSelector as TrainingSelector,
+    )
+
+    network = TrainingSelector(token_dim=8, hidden_dim=256, position_dim=64)
+    checkpoint = tmp_path / "selector.safetensors"
+    save_file(
+        {f"selector.{key}": value for key, value in network.state_dict().items()},
+        checkpoint,
+    )
+
+    layout = build_driveva_layout(
+        f=4, h=2, w=2, num_cond_latents=2, traj_len=2, traj_prefix_len=1
+    )
+    tokens = torch.randn(1, layout.total_length, 8)
+    per_latent = int(layout.tokens_per_latent)
+
+    scorer = LearnedPlanningSelectorScorer(
+        str(checkpoint), layer=15, token_dim=8, future_position_mode="storage"
+    )
+    for domain_name, expected_candidates, expected_t in (
+        ("future_video", 2 * per_latent, [2.0, 3.0]),
+        ("all_video", 4 * per_latent, [0.0, 1.0, 2.0, 3.0]),
+    ):
+        ctx = TokenContext(
+            tokens=tokens,
+            layout=layout,
+            domain=build_domain(domain_name, layout, "cpu"),
+            scene_token="scene-a",
+            diffusion_rank=1000,
+            metadata={
+                "selector_ego_state": [4.0, -0.2],
+                "selector_command": [0.0, 1.0, 0.0],
+            },
+        )
+        scores = scorer.score(ctx)
+        assert scores.shape == (1, expected_candidates)
+        assert torch.isfinite(scores).all()
+        assert ((scores > 0) & (scores < 1)).all()
+        assert "checkpoint" in ctx.metadata["score_diagnostics"]
+        positions = LearnedPlanningSelectorScorer._positions(ctx, torch.float32)
+        assert _expected_t(positions[0, :, 0], per_latent) == expected_t
+
+
+# ---------------------------------------------------------------------------
+# Compositional history+future selector (2026-09-21)
+#
+# "两个已训练 selector 的组合式同时压缩": one press over all_video, but each
+# candidate is scored by the network trained for its own block.  The load-bearing
+# property is exact fidelity -- the composed score vector must equal the history
+# network's scores on the history slots and the future network's scores on the
+# future slots, with no cross-contamination.
+# ---------------------------------------------------------------------------
+
+
+def _tiny_selector_checkpoint(tmp_path, name, seed):
+    from safetensors.torch import save_file
+
+    from videopress.training.online_selector import (
+        DynamicTokenSelector as TrainingSelector,
+    )
+
+    torch.manual_seed(seed)
+    network = TrainingSelector(token_dim=8, hidden_dim=256, position_dim=64)
+    path = tmp_path / name
+    save_file(
+        {f"selector.{key}": value for key, value in network.state_dict().items()},
+        path,
+    )
+    return str(path)
+
+
+def _block_masks(layout, candidates):
+    history_span = layout.history_video
+    future_span = layout.future_video
+    in_history = (candidates >= int(history_span.start)) & (
+        candidates < int(history_span.end)
+    )
+    in_future = (candidates >= int(future_span.start)) & (
+        candidates < int(future_span.end)
+    )
+    return in_history, in_future
+
+
+def test_composed_selector_is_exactly_its_two_component_networks(tmp_path):
+    from videopress.core.context import TokenContext
+    from videopress.scorers.learned_selector import (
+        ComposedLearnedPlanningSelectorScorer,
+        LearnedPlanningSelectorScorer,
+    )
+
+    history_ckpt = _tiny_selector_checkpoint(tmp_path, "history.safetensors", 11)
+    future_ckpt = _tiny_selector_checkpoint(tmp_path, "future.safetensors", 22)
+    layout = build_driveva_layout(
+        f=4, h=2, w=2, num_cond_latents=2, traj_len=2, traj_prefix_len=1
+    )
+    tokens = torch.randn(1, layout.total_length, 8)
+    conditions = {
+        "selector_ego_state": [4.0, -0.2],
+        "selector_command": [0.0, 1.0, 0.0],
+    }
+
+    def context(domain_name):
+        return TokenContext(
+            tokens=tokens,
+            layout=layout,
+            domain=build_domain(domain_name, layout, "cpu"),
+            scene_token="scene-a",
+            diffusion_rank=1000,
+            metadata=dict(conditions),
+        )
+
+    composed = ComposedLearnedPlanningSelectorScorer(
+        history_checkpoint=history_ckpt,
+        future_checkpoint=future_ckpt,
+        layer=15,
+        token_dim=8,
+    )
+    all_ctx = context("all_video")
+    scores = composed.score(all_ctx)
+    candidates = all_ctx.domain.candidate_indices
+    in_history, in_future = _block_masks(layout, candidates)
+
+    assert scores.shape == (1, int(candidates.numel()))
+    assert int(in_history.sum()) == int(layout.history_video.length)
+    assert int(in_future.sum()) == int(layout.future_video.length)
+    assert torch.isfinite(scores).all()
+    assert ((scores > 0) & (scores < 1)).all()
+
+    history_reference = LearnedPlanningSelectorScorer(
+        history_ckpt, layer=15, token_dim=8
+    ).score(context("history"))
+    future_reference = LearnedPlanningSelectorScorer(
+        future_ckpt, layer=15, token_dim=8
+    ).score(context("future_video"))
+
+    # Each block must be reproduced bit-for-bit by its own trained network.
+    torch.testing.assert_close(scores[:, in_history], history_reference)
+    torch.testing.assert_close(scores[:, in_future], future_reference)
+    # ... and the two networks must actually be different, otherwise the test
+    # above would pass even if one checkpoint were used for both blocks.
+    assert not torch.allclose(
+        history_reference[:, : min(history_reference.shape[1], future_reference.shape[1])],
+        future_reference[:, : min(history_reference.shape[1], future_reference.shape[1])],
+    )
+    diagnostics = all_ctx.metadata["score_diagnostics"]
+    assert diagnostics["composed"] is True
+    assert diagnostics["history_candidates"] == int(layout.history_video.length)
+    assert diagnostics["future_candidates"] == int(layout.future_video.length)
+
+
+def test_composed_selector_rejects_non_video_domains(tmp_path):
+    from videopress.core.context import TokenContext
+    from videopress.scorers.learned_selector import (
+        ComposedLearnedPlanningSelectorScorer,
+    )
+
+    history_ckpt = _tiny_selector_checkpoint(tmp_path, "h.safetensors", 1)
+    future_ckpt = _tiny_selector_checkpoint(tmp_path, "f.safetensors", 2)
+    layout = build_driveva_layout(
+        f=4, h=2, w=2, num_cond_latents=2, traj_len=2, traj_prefix_len=1
+    )
+    composed = ComposedLearnedPlanningSelectorScorer(
+        history_checkpoint=history_ckpt,
+        future_checkpoint=future_ckpt,
+        layer=15,
+        token_dim=8,
+    )
+    ctx = TokenContext(
+        tokens=torch.randn(1, layout.total_length, 8),
+        layout=layout,
+        domain=build_domain("history", layout, "cpu"),
+    )
+    with pytest.raises(ValueError, match="requires an all_video/video domain"):
+        composed.score(ctx)
+
+
+def test_runner_exposes_the_composed_scorer_and_both_checkpoints():
+    module = _runner_module()
+    args = module.parse_args(
+        [
+            "--persistent-scorer",
+            "composed_learned_planning_selector",
+            "--domain",
+            "all_video",
+            "--persistent-history-selector-checkpoint",
+            "/tmp/history.safetensors",
+            "--persistent-future-selector-checkpoint",
+            "/tmp/future.safetensors",
+        ]
+    )
+    assert args.persistent_scorer == "composed_learned_planning_selector"
+    assert args.persistent_history_selector_checkpoint is not None
+    assert args.persistent_future_selector_checkpoint is not None
+
+
+def _runner_module():
+    import importlib
+    import sys
+    from pathlib import Path
+
+    scripts_dir = Path(__file__).resolve().parents[1] / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    return importlib.import_module("run_official_navsim_press")
