@@ -47,7 +47,7 @@ class BlockQuotaSelector(TokenSelector):
         block_weights: dict[str, float] | None = None,
         mode: str = "dynamic",
         score_threshold: float = 0.0,
-        floor_ratio: float = 0.0,
+        floor_ratio: float = 0.8,
         eps: float = 1e-8,
     ):
         weights = {"history": 0.5, "future": 0.5} if block_weights is None else dict(block_weights)

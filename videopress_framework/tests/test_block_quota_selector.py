@@ -8,6 +8,8 @@ history, so that "joint" arm never compressed the future block.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
@@ -132,3 +134,32 @@ def test_block_quota_requires_layout():
     selector = BlockQuotaSelector()
     with pytest.raises(ValueError, match="requires ctx.layout"):
         selector.select(torch.rand(1, domain.n_candidate), domain, 4, None)
+
+
+def test_dynamic_floor_bounds_how_much_extra_compression_is_possible():
+    """The floor is the safety knob: hidden length lies in [floor*K, K].
+
+    With the trained selectors scoring ~0.38-0.42 on average -- below the 0.5
+    default threshold -- a small floor would let dynamic mode starve both blocks.
+    """
+
+    ctx, layout, domain = _ctx()
+    n = int(domain.n_candidate)
+    K = n // 2
+    low = torch.full((1, n), 0.01)  # nothing reaches the 0.5 threshold
+
+    def realised(floor):
+        selector = BlockQuotaSelector(
+            block_weights={"history": 0.5, "future": 0.5},
+            mode="dynamic",
+            score_threshold=0.5,
+            floor_ratio=floor,
+        )
+        return selector.select(low, domain, K, ctx).K
+
+    assert realised(0.25) < realised(0.8) <= K
+    assert realised(0.8) == int(math.ceil(0.8 * (K // 2))) * 2
+
+
+def test_block_quota_default_floor_is_safe():
+    assert BlockQuotaSelector().floor_ratio == 0.8

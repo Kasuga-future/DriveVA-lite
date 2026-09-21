@@ -655,10 +655,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--block-quota-floor-ratio",
         type=float,
-        default=0.25,
+        default=0.8,
         help=(
-            "minimum fraction of a block's quota kept in dynamic mode; stops a "
-            "block from being starved when nothing scores above the threshold"
+            "minimum fraction of a block's quota kept in dynamic mode.  This is "
+            "the knob that bounds how much EXTRA compression dynamic mode may "
+            "take: hidden length lands in [floor*K + 9, K + 9].  Default 0.8 "
+            "(e.g. 26.3%-40.8% at K=1149).  A small floor such as 0.25 would "
+            "allow an 81% collapse, and since trained selector scores average "
+            "~0.38-0.42 -- below the 0.5 threshold -- that would starve both "
+            "blocks and teach nothing"
         ),
     )
     parser.add_argument(
