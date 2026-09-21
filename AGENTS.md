@@ -1,10 +1,11 @@
 # AGENTS.md — DriveVA-lite Video Token Compression 交接文件
 
-> 最后更新：2026-09-21 00:35 CST
-> 当前分支：`main`，当前 HEAD：`41abd22`（已与 `origin/main` 同步）
+> 最后更新：2026-09-21 10:50 CST
+> 当前分支：`main`，当前 HEAD：`af71921`（已与 `origin/main` 同步）
 > 当前工作区：clean（唯一 untracked 为排除项 `pre_dit_gpu_smoke.py`）
-> **当前主任务：F3（训练 future selector）与 history+future 联合 selector 训练中**
-> （用户 2026-09-21 明确要求启动，覆盖了此前"F3 取消"的门控结论）。见 §12。
+> **当前主任务：逐 block 动态 token 保留（`block_quota`）——代码+测试已完成，
+> 全量 7876 实验排队中（tmux `f3_blockq`，等 `f3_ep2` 结束后自动开始，仅 2 张 GPU）。**
+> 上一阶段结论见 §12「全量 7876 判决结果」与「重要更正」。
 > 当前主任务：Future token compression 现状：
 > 1. future 直接 select：Phase F0 已打通；噪声上选 future 与随机接近，hard prune 明显掉 PDM。
 > 2. **history-guided future select**：已实现 `HistoryGuidedFutureSelector`、
@@ -725,11 +726,16 @@ oracle 上界都不如随机，没有可蒸馏的信号。
 
 ---
 
-## 6. 当前工作区未提交状态（2026-09-21 00:20 更新）
+## 6. 当前工作区未提交状态（2026-09-21 10:50 更新）
 
-`git status`：`main @ 91740d0`；**本轮新增 F3/联合训练侧代码 + 8 个单测 + AGENTS.md**
-（见 §6.3）。`outputs/f3_joint_selector_train_20260921/` 与
-`outputs/f3_joint_selector_eval_1024_20260921/`（driver、分析脚本、训练产物、checkpoint）
+`git status`：`main @ af71921`，**与 `origin/main` 同步，工作区 clean**；唯一 untracked
+是排除项 `videopress_framework/scripts/pre_dit_gpu_smoke.py`（按 §9.6 不进 git）。
+本阶段已提交：F3/联合训练侧代码（`becdfea`）、组合式 selector（`41abd22`）、
+队列链与门控文档（`103a67a`/`edebdc3`）、全量 7876 判决（`6963ac5`）、
+保留数目更正（`ff87d27`）、`block_quota` 逐 block 动态保留（`af71921`）。
+
+所有实验产物（`outputs/f3_joint_selector_train_20260921/`、
+`outputs/f3_joint_full_7876_20260921/` 含 4 个队列脚本、gate、分析脚本与 checkpoint）
 按 §9.6 **不进 git**。
 
 ### 6.1 已提交内容（此前阶段）
