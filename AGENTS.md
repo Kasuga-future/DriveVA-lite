@@ -1,11 +1,14 @@
 # AGENTS.md — DriveVA-lite Video Token Compression 交接文件
 
-> 最后更新：2026-09-21 10:50 CST
-> 当前分支：`main`，当前 HEAD：`af71921`（已与 `origin/main` 同步）
+> 最后更新：2026-09-21 23:59 CST
+> 当前分支：`main`，当前 HEAD：`1e72fa6`（已与 `origin/main` 同步）
 > 当前工作区：clean（唯一 untracked 为排除项 `pre_dit_gpu_smoke.py`）
-> **当前主任务：逐 block 动态 token 保留（`block_quota`）——代码+测试已完成，
-> 全量 7876 实验排队中（tmux `f3_blockq`，等 `f3_ep2` 结束后自动开始，仅 2 张 GPU）。**
-> 上一阶段结论见 §12「全量 7876 判决结果」与「重要更正」。
+> **当前状态：本阶段全部实验已结束，无排队任务、无运行中 GPU 进程（GPU 0/6/7 空闲）。**
+> **F3 / 组合式 / 逐 block 动态保留三条线均已判决完毕，结论见下方与 §12。**
+> **当前最佳可部署点**：`blockq_dyn_h32f68_k1149` —— 全量 7,876 压缩率 **30.9%**
+> （hidden 1084，history 124+171，future 780 全保留），ΔPDM vs NoPress **−0.0013
+> CI [−0.0036,+0.0010]**（跨 0），vs 已部署 history press **−0.0026 CI 排除 0**。
+> 严格近无损门槛（CI 下界 > −0.002）仍只有 `history_only` 通过。
 > 当前主任务：Future token compression 现状：
 > 1. future 直接 select：Phase F0 已打通；噪声上选 future 与随机接近，hard prune 明显掉 PDM。
 > 2. **history-guided future select**：已实现 `HistoryGuidedFutureSelector`、
@@ -726,13 +729,19 @@ oracle 上界都不如随机，没有可蒸馏的信号。
 
 ---
 
-## 6. 当前工作区未提交状态（2026-09-21 10:50 更新）
+## 6. 当前工作区未提交状态（2026-09-21 23:59 更新）
 
-`git status`：`main @ af71921`，**与 `origin/main` 同步，工作区 clean**；唯一 untracked
+`git status`：`main @ 1e72fa6`，**与 `origin/main` 同步，工作区 clean**；唯一 untracked
 是排除项 `videopress_framework/scripts/pre_dit_gpu_smoke.py`（按 §9.6 不进 git）。
 本阶段已提交：F3/联合训练侧代码（`becdfea`）、组合式 selector（`41abd22`）、
 队列链与门控文档（`103a67a`/`edebdc3`）、全量 7876 判决（`6963ac5`）、
-保留数目更正（`ff87d27`）、`block_quota` 逐 block 动态保留（`af71921`）。
+保留数目更正（`ff87d27`）、`block_quota` 逐 block 动态保留（`af71921`）、
+ep2 结论（`acbb5fd`）、block_quota 安全默认值（`ba4e33b`）、header 刷新（`c08d56d`）、
+最终判决（`1e72fa6`）。
+
+**六个队列阶段全部结束，无运行中进程**：`f3_train`（训练）→ `f3_full`（全量测试）→
+`f3_retrain`（门控加训）→ `f3_retest` / `f3_ep2`（全量重测）→ `f3_blockq`
+（逐 block 动态保留，末臂 18:10:53 完成）。测试基线 **264 passed**。
 
 所有实验产物（`outputs/f3_joint_selector_train_20260921/`、
 `outputs/f3_joint_full_7876_20260921/` 含 4 个队列脚本、gate、分析脚本与 checkpoint）
