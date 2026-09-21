@@ -1936,3 +1936,54 @@ vs `union_history` / vs `same_latent` / vs `history_only`），把结论写入 �
 step-6380**：`composed_ep2_k1149` / `composed_ep2_k989` / `joint_ep2_k1149` / `future_ep2_k682`，
 约 66 min/臂。**这一步的结果尚未产生。**
 
+### 2026-09-21 — 重要更正：组合式臂是**固定 K**，且 composed_v2 在 K=1149 上**完全不压 future**
+
+用户追问「重训 future + 组合式是否为动态压缩、保留数目多少」，按 run metadata 逐场景核对后
+发现上一节的表述需要**更正**。
+
+**动态 vs 固定**（判据：7876 个场景中不同 K 的取值个数）
+
+| arm | mode | 不同 K 数 | K 范围 |
+|---|---|---|---|
+| `history_only`（已部署） | **dynamic** | 169 | 398–575 |
+| `hist_future_union` | **dynamic** | 390 | 901–1336 |
+| `composed_v1/v2`（K1149/K989） | **FIXED** | **1** | 恒定 |
+| `joint_v1/v2`（K1149/K989） | **FIXED** | **1** | 恒定 |
+| `only_future_v1/v2`（K682/K585） | **FIXED** | **1** | 恒定 |
+
+→ 所有**训练过的 selector 臂都是固定 K**（`selector=topk` + `budget=ratio`），每个场景保留**完全相同**
+的 token 数；**只有**已部署的 `history_only`（`history_threshold` 平滑度阈值）和
+`hist_future_union`（继承同一阈值）是**逐场景动态**的。**因此我之前把 composed/joint 与
+history_only 直接并列比较是「固定 K vs 动态 K」的跨类比较**，虽然配对 ΔPDM 仍有效
+（同场景），但两者的预算机制不同，引用时必须写清楚。
+
+**保留数目（K = 保留的视频 token；history/future 各 780；protected traj/action 9）**
+
+| arm | K | history | future | hidden | 历史 latent(老,新) |
+|---|---:|---:|---:|---:|---|
+| `history_only`（dynamic, mean 491） | 491 | 491（62.9%） | 780（100%，未压） | 1293 | 317/174 |
+| `hist_future_union`（dynamic, mean 1154） | 1154 | 492（63.1%） | 661（84.8%） | 1201 | 319/173 |
+| `composed_v1` K1149 | 1149 | 506（64.9%） | 643（82.4%） | 1158 | 229/277 |
+| **`composed_v2` K1149** | 1149 | **369（47.3%）** | **780（100%）** | 1158 | 156/213 |
+| `composed_v1` K989 | 989 | 430（55.1%） | 559（71.7%） | 998 | 184/246 |
+| `joint_v1` K1149 | 1149 | 431（55.2%） | 718（92.1%） | 1158 | 168/263 |
+| `joint_v2` K1149 | 1149 | 440（56.4%） | 709（90.9%） | 1158 | 186/254 |
+| `joint_v1` K989 | 989 | 335（42.9%） | 654（83.9%） | 998 | 113/221 |
+| `only_future_v1/v2` K682 | 682 | 780（100%，未压） | 682（87.4%） | 1471 | — |
+| `only_future_v2` K585 | 585 | 780（100%，未压） | 585（75.0%） | 1374 | — |
+
+**更正（关键）**：`composed_v2` 在 K=1149 上 **future 保留 780/780 = 100%**，即
+**它根本没有压缩 future**。它的 −0.0010 是靠**把压缩负担全部压到 history**
+（history 从 `history_only` 的 491 降到 369，即比已部署方案**更激进地压 history**）换来的。
+→ 上一节「组合式是全项目第一个准近无损的 future/联合臂」这句话**只在「含 future 候选池的联合打分」
+意义上成立，不能读成「future 可被压缩」**。加训的真实效果是**改变了两个 block 的相对打分标定**，
+使 top-1149 更偏向 future、把裁剪全部推给 history（v1 是 506/643，v2 是 369/780）。
+
+**那么「future 压缩」的正确证据是 `only_future_*`**：K=682（future 87.4%，序列 −6.2%）
+→ v2 `−0.0021 CI [−0.0045,+0.0002]`（CI 跨 0，差 0.0001 未过 −0.002 门槛）；
+K=585（future 75.0%，序列 −12.4%）→ `−0.0127 CI [−0.0163,−0.0092]`。**这才是真实的 future 压缩数字。**
+
+**下一步（由此更正直接导出）**：要让组合式真正同时压两个 block，必须加**逐 block 预算**
+（框架已有 `each_future` / `per_future_latent` reference 与 `future_keep_ratio` cap），
+而不是全局 top-k；否则 top-k 会把裁剪全部推给分低的那一侧。
+
