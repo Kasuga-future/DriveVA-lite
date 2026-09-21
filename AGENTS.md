@@ -717,6 +717,7 @@ oracle 上界都不如随机，没有可蒸馏的信号。
 | future domain 官方 runner | **已开放** | `--domain future_video/future_latent_0/future_latent_1` 可用 |
 | future latent 单独 domain/budget | **已实现** | `future_latent_i`、`each_future` reference 已加入并有测试 |
 | future / 联合 online selector 训练 | **已实现（2026-09-21）** | `--selector-candidate-latents` 支持 storage 坐标连续区间：`"2,3"`=future（780）、`"0,1,2,3"`=history+future 联合（1560）；仅 `gradient_abs` teacher；训练 temporal 坐标 = storage index，与部署 `_positions()` 一致。`history_token_mask`（sparse step）仍只覆盖 history，与 candidate range 同时使用会显式报错 |
+| **逐 block 动态保留 selector** | **已实现（2026-09-21）** | `block_quota`：把候选池按 `layout` 拆成 history / future 两块，各自分配 `K` 的配额（`--block-quota-weights history:0.5,future:0.5`），块内可选固定 top-k（`mode=quota`）或**逐场景动态**计数（`mode=dynamic`：保留 score ≥ 阈值者，clamp 到 `[floor_ratio*quota, quota]`，quota 仍是硬上界）。动机是实测发现全局 top-k 会把裁剪全部推给分低的那一侧（K=1149 时组合式保留 780/780 future）。命名 block 但域内为空会显式报错（否则空块白占配额、把实块的预算砍半）。合成端到端 smoke 通过（K=24 → `per_block_quota {history:12, future:12}`） |
 | **组合式 history+future selector** | **已实现（2026-09-21）** | `composed_learned_planning_selector`：一次 `all_video` press，history 候选交给 history 训练的网络（domain view `history`，`t=0,1`），future 候选交给 F3 网络（view `future_video`，`t=2,3`），两个网络互不见对方 block。复用 `LearnedPlanningSelectorScorer` 不改坐标/缓存逻辑；runner 新增 `--persistent-history-selector-checkpoint` / `--persistent-future-selector-checkpoint`；非 `all_video` domain 显式报错。测试断言组合输出在各自 block 上**逐位等于**对应单网络 |
 | future oracle/上界分析 | random-mask / tile / token-level set-level 三种 oracle 均已完成，**全部否定** | 1024 场景 keep0.5：随机 band `−0.0483`，搜索 mask 不优于随机（13 分位 / 输给全部臂）；tile `combined keep0.5` `−0.0182`；下一步只测 keep-ratio frontier |
 | **token-level set-level future oracle** | **已实现并跑完（代码 + 39 单测）；1024 场景验证为否定结果** | `oracle_future_token_mask` selector、`--future-oracle-token-mask-json(s)`、`videopress/oracle/`（token 分组 + set-level greedy/beam/random）、`scripts/search_future_token_set_oracle.py` |
@@ -1986,4 +1987,42 @@ K=585（future 75.0%，序列 −12.4%）→ `−0.0127 CI [−0.0163,−0.0092]
 **下一步（由此更正直接导出）**：要让组合式真正同时压两个 block，必须加**逐 block 预算**
 （框架已有 `each_future` / `per_future_latent` reference 与 `future_keep_ratio` cap），
 而不是全局 top-k；否则 top-k 会把裁剪全部推给分低的那一侧。
+
+### 2026-09-21 — 推进下一步：逐 block 动态 token 保留（代码+测试完成，实验排队）
+
+**问题（由上一条更正直接导出）**：全局 top-k 会让**分低的那一侧独自承担全部裁剪**。实测
+K=1149 时组合式保留 780/780 future、把 411 个被裁 token 全推给 history；`only_future_*`
+则相反，history 保持 780/780。**所以"联合压缩"从未真正同时压两个 block。**
+
+**新组件 `block_quota`**（`videopress/selectors/block_quota.py`）：
+
+- 按 `ctx.layout` 的 `history_video` / `future_video` span 把候选拆块；
+- `block_weights` 分配全局 K（如 `history:0.5,future:0.5`）；
+- `mode=quota`：块内固定 top-k；`mode=dynamic`：保留 `score ≥ score_threshold` 者，
+  **clamp 到 `[ceil(floor_ratio*quota), quota]`** → 计数**逐场景、逐 block** 变化，而 quota 仍是
+  硬上界（序列长度预算不被破坏）；
+- 矩形打包沿用 `threshold` 的规则（短行用自己次优的 token 补齐）；官方 evaluator batch=1，
+  所以逐场景动态计数是**精确**实现的；
+- 元数据上报 `per_block_quota` / `per_block_kept_mean` / `proposed_K_per_batch`。
+
+runner 接入：`--persistent-selector block_quota` + `--block-quota-weights` /
+`--block-quota-mode` / `--block-quota-score-threshold` / `--block-quota-floor-ratio`；
+非 `all_video` domain、或命名的 block 在域内为空（会把实块预算砍半）→ 显式报错。
+
+**测试**：`tests/test_block_quota_selector.py` 6 项，核心断言是「全局 top-k 会把 K 全给
+history 时，`block_quota` 必须把裁剪分摊到两块」；另有 dynamic 计数在无 token 达标时**低于**
+固定配额（证明真的动态）、floor 防止饿死、权重倾斜生效、单块域报错。**全量 `262 passed`**。
+合成端到端 smoke：K=24 → `per_block_quota {history:12, future:12}`。
+
+**关键设计性质**：**固定全局 K 时 hidden 长度不变**，所以 `blockq_*_k1149`（hidden 1158）与
+`composed_v2 (K1149)` / `joint_v2 (K1149)` / `hist_future_union` 是**同一序列长度**下的直接对比，
+把「是否分摊裁剪」与「裁多少」两个变量分离开。
+
+**队列 `f3_blockq`（`run_blockq_queue.sh`，仅 2 张 GPU）**，等 `f3_ep2` 结束后自动开始：
+① `blockq_dyn_h50f50_k1149`（核心：同 K 同 hidden，改成分摊）② `blockq_dyn_h65f35_k1149`
+（future 能否承担更大份额）③ `blockq_dyn_h50f50_k989`（更深）④ 训练 `future_v3`
+（`teacher_keep=0.736` = h50f50 在 K=1149 下的 future 预算 `0.5*1149/780`，2 epochs + ranking loss）
+⑤ `blockq_dyn_v3_k1149`（重训 future 放进逐 block 动态）。每臂全量 7876 ≈ 72 min（2 卡）。
+
+**结果尚未产生，本条不含任何 PDM 结论。**
 

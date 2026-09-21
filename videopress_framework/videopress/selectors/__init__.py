@@ -15,6 +15,7 @@ from .history_budget import (
     HistoryThresholdSelector,
 )
 from .topk import TopKSelector
+from .block_quota import BlockQuotaSelector
 from .threshold import ThresholdSelector
 from .signed_risk import SignedRiskSelector
 from .protected import ProtectedTokenSelector

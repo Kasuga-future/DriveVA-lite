@@ -573,6 +573,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "future_quota",
             "adaptive_mass",
             "adaptive_spatial_mass",
+            "block_quota",
         ),
         default="topk",
         help=(
@@ -621,6 +622,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "comma-separated exact keep ratios in [near,far] storage order; "
             "required by --persistent-selector future_quota"
+        ),
+    )
+    parser.add_argument(
+        "--block-quota-weights",
+        type=str,
+        default="history:0.5,future:0.5",
+        help=(
+            "with --persistent-selector block_quota: how the global K is split "
+            "between the history and future blocks, e.g. 'history:0.5,future:0.5' "
+            "(or a bare '0.5,0.5' in history,future order)"
+        ),
+    )
+    parser.add_argument(
+        "--block-quota-mode",
+        type=str,
+        choices=("quota", "dynamic"),
+        default="dynamic",
+        help=(
+            "block_quota count rule: 'quota' = fixed top-k inside each block; "
+            "'dynamic' = keep every token at/above --block-quota-score-threshold, "
+            "clamped into [floor_ratio*quota, quota] so the count varies per "
+            "scene and per block while the quota stays a hard cap"
+        ),
+    )
+    parser.add_argument(
+        "--block-quota-score-threshold",
+        type=float,
+        default=0.5,
+        help="score cut for --block-quota-mode dynamic",
+    )
+    parser.add_argument(
+        "--block-quota-floor-ratio",
+        type=float,
+        default=0.25,
+        help=(
+            "minimum fraction of a block's quota kept in dynamic mode; stops a "
+            "block from being starved when nothing scores above the threshold"
         ),
     )
     parser.add_argument(
@@ -2038,6 +2076,46 @@ def _method_specs_for_run(args: argparse.Namespace, round_seed: int) -> list[dic
         )
         scorer_options["future_position_mode"] = str(
             getattr(args, "persistent_future_position_mode", "storage")
+        )
+    if selector_name == "block_quota":
+        # Per-block retention: force the cut to be shared between the history
+        # and future blocks instead of letting one block absorb all of it.
+        if not str(getattr(args, "domain", "")).startswith(("all_video", "video")):
+            raise ValueError(
+                "--persistent-selector block_quota requires --domain all_video "
+                "(it allocates a separate budget to the history and future blocks)"
+            )
+        raw_weights = str(getattr(args, "block_quota_weights", "") or "").strip()
+        if raw_weights:
+            weights: dict[str, float] = {}
+            for token in raw_weights.split(","):
+                token = token.strip()
+                if not token:
+                    continue
+                if ":" in token:
+                    name, value = token.split(":", 1)
+                    weights[name.strip().lower()] = float(value)
+                else:
+                    # Bare list is in history,future order.
+                    position = len(weights)
+                    key = ("history", "future")[min(position, 1)]
+                    weights[key] = float(token)
+            if not weights:
+                raise ValueError("--block-quota-weights did not contain any value")
+        else:
+            weights = {"history": 0.5, "future": 0.5}
+        mode = str(getattr(args, "block_quota_mode", "dynamic") or "dynamic").lower()
+        if mode not in {"quota", "dynamic"}:
+            raise ValueError("--block-quota-mode must be 'quota' or 'dynamic'")
+        selector_config.update(
+            {
+                "block_weights": weights,
+                "mode": mode,
+                "score_threshold": float(
+                    getattr(args, "block_quota_score_threshold", 0.0)
+                ),
+                "floor_ratio": float(getattr(args, "block_quota_floor_ratio", 0.0)),
+            }
         )
     if scorer_name == "action_contribution_stability":
         observation_start = getattr(
