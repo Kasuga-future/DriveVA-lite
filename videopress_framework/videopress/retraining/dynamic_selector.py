@@ -99,16 +99,29 @@ class DynamicVideoTokenScorer(nn.Module):
 
     # ------------------------------------------------------------------ utils
     @staticmethod
-    def _time_features(timestep, batch: int, dtype: torch.dtype) -> torch.Tensor:
+    def _time_features(timestep, batch: int, n: int, dtype: torch.dtype) -> torch.Tensor:
+        """Time features as ``[B, 5]`` (per sample) or ``[B, N, 5]`` (per token).
+
+        DriveVA passes a *per-token* flow timestep to ``model_fn``: conditioned
+        history latents carry 0 while the future latents carry the current
+        sigma, so the tensor has length ``N`` (or ``B*N``) rather than ``B``.
+        That distinction is informative rather than a nuisance -- a token's own
+        noise level is exactly the kind of context the plan asks the scorer to
+        condition on -- so per-token timesteps are supported natively instead of
+        being collapsed to a scalar.
+        """
         if timestep is None:
             value = torch.zeros(batch, dtype=torch.float32)
         else:
             value = torch.as_tensor(timestep, dtype=torch.float32).reshape(-1)
             if value.numel() == 1:
                 value = value.expand(batch)
-            if value.numel() != batch:
+            elif value.numel() == batch * n:
+                value = value.reshape(batch, n)
+            elif value.numel() != batch:
                 raise ValueError(
-                    f"timestep must be scalar or length {batch}, got {value.numel()}"
+                    f"timestep must be scalar, length {batch} (per sample) or "
+                    f"length {batch * n} (per token), got {value.numel()}"
                 )
         # DriveVA flow-matching timesteps are in [0, 1000]; Phase keeps the
         # frozen sinusoidal features from the existing selector so the two are
@@ -188,8 +201,10 @@ class DynamicVideoTokenScorer(nn.Module):
         type_feature = self.type_embedding(token_type)
 
         time_feature = self.time_proj(
-            self._time_features(timestep, batch, param_dtype)
-        ).unsqueeze(1).expand(-1, n, -1)
+            self._time_features(timestep, batch, n, param_dtype)
+        )
+        if time_feature.ndim == 2:
+            time_feature = time_feature.unsqueeze(1).expand(-1, n, -1)
 
         context = self._action_context(action_hidden, batch, n, param_dtype) + time_feature
         local = token_feature + position_feature + type_feature

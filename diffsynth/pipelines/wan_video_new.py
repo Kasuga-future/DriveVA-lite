@@ -2056,6 +2056,65 @@ def model_fn_wan_video(
             and int(counterfactual_layer) == -1
         ):
             x, freqs, t_mod = apply_counterfactual_mask(x, freqs, t_mod)
+
+        # Route A ("Dynamic Select") retraining path.  Unlike the runtime
+        # TokenPress hooks this is a real trainable module owned by the pipeline:
+        # it runs the dense front-end, applies a threshold gate whose keep count
+        # is scene-dependent, runs the remaining blocks on the shortened
+        # sequence, and restores the dense video grid through its recovery
+        # decoder.  It is duck-typed for the same reason the other controllers
+        # are: the base DriveVA model must not depend on the optional framework.
+        # When the attribute is absent this is a no-op and the original dense
+        # block loop below runs unchanged.
+        route_a = getattr(dit, "_tokenpress_route_a", None)
+        if route_a is not None:
+            route_a_incompatible = []
+            if tea_cache is not None:
+                route_a_incompatible.append("TeaCache")
+            if vace_context is not None:
+                route_a_incompatible.append("VACE")
+            if use_unified_sequence_parallel:
+                route_a_incompatible.append("unified sequence parallel")
+            if pose_latents is not None or face_pixel_values is not None:
+                route_a_incompatible.append("Animate")
+            if route_a_incompatible:
+                raise NotImplementedError(
+                    "Route A token compression is not implemented with "
+                    + ", ".join(route_a_incompatible)
+                )
+            route_a_out = route_a(
+                list(dit.blocks),
+                x,
+                context,
+                t_mod,
+                freqs,
+                timestep=timestep if torch.is_tensor(timestep) else None,
+                trajectory_head=trajectory_head if traj_len > 0 else None,
+                head=dit.head,
+                head_t_mod=t,
+                capture_layers=getattr(dit, "_tokenpress_route_a_capture_layers", ()),
+                capture_video_layers=getattr(
+                    dit, "_tokenpress_route_a_capture_video_layers", ()
+                ),
+                physical_shortening=bool(
+                    getattr(dit, "_tokenpress_route_a_physical", True)
+                ),
+                use_checkpoint=bool(use_gradient_checkpointing),
+            )
+            route_a_video = (
+                dit.unpatchify(route_a_out.video_flow, (f, h, w))
+                if route_a_out.video_flow is not None
+                else None
+            )
+            if return_traj_pred:
+                return {"video": route_a_video, "traj": route_a_out.traj_pred}
+            if route_a_video is None:
+                raise RuntimeError(
+                    "Route A produced no video flow: it needs dit.head to recover "
+                    "the dense video prediction, or return_traj_pred"
+                )
+            return route_a_video
+
         for block_id, block in enumerate(dit.blocks):
             if capture_history_tokens and block_id == int(selector_layer):
                 if pipe is None:

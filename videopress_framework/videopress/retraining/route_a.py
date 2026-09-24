@@ -395,8 +395,12 @@ class RouteADynamicSelect(nn.Module):
             )
         else:
             positions = positions.to(device=x.device, dtype=video_hidden.dtype)
-            if positions.ndim == 2:
-                positions = positions.unsqueeze(0).expand(x.shape[0], -1, -1)
+        # Always batch the coordinates.  ``build_driveva_video_positions`` returns
+        # an unbatched [N, 3] table, and the recovery decoder indexes it with a
+        # [B, K, 3] index, so leaving it 2-D raises "Index tensor must have the
+        # same number of dimensions as input tensor" on the real pipeline.
+        if positions.ndim == 2:
+            positions = positions.unsqueeze(0).expand(x.shape[0], -1, -1)
 
         # -------------------------------------------------------- thresholding
         logits = self.scorer(
@@ -443,6 +447,11 @@ class RouteADynamicSelect(nn.Module):
 
         # ----------------------------------------------------- sparse backend
         # Scale the video tokens by the straight-through mask.
+        # The gate works in fp32 for numerical stability, but the backend
+        # blocks run in the model dtype.  Cast the mask back before it touches
+        # the residual stream, otherwise ``video * mask`` silently promotes the
+        # sequence to fp32 and every downstream layer raises a dtype mismatch.
+        ste_mask = ste_mask.to(video_hidden.dtype)
         gated_video = video_hidden * ste_mask.unsqueeze(-1)
         x_gated = torch.cat([gated_video, traj_hidden], dim=1)
 
@@ -524,6 +533,9 @@ class RouteADynamicSelect(nn.Module):
                 query_positions=positions,
                 batch_size=x.shape[0],
             )
+            # Same reason as the mask: the recovery decoder is fp32, the Wan
+            # head runs in the model dtype.
+            dense_video_hidden = dense_video_hidden.to(video_hidden.dtype)
             if head is not None:
                 # The Wan head is position-wise over the *video* grid only: the
                 # production pipeline strips the trajectory tokens before
