@@ -1,10 +1,9 @@
 # AGENTS.md — DriveVA-lite Video Token Compression 交接文件
 
 > 最后更新：2026-09-24 CST
-> 当前分支：`main`，当前 HEAD：`b2e7a19`（已与 `origin/main` 同步）
-> 当前工作区：tracked clean。本轮提交两个 commit：`b98c6cc`（上一会话遗留：DiT 探针 +
-> round-scheduled selector）与 `b2e7a19`（Route A 重训实现 + 报告 + 59 单测）。
-> 训练产物写入被忽略的 `videopress_framework/outputs/route_a_retraining_20260924/`。
+> 当前分支：`main`，当前 HEAD：`2d00842`（**已与 `origin/main` 同步；推送已恢复正常**）
+> 当前工作区：tracked clean。本会话共 6 个 commit 已全部推送（`b98c6cc` … `2d00842`）。
+> 训练/评测产物写入被忽略的 `videopress_framework/outputs/route_a_{train,eval}_20260924/`。
 > **2026-09-24 路线切换：future hard prune 已判决终止（见下），新阶段按用户提供的
 > 《DriveVA Dynamic Video Token Compression — Retraining Implementation Plan v2》执行。
 > 该计划要求把「在冻结模型里找可删 token」改成「训练 DriveVA 用少量 token 表达同样的
@@ -25,17 +24,15 @@
 > **2026-09-22 历史状态：future hard prune 全面失败，最 balance 部署为 future 全保留的
 > `blockq_dyn_h32f68_k1149`，严格近无损为 `history_only`；该结论仍成立，因为 Route A
 > 是"重训"而非"冻结模型里剪枝"，两者不矛盾。**
-> 当前状态：**Route A 正式训练已在 GPU 4 正常运行**（tmux `driveva_routea`）：
-> A1 / Lb=18 / 3768 场景 / 1 epoch / dense-gate / 冻结 backbone，
-> 实测 **1.04 it/s → 约 60 min**；已验证 `trainable route_a == trainable dit == 177.48M`
-> （优化器只看到 Route A 参数）。产物 `outputs/route_a_train_20260924/a1_l18_densegate/`。
-> MVP substrate 对照（GPU 2，tmux `driveva_mvp`）4/4 臂已完成，结果见 §4。
-> **⚠️ git 推送受阻（2026-09-24）：VSCode git credential 全部失效，本机有 commit 未推送。**
-> 症状：三个 askpass socket（`/run/user/1007/vscode-git-{9c96753744,be1669dea6,d52c86db93}.sock`）
-> 全部返回 `remote: No anonymous write access.` / `Authentication failed`；读权限正常
-> （`git ls-remote` 可用）。`be1669dea6` 在本会话早前可用，之后失效。
-> 处置（用户 2026-09-24 明确要求）：**不要反复重试推送**，失败即上报。
-> 修复方式：在 VSCode 重新授权 GitHub，或人工执行 `git push origin main`。
+> 当前状态：**无运行中 GPU 任务**。A1 训练已跑完（16 个检查点）；1024 场景配对评测显示
+> no_press **0.911078** vs Route A **0.540180**（保留 50%），配对 ΔPDM **−0.3709**。
+> **但该负面结果不能判定 Route A**——A1 配置有三处我的错误（无稀疏项导致保留率失控漂移
+> 99.7%→50%、轨迹模块被无意训练而首次评测只加载了 Route A、保留率统计未接入训练循环）。
+> 修正清单见 §4「2026-09-24（续 4）」与 `SESSION_PROGRESS_REPORT.md` 附录。
+> **git 推送问题已解决（2026-09-24 晚）**：早前 VSCode askpass socket 失效导致
+> `No anonymous write access`；期间按用户要求"只试一次、失败即上报、不反复重试"。
+> 现已恢复正常，本会话全部 commit 均已推送。若再次遇到同样症状：换用最新的
+> `/run/user/1007/vscode-git-*.sock`（用 `ls -t` 或逐个试），不要连续重试。
 > **2026-09-22 长任务队列标准（用户要求）：预计等待/运行 >10 分钟且无需持续观察的 GPU 任务，必须进入持久 tmux 自动队列，自行获取空闲 GPU、写 status/ETA；计算 ETA 后立即结束连续监控，禁止用长 sleep 占前台导致 shell reset/SIGTERM 杀任务。当前队列：`outputs/auto_queue_20260922/`，ETA ≈ 3 h 52 min。**
 > **2026-09-22 自动队列已结束（15:24 CST）。full 7,876 结论：future L22+keep0.75 不可部署——`action_attention_vnorm` ΔPDM −0.011601 CI [−0.014996,−0.008387]；在 L22 校准后的 future selector ΔPDM −0.010396 CI [−0.013780,−0.007042]，只比训练-free scorer 提升 +0.0012，且 e2e 反增 +48.9 ms。未来 hard prune 仍不满足 near-lossless；当前最佳部署仍是 future 全保留的 `blockq_dyn_h32f68_k1149` / history-only press。**
 > **2026-09-22 15:52 新队列 `driveva_queue_late`：补 full `late_to_mid [22,22,18]` + 从零训练 L18/L22 selector（不再用 F3 初始化）+ `round_scheduled_learned_planning_selector` full。队列路径 `outputs/auto_queue_late_to_mid_20260922/`，ETA ≈ 3 h 42 min，预计 19:32 CST；按标准不持续监控。**
