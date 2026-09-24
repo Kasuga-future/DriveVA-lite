@@ -1,8 +1,9 @@
 # AGENTS.md — DriveVA-lite Video Token Compression 交接文件
 
 > 最后更新：2026-09-24 CST
-> 当前分支：`main`，当前 HEAD：`b98c6cc`（已与 `origin/main` 同步）
-> 当前工作区：tracked clean；本轮新增 Route A retraining 包与 2 个脚本（已提交）；
+> 当前分支：`main`，当前 HEAD：`b2e7a19`（已与 `origin/main` 同步）
+> 当前工作区：tracked clean。本轮提交两个 commit：`b98c6cc`（上一会话遗留：DiT 探针 +
+> round-scheduled selector）与 `b2e7a19`（Route A 重训实现 + 报告 + 59 单测）。
 > 训练产物写入被忽略的 `videopress_framework/outputs/route_a_retraining_20260924/`。
 > **2026-09-24 路线切换：future hard prune 已判决终止（见下），新阶段按用户提供的
 > 《DriveVA Dynamic Video Token Compression — Retraining Implementation Plan v2》执行。
