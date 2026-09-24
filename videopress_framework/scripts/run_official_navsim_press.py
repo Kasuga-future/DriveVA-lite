@@ -464,6 +464,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--persistent-layer-schedule",
+        default=None,
+        help=(
+            "optional comma-separated source layers in execution/round order, "
+            "e.g. '22,18,15'. Length must equal --num-inference-steps. When set, "
+            "the static --persistent-layer-sweep value is only a base/fallback."
+        ),
+    )
+    parser.add_argument(
         "--persistent-end-layer",
         type=int,
         default=None,
@@ -500,6 +509,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "action_contribution_stability",
             "learned_planning_selector",
             "composed_learned_planning_selector",
+            "round_scheduled_learned_planning_selector",
             "random",
         ),
         default="action_attention_vnorm",
@@ -533,6 +543,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "learned threshold-0.4 arm (layer 15) and extends it to deeper start "
             "layers, so the compression start point can be moved without changing "
             "anything else about the selector."
+        ),
+    )
+    parser.add_argument(
+        "--persistent-learned-checkpoint-map",
+        default=None,
+        help=(
+            "layer:checkpoint_path mapping for "
+            "round_scheduled_learned_planning_selector, e.g. "
+            "'18:/path/l18.safetensors,22:/path/l22.safetensors'"
         ),
     )
     parser.add_argument(
@@ -1860,6 +1879,29 @@ def _method_specs_for_run(args: argparse.Namespace, round_seed: int) -> list[dic
             },
         )
         return [baseline, fixed375, fixed50, balanced, cautious]
+    layer_schedule = None
+    raw_layer_schedule = getattr(args, "persistent_layer_schedule", None)
+    if raw_layer_schedule:
+        layer_schedule = [
+            int(item.strip())
+            for item in str(raw_layer_schedule).split(",")
+            if item.strip()
+        ]
+        if not layer_schedule:
+            raise ValueError("--persistent-layer-schedule cannot be empty")
+        invalid = [layer for layer in layer_schedule if layer < 0 or layer >= 30]
+        if invalid:
+            raise ValueError(
+                f"--persistent-layer-schedule has layers outside [0, 29]: {invalid}"
+            )
+        expected = int(getattr(args, "num_inference_steps", 0) or 0)
+        if expected and len(layer_schedule) != expected:
+            raise ValueError(
+                "--persistent-layer-schedule length must equal "
+                f"--num-inference-steps ({expected}), got {len(layer_schedule)}"
+            )
+        if args.persistent_layer_sweep is None:
+            args.persistent_layer_sweep = str(layer_schedule[-1])
     if args.persistent_layer_sweep is None:
         if getattr(args, "persistent_skip_baseline", False):
             raise ValueError("--persistent-skip-baseline requires --persistent-layer-sweep")
@@ -2031,6 +2073,18 @@ def _method_specs_for_run(args: argparse.Namespace, round_seed: int) -> list[dic
                 "--persistent-feature-layer cannot follow a sweep source layer"
             )
         scorer_options["feature_layer"] = feature_layer
+    if scorer_name == "round_scheduled_learned_planning_selector":
+        raw_map = getattr(args, "persistent_learned_checkpoint_map", None)
+        if not raw_map:
+            raise ValueError(
+                "--persistent-scorer round_scheduled_learned_planning_selector "
+                "requires --persistent-learned-checkpoint-map"
+            )
+        scorer_options["checkpoints"] = str(raw_map)
+        if str(getattr(args, "domain", "")).startswith("future"):
+            scorer_options["future_position_mode"] = str(
+                getattr(args, "persistent_future_position_mode", "storage")
+            )
     if scorer_name == "learned_planning_selector":
         # Deployed-selector arm: the sweep layer is written into the scorer
         # config by persistent_attention_vnorm_spec, and `scorer.layer` is the
@@ -2163,6 +2217,8 @@ def _method_specs_for_run(args: argparse.Namespace, round_seed: int) -> list[dic
             spec["press"] = apply_history_retention_policy(
                 spec["press"], args.retention_policy
             )
+        if layer_schedule is not None:
+            spec["layer_schedule"] = list(layer_schedule)
         specs.append(spec)
     return specs
 
@@ -3989,6 +4045,14 @@ def run(args: argparse.Namespace) -> int:
                     )
                 score_cache = ScoreCache(score_cache_dir)
             press = build_press(spec["press"])
+            spec_layer_schedule = spec.get("layer_schedule")
+            if spec_layer_schedule:
+                scorer = getattr(press, "scorer", None)
+                if scorer is None:
+                    raise RuntimeError(
+                        "layer schedule requested but press has no scorer"
+                    )
+                setattr(scorer, "layer_schedule", [int(v) for v in spec_layer_schedule])
             adapter = DriveVAAdapter()
             runtime = VideoPressRuntime(
                 press=press,

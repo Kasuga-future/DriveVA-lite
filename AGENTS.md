@@ -1,9 +1,13 @@
 # AGENTS.md — DriveVA-lite Video Token Compression 交接文件
 
-> 最后更新：2026-09-21 23:59 CST
-> 当前分支：`main`，当前 HEAD：`1e72fa6`（已与 `origin/main` 同步）
-> 当前工作区：clean（唯一 untracked 为排除项 `pre_dit_gpu_smoke.py`）
-> **当前状态：本阶段全部实验已结束，无排队任务、无运行中 GPU 进程（GPU 0/6/7 空闲）。**
+> 最后更新：2026-09-22 16:53 CST
+> 当前分支：`main`，当前 HEAD：`4781c1f`（已与 `origin/main` 同步）
+> 当前工作区：tracked clean；本轮新增 `videopress_framework/scripts/analyze_dit_semantics.py` 与 `videopress_framework/outputs/dit_semantic_analysis_20260922/`（均被 .gitignore 忽略，不进入提交）。
+> **当前状态：无运行中 GPU 任务。2026-09-22 完成 8-scene × 3-round × 30-layer DiT 逐层语义/注意力探针（并补做逐轮捕获）：future latent 约在 L16–18 由噪点转为可线性解码最终 latent（第 1 轮 L14 转正、L18 巩固；第 2/3 轮 L12 低点后 L18 再巩固）；history latent 约在 L8–15 由 patch 纹理重组为语义表示且三轮几乎不变；future trajectory 的最终规划语义约在 L10–12（核心 L11）形成；future 若必须 hard prune，L22+keep0.75 在 256 面板上 Pareto 优于 L15+keep0.875，但严格近无损门槛（CI 下界 > −0.002）仍未通过。**
+> **2026-09-22 长任务队列标准（用户要求）：预计等待/运行 >10 分钟且无需持续观察的 GPU 任务，必须进入持久 tmux 自动队列，自行获取空闲 GPU、写 status/ETA；计算 ETA 后立即结束连续监控，禁止用长 sleep 占前台导致 shell reset/SIGTERM 杀任务。当前队列：`outputs/auto_queue_20260922/`，ETA ≈ 3 h 52 min。**
+> **2026-09-22 自动队列已结束（15:24 CST）。full 7,876 结论：future L22+keep0.75 不可部署——`action_attention_vnorm` ΔPDM −0.011601 CI [−0.014996,−0.008387]；在 L22 校准后的 future selector ΔPDM −0.010396 CI [−0.013780,−0.007042]，只比训练-free scorer 提升 +0.0012，且 e2e 反增 +48.9 ms。未来 hard prune 仍不满足 near-lossless；当前最佳部署仍是 future 全保留的 `blockq_dyn_h32f68_k1149` / history-only press。**
+> **2026-09-22 15:52 新队列 `driveva_queue_late`：补 full `late_to_mid [22,22,18]` + 从零训练 L18/L22 selector（不再用 F3 初始化）+ `round_scheduled_learned_planning_selector` full。队列路径 `outputs/auto_queue_late_to_mid_20260922/`，ETA ≈ 3 h 42 min，预计 19:32 CST；按标准不持续监控。**
+> **2026-09-22 19:32 补充队列完成。full 7,876 最终补充结论：`late_to_mid [22,22,18]` action ΔPDM −0.013053 CI [−0.016461,−0.009679]；从零训练 layer-scheduled selector ΔPDM −0.011590 CI [−0.015071,−0.008212]（e2e +13.3 ms）。所有 future hard-prune 臂 CI 下界均 < −0.002，未过严格近无损；从零训练 selector 也不改善。最终最 balance 的部署仍是 future 全保留：`blockq_dyn_h32f68_k1149`，严格近无损用 `history_only`。future hard prune 停止。**
 > **F3 / 组合式 / 逐 block 动态保留三条线均已判决完毕，结论见下方与 §12。**
 > **当前最佳可部署点**：`blockq_dyn_h32f68_k1149` —— 全量 7,876 压缩率 **30.9%**
 > （hidden 1084，history 124+171，future 780 全保留），ΔPDM vs NoPress **−0.0013
@@ -182,6 +186,12 @@ DriveVA-lite/
 - **并发上限（2026-09-20 23:15 用户再次收紧）**：当前仅允许同时占用 **2 张 GPU**（建议 0/1，但 0/1 若被他人占用则用最空闲的两张）。所有 GPU
   任务必须通过 tmux 队列 `outputs/future_oracle_queue_v3_20260918/run_queue.sh` 排队执行，
   启动前检查 `nvidia-smi` 与 `ps`，不允许直接抢占 GPU。
+- **长任务持久 tmux 队列标准（2026-09-22 用户明确要求）**：预计等待或运行超过 ~10 分钟且无需
+  持续人工观察的 GPU 任务，必须放入持久 `tmux` 会话自动排队；队列脚本自行按空闲 GPU
+  （free ≥ 40 GiB）获取 2 卡、记录 `status.log` 与 ETA。**计算 ETA 后立即结束连续监控**，
+  禁止用长 `sleep` 阻塞前台 shell，防止 shell reset / SIGTERM 把后台任务一起杀掉。
+  当前实现：`videopress_framework/outputs/auto_queue_20260922/run_queue.sh`，
+  状态见 `status.log`，ETA 见 `ETA.txt`，最终见 `FINAL_SUMMARY.md`。
 - 绘图前设 `MPLCONFIGDIR=/tmp/driveva_mpl`，避免 matplotlib 写 home 失败。
 
 ### 3.2 模型与 checkpoint
@@ -703,6 +713,275 @@ zero `44/30`。近无损门槛（CI 下界 > `−0.002`）**未通过**，
 若 keep 0.75 仍远非近无损 → **彻底放弃 future hard prune**，转 structured attention /
 training-time bottleneck / merge；并且 **F3（训练 future selector）直接取消**：
 oracle 上界都不如随机，没有可蒸馏的信号。
+
+
+### 2026-09-22 — DiT 逐层语义探针：future 语义在 L16–18 出现，history 纹理在 L10–15 完成重组
+
+**目的**：直接观测 `history video latent`、`future video latent` 与 `future trajectory latent`
+在 3 轮 flow-matching、每轮 30 层 DiT 中的逐层表示与注意力，回答“哪一层开始形成可分辨语义”，
+并据此重新选择 press 的 `source layer / scorer / start position`。
+
+**仪器**（runtime-only，不改 clean model）：
+- `videopress_framework/scripts/analyze_dit_semantics.py`：在官方 `run_eval` 外部 pipeline
+  实例上挂 block forward hook 与 self-attn pre-hook，捕获 30 层 hidden、action/future/history
+  query 的注意力统计、每轮 final latent / final traj。
+- 面板：navtest-7876 前 8 个 token（truncated POC），`num_inference_steps=3`，timesteps
+  `[1000, 908, 716]`；布局与线上一致：video 1560（history 780 + future 780），traj 9
+  （prefix 1 + action 8），总长 1569。
+- 语义探针：每个 layer/round 取 128 token/场景，leave-one-scene-out ridge（8 folds）
+  从 hidden 预测最终 clean latent 的 patch 向量（future: final future latent；history:
+  clean history VAE latent）。另算 linear CKA 与 attention summary。
+
+**验证结果（8 scenes，POC）**：
+1. **future latent 由噪点转为语义**：第一轮（t=1000）future hidden 对最终 future latent
+   的 LOO R² 在 L16 首次转正（L13 −0.153 → L14 −0.080 → L15 −0.040 → L16 +0.014 →
+   L17 +0.081 → L18 +0.238 → L20 +0.326 → L29 +0.630）。第 2/3 轮输入已带前轮语义，
+   L0 已为正，但每轮仍一致在 **L18 附近显著跃升**（round2 L18 .343，round3 L18 .515）。
+   `future hidden ↔ final future latent` 的线性 CKA 同样在 L18 从 ~0.29 抬到 ~0.34，
+   L20 ~0.37。结论：**future video latent 的可分辨语义约在 L16–18 形成，L18 是稳定起点**；
+   L15 仍处于语义未成形区。
+2. **history latent 由 patch 纹理转为语义表示**：history hidden 对 clean history VAE
+   patch latent 的 LOO R² 从 L0 的 0.997 单调降到 L8 的 0.846、L14 的 0.824、L15 的 0.827，
+   之后在深层恢复（L28 0.915）。同时 `history ↔ future same-layer` CKA 在 L10 达峰
+   0.52–0.56，L12 0.30–0.35，L15 0.13–0.18，L18–24 接近 0。解释：**history 表示在
+   L0–L3 仍近乎直接保留 VAE patch 纹理，L8–L12 开始语义重组，L14–16 已基本脱离
+   原始 patch 可逆空间并完成 history/future 角色分离**。因此 history press 的现有 L15
+   正好在语义重组完成后的 knee 附近；本探针不支持把 history 起点提前到 L8–L12。
+3. **attention 分布**（8 场景均值，step0）：future-video query 的 future-mass 在 L10 0.713、
+   L15 0.523、**L18 0.663、L20 0.822**，L20 同时 entropy 下降到 3.86、top5 0.474、
+   effective tokens 189——future token 之间出现强自聚合。action query 的 future-mass
+   在浅层很高（L2 ~0.63、L15 ~0.535），但在 L18–20 转向 action/prefix 自注意力
+   （L18 action-mass 0.567、L20 0.475），说明 action 对 future video 的“可读窗口”
+   与 future 自身语义形成窗口一致在 **L18–20**；单纯用浅层 action 注意力并不能证明
+   噪声 future token 已有语义。
+4. **PDM 验证（truncated POC，不能当官方全量结论）**：对 future domain 做
+   `action_attention_vnorm + topk + hidden_sequence` 起点扫描。
+   - 64 场景 keep0.75：L15 ΔPDM −0.04198、L18 −0.02547、L20 −0.02794、L22 +0.00317；
+     L22 的正值在 256 面板未复现，判为小面板波动。
+   - 256 场景（same-scene paired，baseline PDM 0.906841）：
+     L15 keep0.875 ΔPDM **−0.01831** CI [−0.03689,−0.00225]（CI 排除 0，负）；
+     L18 keep0.75 **−0.01305** CI [−0.03633,+0.00932]；
+     L20 keep0.75 **−0.01707** CI [−0.04254,+0.00691]；
+     L22 keep0.75 **−0.00693** CI [−0.02467,+0.00938]；
+     L24 keep0.75 −0.00808 CI [−0.03096,+0.01340]。
+   - **同等理论 token-layer 预算**下：L15 keep0.875（删 98 token × 14 层）与
+     L22 keep0.75（删 195 token × 7 层）几乎相同；前者显著掉点，后者 CI 跨 0，
+     即“**把 future 压缩推迟到 L22、并一次多删 tokens**”优于 L15 高保留率。
+   - 严格近无损门槛（CI 下界 > −0.002）仍未通过；因此不能宣称 future hard prune 可部署。
+5. **scorer 建议**：在 L18–20 读取时，`action_attention_vnorm` 仍是可用的 baseline；
+   但 attention summary 显示 L20 future-video query 对未来 token 的 mass 达 0.822，
+   比 action query 更直接。下一候选是 **future-query attention × value norm** 的
+   `future_self_attention_vnorm`（score_i = Σ_{q∈future} attn(q→i)·‖V_i‖），以及
+   只在 L22 以后做物理压缩的 late-start press。
+
+**新增建议（待实现/验证）**：
+- **不要从 L15 开始压 future**；若做 future hard prune，当前 Pareto 最好点是
+  `future_video + action_attention_vnorm + hidden_sequence + source_layer=22 + keep=0.75`
+  （256 面板 ΔPDM −0.0069，CI 跨 0），但未过严格近无损门槛。
+- **非对称两段式 press（推荐 hack）**：history 在 L14–15 先压，future 保持全量；
+  L18–22 再压 future。现有 `HiddenSequencePersistenceController` 只支持单一 source layer，
+  需要扩展为“按 domain 分段的 hidden_sequence”控制器；这是下一阶段最直接的工程改动。
+- **history 起点维持 L15**（或 L14）；探针不支持提前到 L10–12。
+
+**产物**：
+`outputs/dit_semantic_analysis_20260922/`：
+- `capture8/capture.pt`（8 scenes × 3 rounds × 30 layers hidden + attention + targets，6.5GB）
+- `capture8/latent_probe_lo128.json`、`capture8/extra_probes.json`、`capture8_attn.txt`、`capture8_cka.log`
+- `report_assets/*.png`（future/history probe、attention curves）
+- `future_start_layer_sweep64_20260922/`、`future_start_layer_sweep256_20260922/`、
+  `future_l15_keep0875_256_20260922/`、`future_late_layer_keep075_256_20260922/`（PDM sweep）
+
+### 2026-09-22（续） — 3 轮 flow-matching 逐轮逐层定位
+
+**补充捕获**：`capture8_rounds/capture.pt` 额外保存每轮输入 `latents_in`、每轮 scheduler 输出
+`step_latents_out`、每轮 traj token 输入 `traj_tokens_in` 与每轮 traj 输出 `step_traj_out`；
+语义探针统一以**最终** clean latent / final trajectory 为目标，避免“预测本轮输入残差”造成的假阳性。
+
+**逐轮 future video latent（future hidden -> final future latent patch，LOO R²）**：
+
+| layer | round1 t=1000 | round2 t=908 | round3 t=716 |
+|---:|---:|---:|---:|
+| 12 | -0.078 | +0.174 | +0.448 |
+| 14 | +0.019 | +0.238 | +0.462 |
+| 16 | +0.131 | +0.261 | +0.471 |
+| 17 | +0.186 | +0.296 | +0.486 |
+| **18** | **+0.298** | **+0.387** | **+0.525** |
+| 19 | +0.353 | +0.443 | +0.560 |
+| 20 | +0.364 | +0.454 | +0.577 |
+| 24 | +0.456 | +0.554 | +0.654 |
+| 29 | +0.661 | +0.827 | +0.902 |
+
+- **Round 1** 是真正“噪声→语义”：L14 首次转正，L16 清晰，**L18 巩固**。
+- **Round 2/3** 输入已带部分语义；曲线呈 U 形，低点在 L12，L13 后回修，**L17→L18 再次跃升**。
+- **共同关键层：L18**；L20 是 future-video self-attention 最大聚合层。
+
+**逐轮 history latent（history hidden -> clean history VAE patch，LOO R²）**：
+三轮几乎重合：L0 ≈0.995 → L8 ≈0.79 → L8–15 平台 ≈0.77–0.80 → L28 ≈0.90。
+配合 history↔future CKA（L10 峰值、L15 后接近 0）可定位：
+**L1–L8 脱离 patch 纹理，L8–L15 完成 history/future 角色分离；history press source L15 与 round 无关。**
+
+**逐轮 trajectory latent（action token hidden -> 自己的最终轨迹点 (x,y,heading)，LOO R²）**：
+
+| layer | round1 | round2 | round3 |
+|---:|---:|---:|---:|
+| 9 | +0.619 | +0.762 | +0.857 |
+| **10** | **+0.791** | **+0.870** | **+0.891** |
+| **11** | **+0.898** | **+0.919** | **+0.925** |
+| 12 | +0.909 | +0.925 | +0.934 |
+| 14 | +0.915 | +0.932 | +0.941 |
+| 18 | +0.888 | +0.918 | +0.939 |
+| 24 | +0.878 | +0.919 | +0.949 |
+
+- **trajectory 最终规划语义在 L10–L12 形成，核心 L11**，比 future video latent（L18）早。
+- 三轮 attention 都有 action→future 的 **L10–L11 峰**，与 trajectory 形成同步；
+  future-video query 对 future token 的 mass 则在 **L20** 达最大（round1 0.822、round2 0.865、round3 0.886）。
+
+**对 press 的直接含义**：history 压 L15 合理；future 压 L15 太早，因为 L15 还在
+future latent 尚未可解码最终语义的区间；若必须压 future，至少从 L18 以后开始，
+256 面板当前 observed Pareto 点是 **L22 + keep0.75**。direction 仍是
+history L14–15 先压、future L18–22 后压的 domain-specific 两段式 hidden_sequence。
+
+产物：`capture8_rounds/round_probes_final.json`、`ROUND_REPORT.md`、`report_assets/*_per_round.png`。
+
+
+### 2026-09-22（续 2） — 5 张逐轮折线图、round-specific press 与 selector 重训判断
+
+**可视化**：已生成 5 张折线图，位于
+`videopress_framework/outputs/dit_semantic_analysis_20260922/report_assets/5charts/`：
+1. `01_future_video_per_round.png`：future hidden → final future latent；
+2. `02_history_video_per_round.png`：history hidden → clean history VAE latent；
+3. `03_trajectory_per_round.png`：action token hidden → final trajectory point；
+4. `04_action_to_future_attn_per_round.png`：action query → future video attention mass；
+5. `05_future_to_future_attn_per_round.png`：future-video query → future video attention mass。
+另生成 `00_five_charts_combined.png`。
+
+**round-specific press 判断**：
+- history：三轮 R²/CKA 基本重合，**不需要按轮换层**，固定 L15 合理。
+- future：第 1 轮从噪声起步，L14 才转正；第 2/3 轮仍在 L12 有低点、L18 再巩固。
+  因此 future **很可能值得做 round-adaptive 起点**：R1 L20–22，R2 L18–20，R3 L15–18。
+  这是假设，尚未做 PDM 验证；当前代码 `scorer.layer` 是静态的，需要支持按
+  `diffusion_rank` / round 解析 `layer_schedule`。
+- trajectory：三轮核心都在 L10–12/L11，不需要轮次相关位置；但 future 压太早会穿过
+  L10–12 的 action/future 跨分支读出窗口，这也是 future 不能在 L15 压的另一个原因。
+
+**selector 是否需要重训（CPU 零样本打分迁移）**：用现有 F3 future selector（训练于 L15）
+直接打分 L15 vs L18/L20/L22 hidden。结果为 Spearman / top195 overlap：
+- R1：L15↔L18 0.70/0.68，L20 0.57/0.58，L22 0.51/0.53；
+- R2：L18 0.72/0.69，L20 0.61/0.60，L22 0.56/0.55；
+- R3：L18 0.69/0.67，L20 0.60/0.60，L22 0.55/0.55。
+同层跨轮 score 一致性也只有中等（L15 R1↔R3 0.45/0.48，R2↔R3 0.71/0.69）。
+
+结论：
+1. **history selector 固定 L15 不需要重训**；
+2. **future selector 移到 L18 可零样本尝试**（有 ~0.7 rank 相关），但 L20/L22 迁移性下降，
+   建议在目标层做轻量 calibration / 只微调 selector head，而不是马上从头重训；
+3. 若上 round-adaptive schedule，优先用训练-free scorer（`action_attention_vnorm` /
+   `future_self_attention_vnorm`）或给 selector 增加 `(round, layer)` conditioning；
+4. 即便重训 future selector，也不能绕过 token-level oracle 对 future hard prune 的上界结论；
+   重训只改善给定 start/scorer 的排序，不替代两段式 press 和 start-layer 验证。
+
+
+### 2026-09-22（续 4） — 自动队列 full 7,876 判决：future L22 hard prune 不可部署
+
+队列 `outputs/auto_queue_20260922/` 已于 15:24 CST 全部完成（`QUEUE_COMPLETE`）。
+
+**512 面板候选（truncated POC，n=512）**：
+
+| arm | schedule | ΔPDM | 95% CI | avg_len_ratio |
+|---|---|---:|---|---:|
+| fixed22 | [22,22,22] | -0.01087 | [-0.02334,-0.00005] | 0.96686 |
+| fixed18 | [18,18,18] | -0.02259 | [-0.03938,-0.00678] | 0.95029 |
+| late_to_mid | [22,22,18] | -0.01102 | [-0.02436,+0.00089] | 0.96133 |
+| mid_to_late | [22,18,18] | -0.02535 | [-0.04099,-0.01099] | 0.95581 |
+
+- 更激进的 round-adaptive（R3 用 L18/L15）显著掉点，排除。
+- `late_to_mid [22,22,18]` 与 `fixed22` 质量接近、压缩更多且 CI 跨 0，但未被选为 full 臂；下一轮若要继续，应优先补它的 full。
+
+**Full 7,876 实测（selected fixed22，keep=0.75）**：
+
+| arm | PDM | ΔPDM vs NoPress | 95% CI | e2e latency |
+|---|---:|---:|---|---:|
+| NoPress | 0.909839 | 0 | — | 573.67 ms |
+| `action_attention_vnorm` L22 | 0.898238 | **−0.011601** | [−0.014996,−0.008387] | 572.67 ms（−1.0 ms） |
+| calibrated `learned_planning_selector` L22 | 0.899443 | **−0.010396** | [−0.013780,−0.007042] | 622.54 ms（**+48.9 ms**） |
+
+**结论**：
+
+1. **future-only L22 + keep0.75 不可部署**：两个 scorer 的 CI 都排除 0，且均显著低于 NoPress，未过严格近无损门槛。
+2. **selector calibration 收益不足**：L22 校准 selector 相对训练-free action scorer 仅 +0.001204 CI [−0.00175,+0.00421]，但延迟增加约 49 ms，质量-速度都不划算。
+3. **未来 hard prune 仍应停止**：当前最佳部署方向仍是 future 全保留；`blockq_dyn_h32f68_k1149`/history-only 仍是更好工作点。
+4. 若再尝试，只剩 `late_to_mid [22,22,18]` 值得 full；其他 round-adaptive 已明显更差。
+
+### 2026-09-22（续 4b） — 因果 knockout 探针：future 的依赖不随深度衰减
+
+**动机**：LOO-ridge 语义探针是相关性证据（"信息可线性读出"），不能回答"模型是否还需要这些
+token"。为直接回答"能不能删"，新增 runtime-only 因果探针
+`videopress_framework/scripts/analyze_dit_causal_knockout.py`：
+在第 ℓ 层 block 之后把目标域（future / history）token 的残差流置零（可指定单轮或每轮），
+跑完 3 轮后比较最终 traj latent 与 future video latent 相对 baseline 的位移；以
+"从 L0 起置零全部 video token" 的位移为 100%。置零与 `hidden_sequence` 在 Head 前对
+dropped token 的处理一致，因此该曲线直接对应"在这一层删掉这些 token，规划变多少"。
+
+**设置**：8 场景（`--max-eval-tokens 8`）、3 轮、每轮都置零；1 张空闲 GPU（GPU 1），
+约 4 分钟。产物 `outputs/dit_causal_knockout_20260922/run8_all/`
+（`KNOCKOUT_REPORT.md` / `knockout_summary.json`）。参照上限：全部 video@L0 → traj 位移
+`0.5817 ± 0.0647`（baseline traj latent 范数 `1.6868`）、video latent 位移 `505.5`。
+
+| 域 | 起始层 | traj 位移（mean ± SE） | / 上限 | video latent 位移 / 上限 |
+|---|---:|---:|---:|---:|
+| future | 8 | 0.366 ± 0.067 | 62.9% | 87.5% |
+| future | 15 | 0.262 ± 0.038 | 45.1% | 90.3% |
+| future | 22 | 0.352 ± 0.041 | 60.4% | 92.8% |
+| future | 24 | 0.264 ± 0.038 | 45.4% | 88.6% |
+| history | 8 | 0.321 ± 0.059 | 55.1% | 53.7% |
+| history | 15 | 0.092 ± 0.017 | 15.9% | 49.3% |
+| history | 22 | 0.064 ± 0.013 | 11.0% | 53.7% |
+
+配对同场景差异：`history L8−L15 = +0.228 ± 0.056`、`history L8−L22 = +0.257 ± 0.055`
+（衰减清晰）；`future L8−L22 = +0.014 ± 0.063`（无差异）。
+
+**结论（verified，8 场景 POC）**：
+
+1. **history 的信息在 L15 前已被吸收**：从 L8 置零影响 55%，L15 起只剩 16%，L22 起 11%
+   → 已部署的 history L15 press 有因果依据。
+2. **future 不存在"某层之后不再需要"的位置**：L8–L24 置零影响始终 45%–63%，无深度衰减；
+   future video latent 位移全程 88%–93%。模型在每轮、直到深层都仍在读 future token。
+3. **"语义在 L18 成形" ≠ "L18 之后可删"**：这解释了 full 7,876 上 L22+keep0.75 仍掉
+   −0.0116 —— 推迟压缩只减少受影响的层数，不能消除依赖；换 scorer 也绕不过去。
+4. **局限**：这是"全部删除"的极端扰动，测的是依赖强度而非可压缩比例；仅 8 场景；
+   读数为 latent 位移，不是 PDM。
+5. 该判据可用于评估后续机制：任何新方案（structured attention / bottleneck / merge）
+   都必须把这条"从某层起置零 future"的影响曲线压下来，才算真正可行。
+
+
+### 2026-09-22（续 6） — late_to_mid + 从零 selector full 7,876 最终判决
+
+**512 panel（truncated POC）**：`late_to_mid [22,22,18]` ΔPDM −0.01102 CI [−0.02436,+0.00089]，
+与本前 fixed22 −0.01087 接近，因此进入 full 补测。
+
+**Full 7,876（同一 fresh NoPress baseline，n=7876）**：
+
+| arm | PDM | ΔPDM vs NoPress | 95% CI | e2e delta |
+|---|---:|---:|---|---:|
+| NoPress | 0.909839 | 0 | — | — |
+| fixed22 action_attention_vnorm | 0.898238 | −0.011601 | [−0.014996,−0.008387] | −1.0 ms |
+| fixed22 selector, F3-initialized | 0.899443 | −0.010396 | [−0.013780,−0.007042] | +48.9 ms |
+| late_to_mid action_attention_vnorm | 0.896786 | −0.013053 | [−0.016461,−0.009679] | −1.6 ms |
+| **late_to_mid layer-scheduled selector, from scratch** | 0.898249 | **−0.011590** | [−0.015071,−0.008212] | +13.3 ms |
+
+配对结论：
+- `late_to_mid action − fixed22 action` = −0.001452 CI [−0.003307,+0.000377]（无显著差异，均值更差）；
+- `late_to_mid scratch selector − fixed22 action` = +0.000011 CI [−0.002876,+0.002917]（几乎相同）；
+- `late_to_mid scratch selector − fixed22 F3-calibrated` = −0.001193 CI [−0.003495,+0.001051]；
+- 从零训练 **没有改善**，反而比 F3 初始化 selector 略差且慢 +13.3 ms。
+
+**最终结论**：
+1. 所有 future hard-prune 臂 CI 下界都 `< −0.002`，**未过严格近无损门槛**。
+2. `late_to_mid [22,22,18]` 不比 fixed22 更好；从零训练 layer-scheduled selector 也没有改善。
+3. 最 balance 的可用 press 仍必须 **future 全保留**：
+   - 工程平衡：`blockq_dyn_h32f68_k1149`，30.9% 压缩，ΔPDM −0.0013 CI 跨 0；
+   - 严格近无损：`history_only`，ΔPDM +0.0013 CI 跨 0。
+4. **future token hard prune 路线正式停止**。瓶颈不在 selector 训练/初始化/层调度，而在 future token 子集空间本身。
 
 ## 5. 当前框架能力矩阵
 
@@ -2174,3 +2453,97 @@ future checkpoint 完全不敏感；而 future-only 臂的选择就是 future �
 产物：`outputs/f3_joint_full_7876_20260921/analyze_final.py`（本表）、`analyze_ep2.py`、
 `analyze_retention.py`。**以上全部为实测。**
 
+### 2026-09-22 — DiT 逐层语义探针会话
+
+- 读取 `AGENTS.md`、`wan_video_new.py`、Wan `DiTBlock`/`SelfAttention`、`run_official_navsim_press.py` 后，新增 runtime-only 捕获脚本 `analyze_dit_semantics.py`（已被 .gitignore 忽略）。
+- 在 GPU 0 空闲时跑 8-scene × 3-round × 30-layer 捕获；完成 future/history latent 的 LOO ridge probe、linear CKA、action/future/history query 注意力统计。
+- 结论：future 语义形成于 L16–18，history 纹理→语义重组完成于 L10–15；未来 hard prune 若必须做，L22+keep0.75 是当前 256 面板 Pareto 点，但未过严格近无损门槛。
+- 额外跑 64/256 场景 future start-layer PDM sweep；所有 PDM 均为 truncated POC，不是 7,876 官方结论。
+- 工作区未提交；新增输出全部在 ignored `outputs/` 下。下一次会话优先验证：两段式 domain-specific hidden_sequence 控制器、L18–20 future-query attention scorer、L22 future press 的更大面板/full 验证。
+
+### 2026-09-22（续） — 逐轮定位会话
+
+- 补做逐轮捕获 `capture8_rounds/`，保存每轮输入/输出、traj 输入/输出；统一用最终语义目标重新做 LOO ridge probe。
+- 确认：future video 关键层 L18（R1 L14 转正/L18 巩固，R2/R3 L12 低点后 L18 再巩固）；history 三轮不变、L8–15 重组；trajectory 核心 L10–12/L11；future self-attention 峰值 L20。
+- 结论写入 §4；未提交，输出均在 ignored `outputs/`。
+
+### 2026-09-22（续 2） — 5 图与 selector 重训判断会话
+
+- 生成 5 张逐轮折线图和 combined 图，目录见 §4 新增小节。
+- 用 CPU 对现有 F3 future selector 做 L15→L18/20/22 零样本 score 迁移与跨轮一致性分析；
+  结论：history 无需重训，future 移到 L18 可零样本试、L20/22 建议轻量 calibration。
+- 提出 round-adaptive future layer schedule 假设（R1 L20–22、R2 L18–20、R3 L15–18），但未做 PDM 验证；
+  需等 GPU 空闲后实现 `layer_schedule` 并按 AGENTS 资源规则实验。
+
+### 2026-09-22（续 3） — 长任务自动队列启动，结束连续监控
+
+- 新增 `--persistent-layer-schedule` 支持：core runtime/persistence/adapter 与 official runner
+  可按 flow-matching round 解析动态 source layer；静态 `scorer.layer` 仅作 fallback。
+- 512-scene 验证发现 `late_to_early [22,18,15]` 明显掉点（ΔPDM −0.0246 CI 排除 0；
+  说明 round 3 用 L15 仍太早）。已改为在持久 tmux 队列中自动验证更保守的候选：
+  `fixed22 [22,22,22]`、`fixed18 [18,18,18]`、`late_to_mid [22,22,18]`、`mid_to_late [22,18,18]`，
+  自动选近无损/最优臂，再跑 full 7,876。
+- 队列 `outputs/auto_queue_20260922/run_queue.sh` 阶段：
+  1) 512 panel 候选；2) 选最好 candidate；3) full 7,876 selected + fresh NoPress；
+  4) 在 selected earliest layer 做 selector calibration（已有 F3 权重初始化，3190 windows × 1 epoch）；
+  5) full 7,876 calibrated selector；6) 汇总 `FINAL_SUMMARY.md`。
+- ETA：约 **232 min ≈ 3 h 52 min**（预计 15:40 CST 左右完成，取决于 GPU 可用性与训练是否按预期）。
+  已写入 `outputs/auto_queue_20260922/ETA.txt`。
+- tmux 会话：`driveva_queue`。按用户要求，**不再持续监控**；后续只看
+  `status.log` / `FINAL_SUMMARY.md`。
+
+### 2026-09-22（续 4） — 组会报告产出会话
+
+- 用户要求按既有风格输出 20260922 组会报告。汇总本周期（09.18–09.22）四条线：
+  ① future hard prune 三条 oracle 全部否定；② 组合式 history+future 联合 press 与
+  全量 7876 判决；③ `block_quota` 逐 block 动态保留（强制分摊被证伪、动态机制 +4.7 压缩点）；
+  ④ DiT 逐层/逐轮语义探针与 late-start / round-adaptive press 建议。
+- 产出：`videopress_framework/outputs/group_meeting_report_20260922.md`（ignored，不进 git）。
+- 报告写作时队列 `auto_queue_20260922` 仍在跑 full 7876 `fixed22`；报告中该部分
+  明确标注为进行中，未写成结论。512 面板候选实测：`fixed22` −0.01087 [−0.02334,−0.00005]、
+  `late_to_mid` −0.01102 [−0.02436,+0.00089]、`fixed18` −0.02259、`mid_to_late` −0.02535、
+  `late_to_early` −0.0246；已选中 `fixed22`（train layer 22）。**无 GPU 实验由本会话发起。**
+- 未改动代码/实验状态；AGENTS.md 仅本条目 + 顶部时间戳更新。
+
+### 2026-09-22（续 4） — 自动队列完成与 full 判决
+
+- `auto_queue_20260922` 完成；tmux 会话已退出，GPU 释放。
+- 完整产物：`status.log`、`FINAL_SUMMARY.md`、`QUEUE_COMPLETE`、`full_selected.log`、`full_selector_l22.log`。
+- full 结论：future L22+keep0.75 无论 action_attention_vnorm 还是 L22 calibrated selector 都显著掉 PDM；
+  calibrated selector 仅 +0.0012 且 e2e +48.9 ms。**future hard prune 不满足 near-lossless，停止；保持 future 全保留。**
+- 若继续研究，唯一值得补的臂是 `late_to_mid [22,22,18]` 的 full 7,876。
+
+### 2026-09-22（续 5） — late_to_mid + from-scratch layer-scheduled selector 队列
+
+- 新增 `round_scheduled_learned_planning_selector` 与 runner `--persistent-learned-checkpoint-map`：
+  按 `ctx.layer_idx` 将 [22,22,18] schedule 路由到 L22/L18 两个 selector。
+- 启动持久 tmux `driveva_queue_late`，队列脚本
+  `outputs/auto_queue_late_to_mid_20260922/run_queue.sh`：
+  1) full 7,876 `late_to_mid [22,22,18]` + `action_attention_vnorm`；
+  2) 从零训练 L22 selector（3190 windows × 1 epoch）；
+  3) 从零训练 L18 selector（同 recipe）；
+  4) full 7,876 `round_scheduled_learned_planning_selector` on [22,22,18]；
+  5) 汇总 `FINAL_SUMMARY.md`，判定最 balance 的 press。
+- ETA ≈ 3 h 42 min；预计 19:32 CST。启动时只有 1 张空闲 GPU，队列会按标准等待 2 张空闲 GPU。
+- 16:13 首跑 full `late_to_mid` action 时，进程在 16:14 被外部 SIGTERM（exit −15）杀掉，无 records；主队列继续做 L22 from-scratch 训练。已另起 tmux `driveva_late_retry`，等主队列 `QUEUE_COMPLETE` 后自动重跑该臂并追加 full 结论。
+- 本会话不再持续监控；后续查看 `status.log` / `ETA.txt` / `FINAL_SUMMARY.md` / `QUEUE_COMPLETE`。
+
+### 2026-09-22（续 6） — 组会报告修订会话 + 因果 knockout 探针
+
+- 用户要求：报告改平实、压缩表格术语、结论分点、语义方法要讲清"为什么能分析出语义"，
+  必要时用一张空闲 GPU 重新分析。据此重写 `outputs/group_meeting_report_20260922.md`
+  （表头拆成"测试场景数 / 序列压缩率"，去掉"随机带/前沿/零分尾部"等隐语）。
+- 新增因果探针 `videopress_framework/scripts/analyze_dit_causal_knockout.py`（runtime-only，
+  不进入 git；同 `analyze_dit_semantics.py` 的 ignored 状态）：在 block ℓ 之后置零目标域
+  token 的残差流（`round=-1` = 每轮），测最终 traj latent / future video latent 的位移。
+  修掉一个初版 bug：`round=-1` 原先永不匹配导致 `all_video@L0` 参照为 0，已改为"每轮生效"。
+- 用 **1 张空闲 GPU（GPU 1）** 跑 8 场景 × 3 轮，12 个配置 ≈ 4 min。结果与结论见 §4
+  「2026-09-22（续 4b）」：history 在 L15 后影响降到 16%/11%，future 全程 45%–63% 无衰减。
+- 本会话未改动任何实验代码路径，未影响运行中的 `driveva_queue_late` / `driveva_late_retry`
+  （两者仍在跑；GPU 占用遵守"只用真正空闲的 1 张卡"）。
+
+### 2026-09-22（续 6） — 补充队列完成与 future hard prune 终止
+
+- `driveva_queue_late` 完成；`late_to_mid` action 首次被外部 SIGTERM，由 `driveva_late_retry` 自动重跑成功。
+- 产物：`outputs/auto_queue_late_to_mid_20260922/FINAL_SUMMARY.md`、`FINAL_CONCLUSION.md`、`QUEUE_COMPLETE`、`RETRY_COMPLETE`。
+- 最终判决：future hard prune 全面失败；最 balance 部署为 future 全保留 `blockq_dyn_h32f68_k1149`，严格近无损为 `history_only`。

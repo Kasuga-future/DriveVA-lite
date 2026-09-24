@@ -17,6 +17,7 @@ from .learned_selector import (
     ComposedLearnedPlanningSelectorScorer,
     DynamicTokenSelector,
     LearnedPlanningSelectorScorer,
+    RoundScheduledLearnedPlanningSelectorScorer,
 )
 
 __all__ = [
@@ -30,6 +31,7 @@ __all__ = [
     "ComposedLearnedPlanningSelectorScorer",
     "DynamicTokenSelector",
     "LearnedPlanningSelectorScorer",
+    "RoundScheduledLearnedPlanningSelectorScorer",
     "RandomScorer",
     "TokenNormScorer",
     "TokenScorer",

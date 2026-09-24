@@ -319,6 +319,7 @@ class DriveVAAdapter:
                 if torch.is_tensor(timestep) and timestep.numel():
                     runtime.current_diffusion_rank = int(timestep.reshape(-1)[0].item())
                     runtime.current_timestep = runtime.current_diffusion_rank
+                    runtime.note_model_timestep(runtime.current_diffusion_rank)
                 latents = kwargs.get("latents")
                 longcat = kwargs.get("longcat_latents")
                 traj = kwargs.get("traj_tokens")
@@ -412,6 +413,7 @@ class DriveVAAdapter:
                 if torch.is_tensor(timestep) and timestep.numel():
                     runtime.current_diffusion_rank = int(timestep.reshape(-1)[0].item())
                     runtime.current_timestep = runtime.current_diffusion_rank
+                    runtime.note_model_timestep(runtime.current_diffusion_rank)
                 longcat = kwargs.get("longcat_latents")
                 traj = kwargs.get("traj_tokens")
                 latents = kwargs.get("latents")
@@ -499,7 +501,9 @@ class DriveVAAdapter:
                     if runtime.press is None or runtime.layout is None:
                         raise RuntimeError("SELF_ATTN_KV hook requires an active layout and press")
                     scorer = getattr(runtime.press, "scorer", None)
-                    requested_layer = getattr(scorer, "layer", None)
+                    requested_layer = runtime.resolve_scorer_layer()
+                    if requested_layer is None:
+                        requested_layer = getattr(scorer, "layer", None)
                     effective_layer = _layer_idx if layer_idx is None else layer_idx
                     reuse_persistent_selection = False
                     observe_only = False
@@ -676,6 +680,7 @@ class DriveVAAdapter:
                 if torch.is_tensor(timestep) and timestep.numel():
                     runtime.current_diffusion_rank = int(timestep.reshape(-1)[0].item())
                     runtime.current_timestep = runtime.current_diffusion_rank
+                    runtime.note_model_timestep(runtime.current_diffusion_rank)
                 longcat = kwargs.get("longcat_latents")
                 traj = kwargs.get("traj_tokens")
                 latents = kwargs.get("latents")

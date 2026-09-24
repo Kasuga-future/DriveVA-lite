@@ -649,3 +649,135 @@ class LearnedPlanningSelectorScorer(TokenScorer):
         if self.all_video_history_only:
             signature += ":all_video_history_only=True"
         return signature
+
+@register_scorer("round_scheduled_learned_planning_selector")
+class RoundScheduledLearnedPlanningSelectorScorer(TokenScorer):
+    """Route a flow-matching round to the selector trained for its source layer.
+
+    ``checkpoints`` is either a mapping ``{layer: checkpoint_path}`` or a
+    string ``\"18:/path/a.safetensors,22:/path/b.safetensors\"``.  At scoring
+    time the adapter hook builds ``ctx.layer_idx`` from the active
+    ``layer_schedule`` (already supported by the core runtime); this scorer
+    dispatches to the sub-selector whose training layer matches that index.
+
+    This makes a round-adaptive schedule such as ``[22, 22, 18]`` usable with
+    learned selectors instead of only training-free attention scorers.
+    """
+
+    name = "round_scheduled_learned_planning_selector"
+    uses_pre_block_hidden = True
+
+    def __init__(
+        self,
+        checkpoints,
+        layer: int | None = None,
+        token_dim: int = 3072,
+        action_mode: str | None = None,
+        feature_mode: str = "all",
+        future_position_mode: str = "storage",
+        all_video_history_only: bool = False,
+    ):
+        if isinstance(checkpoints, dict):
+            mapping = {int(k): str(v) for k, v in checkpoints.items()}
+        elif isinstance(checkpoints, str):
+            mapping = {}
+            for raw in checkpoints.replace(";", ",").split(","):
+                item = raw.strip()
+                if not item:
+                    continue
+                if ":" not in item:
+                    raise ValueError(
+                        "round_scheduled selector checkpoints must be a "
+                        "comma-separated layer:path mapping, got "
+                        f"{item!r}"
+                    )
+                layer_text, path_text = item.split(":", 1)
+                mapping[int(layer_text.strip())] = path_text.strip()
+        else:
+            raise TypeError(
+                "round_scheduled selector checkpoints must be a mapping or string"
+            )
+        if not mapping:
+            raise ValueError("round_scheduled selector needs at least one checkpoint")
+        for sub_layer, sub_path in mapping.items():
+            if not 0 <= int(sub_layer) < 30:
+                raise ValueError(
+                    f"round_scheduled selector layer {sub_layer} outside [0, 29]"
+                )
+            if not Path(sub_path).is_file():
+                raise FileNotFoundError(
+                    f"round_scheduled selector checkpoint not found: {sub_path}"
+                )
+        self.layer = int(layer) if layer is not None else min(mapping)
+        self.token_dim = int(token_dim)
+        self.action_mode = action_mode
+        self.feature_mode = str(feature_mode)
+        self.future_position_mode = str(future_position_mode)
+        self.all_video_history_only = bool(all_video_history_only)
+        self.sub_scorers = {
+            int(sub_layer): LearnedPlanningSelectorScorer(
+                sub_path,
+                layer=int(sub_layer),
+                feature_layer=int(sub_layer),
+                token_dim=self.token_dim,
+                action_mode=action_mode,
+                feature_mode=self.feature_mode,
+                future_position_mode=self.future_position_mode,
+                all_video_history_only=self.all_video_history_only,
+            )
+            for sub_layer, sub_path in sorted(mapping.items())
+        }
+        self.checkpoints = {
+            int(sub_layer): scorer.checkpoint
+            for sub_layer, scorer in self.sub_scorers.items()
+        }
+
+    def reset_observations(self) -> None:
+        for scorer in self.sub_scorers.values():
+            scorer.reset_observations()
+
+    def observation_layers(self) -> tuple[int, ...]:
+        return ()
+
+    def _sub(self, ctx):
+        if ctx.layer_idx is None:
+            raise ValueError(
+                "round_scheduled selector requires ctx.layer_idx from the active schedule"
+            )
+        layer = int(ctx.layer_idx)
+        try:
+            return self.sub_scorers[layer]
+        except KeyError:
+            raise ValueError(
+                "round_scheduled selector has no checkpoint for source layer "
+                f"{layer}; available={sorted(self.sub_scorers)}"
+            ) from None
+
+    @torch.no_grad()
+    def observe(self, ctx) -> None:
+        sub = self._sub(ctx)
+        observe = getattr(sub, "observe", None)
+        if observe is not None:
+            observe(ctx)
+
+    @torch.no_grad()
+    def score(self, ctx):
+        return self._sub(ctx).score(ctx)
+
+    def describe(self) -> dict:
+        return {
+            **super().describe(),
+            "layer": self.layer,
+            "checkpoints": {str(k): v for k, v in self.checkpoints.items()},
+            "uses_pre_block_hidden": True,
+            "feature_mode": self.feature_mode,
+            "future_position_mode": self.future_position_mode,
+        }
+
+    def signature(self) -> str:
+        parts = [f"layer{k}={Path(v).name}" for k, v in sorted(self.checkpoints.items())]
+        return (
+            f"{self.name}:{','.join(parts)}:features={self.feature_mode}"
+            f":future_position_mode={self.future_position_mode}"
+        )
+

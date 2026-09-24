@@ -242,7 +242,10 @@ class HiddenSequencePersistenceController:
         # A source-layer-only K/V prune is represented by enabled=False and
         # never installs this hidden-sequence controller.
         end_layer = self.persistence.end_layer
-        source_layer = int(getattr(self.runtime.press.scorer, "layer"))
+        source_layer = self.runtime.resolve_scorer_layer()
+        if source_layer is None:
+            source_layer = getattr(self.runtime.press.scorer, "layer")
+        source_layer = int(source_layer)
         last_layer = int(num_blocks) - 1
         if end_layer is not None and source_layer < int(end_layer) < last_layer:
             raise ValueError(
@@ -271,7 +274,10 @@ class HiddenSequencePersistenceController:
         return restored
 
     def after_block(self, block_idx: int, x, freqs, t_mod):
-        source_layer = int(getattr(self.runtime.press.scorer, "layer"))
+        source_layer = self.runtime.resolve_scorer_layer()
+        if source_layer is None:
+            source_layer = getattr(self.runtime.press.scorer, "layer")
+        source_layer = int(source_layer)
         block_idx = int(block_idx)
         if self._active:
             end_layer = self.persistence.end_layer

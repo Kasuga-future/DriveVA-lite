@@ -80,6 +80,11 @@ class VideoPressRuntime:
         self.current_context = None
         self.current_diffusion_rank = None
         self.current_timestep = None
+        # Per-forward round index and schedule resolution.  ``current_round_index``
+        # is incremented whenever the diffusion timestep changes inside one
+        # sample; ``resolve_scorer_layer`` can then map round -> source layer.
+        self.current_round_index = -1
+        self._round_last_timestep = None
         self.last_result = None
         self.events: list[CompressionEvent] = []
         self.artifacts: dict[str, Any] = {}
@@ -94,6 +99,8 @@ class VideoPressRuntime:
         self.current_scene = getattr(sample, "scene_token", None) if sample is not None else None
         self.current_diffusion_rank = getattr(sample, "diffusion_rank", None) if sample is not None else None
         self.current_timestep = getattr(sample, "timestep", None) if sample is not None else None
+        self.current_round_index = -1
+        self._round_last_timestep = None
         if layout is not None:
             self.layout = layout
         self.current_context = None
@@ -115,6 +122,42 @@ class VideoPressRuntime:
     def set_context(self, context) -> None:
         self.current_context = context
         self.layout = context.layout
+
+    def note_model_timestep(self, timestep) -> None:
+        """Track the 0-based flow-matching round index inside one sample.
+
+        The official evaluator calls ``model_fn`` once per scheduler timestep.
+        We only increment when the scalar timestep actually changes, so built-in
+        CFG positive/negative calls with the same timestep stay in one round.
+        """
+        if timestep is None:
+            return
+        try:
+            value = float(timestep)
+        except (TypeError, ValueError):
+            return
+        if self._round_last_timestep is None or value != self._round_last_timestep:
+            self.current_round_index += 1
+            self._round_last_timestep = value
+
+    def resolve_scorer_layer(self, default_layer=None):
+        """Resolve the active press source layer for the current round.
+
+        ``scorer.layer_schedule``, when present, is a list ordered by
+        flow-matching round (first executed timestep = index 0).  Without it the
+        historical static ``scorer.layer`` is returned unchanged.
+        """
+        scorer = getattr(self.press, "scorer", None) if self.press is not None else None
+        schedule = getattr(scorer, "layer_schedule", None)
+        if schedule:
+            if not isinstance(schedule, (list, tuple)):
+                schedule = [schedule]
+            idx = 0 if self.current_round_index < 0 else int(self.current_round_index)
+            idx = max(0, min(idx, len(schedule) - 1))
+            return int(schedule[idx])
+        if default_layer is not None:
+            return default_layer
+        return getattr(scorer, "layer", None)
 
     @staticmethod
     def _domain_label(domain: Any) -> str:
