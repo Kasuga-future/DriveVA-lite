@@ -1,9 +1,30 @@
 # AGENTS.md — DriveVA-lite Video Token Compression 交接文件
 
-> 最后更新：2026-09-22 16:53 CST
-> 当前分支：`main`，当前 HEAD：`4781c1f`（已与 `origin/main` 同步）
-> 当前工作区：tracked clean；本轮新增 `videopress_framework/scripts/analyze_dit_semantics.py` 与 `videopress_framework/outputs/dit_semantic_analysis_20260922/`（均被 .gitignore 忽略，不进入提交）。
-> **当前状态：无运行中 GPU 任务。2026-09-22 完成 8-scene × 3-round × 30-layer DiT 逐层语义/注意力探针（并补做逐轮捕获）：future latent 约在 L16–18 由噪点转为可线性解码最终 latent（第 1 轮 L14 转正、L18 巩固；第 2/3 轮 L12 低点后 L18 再巩固）；history latent 约在 L8–15 由 patch 纹理重组为语义表示且三轮几乎不变；future trajectory 的最终规划语义约在 L10–12（核心 L11）形成；future 若必须 hard prune，L22+keep0.75 在 256 面板上 Pareto 优于 L15+keep0.875，但严格近无损门槛（CI 下界 > −0.002）仍未通过。**
+> 最后更新：2026-09-24 CST
+> 当前分支：`main`，当前 HEAD：`b98c6cc`（已与 `origin/main` 同步）
+> 当前工作区：tracked clean；本轮新增 Route A retraining 包与 2 个脚本（已提交）；
+> 训练产物写入被忽略的 `videopress_framework/outputs/route_a_retraining_20260924/`。
+> **2026-09-24 路线切换：future hard prune 已判决终止（见下），新阶段按用户提供的
+> 《DriveVA Dynamic Video Token Compression — Retraining Implementation Plan v2》执行。
+> 该计划要求把「在冻结模型里找可删 token」改成「训练 DriveVA 用少量 token 表达同样的
+> 驾驶信息」，分 Route A（Dynamic Select，只保留原 patch token + 阈值动态长度）与
+> Route B（Dynamic Register）。本轮实现并验证了 **Route A 的完整代码路径**，见
+> `ROUTE_A_IMPLEMENTATION_AND_TRAINING_REPORT.md` 与 §4「2026-09-24」。**
+> **Route A 可执行性结论（本轮，verified on CPU）：阈值 STE gate / 规划条件 scorer /
+> dense recovery decoder / A0–A4 课程 / KD 损失 / 动态长度统计全部实现并有 59 个单测（框架 323 passed）；
+> 在受控冗余仿真上用生产 `DiTBlock` 跑通端到端训练；但配上未训练 scorer 对照后
+> **仿真并不能证明 selector 学会了选择**（见 §4：K=40 时未训练对照已有 0.328 overlap，
+> 训练后反而降到 0）。真正站得住的发现是 §11 的 gather 信用分配缺口与 dense-gate 修复。**未**在 NAVSIM 上训练或评测（阻塞=GPU，不是代码）：当前 8 张 GPU 全部被他人占用
+> （free 最大 10.3 GiB，规则要求 ≥ 40 GiB），无法启动真实训练。**
+> **解析成本模型（`scripts/route_a_budget_report.py`）：real layout 下若 mean kept ≈ 240
+> video token（序列比 15.9%），Lb=18 时 backbone MAC 省 33.9%，Lb=15 省 42.4%，
+> Lb=12 省 50.9%；新增参数 scorer 2.18M（+gate 0）、recovery decoder 175M（仅训练/视频
+> flow 用），trajectory-only 推理额外开销 0.024%。即 Route A 若成立，收益比已部署
+> history press 的 2.8–3.4% 大一个数量级。**
+> **2026-09-22 历史状态：future hard prune 全面失败，最 balance 部署为 future 全保留的
+> `blockq_dyn_h32f68_k1149`，严格近无损为 `history_only`；该结论仍成立，因为 Route A
+> 是"重训"而非"冻结模型里剪枝"，两者不矛盾。**
+> 当前状态：无运行中 GPU 任务；CPU 上有 2 个 Route A 仿真训练任务（见 §12）。
 > **2026-09-22 长任务队列标准（用户要求）：预计等待/运行 >10 分钟且无需持续观察的 GPU 任务，必须进入持久 tmux 自动队列，自行获取空闲 GPU、写 status/ETA；计算 ETA 后立即结束连续监控，禁止用长 sleep 占前台导致 shell reset/SIGTERM 杀任务。当前队列：`outputs/auto_queue_20260922/`，ETA ≈ 3 h 52 min。**
 > **2026-09-22 自动队列已结束（15:24 CST）。full 7,876 结论：future L22+keep0.75 不可部署——`action_attention_vnorm` ΔPDM −0.011601 CI [−0.014996,−0.008387]；在 L22 校准后的 future selector ΔPDM −0.010396 CI [−0.013780,−0.007042]，只比训练-free scorer 提升 +0.0012，且 e2e 反增 +48.9 ms。未来 hard prune 仍不满足 near-lossless；当前最佳部署仍是 future 全保留的 `blockq_dyn_h32f68_k1149` / history-only press。**
 > **2026-09-22 15:52 新队列 `driveva_queue_late`：补 full `late_to_mid [22,22,18]` + 从零训练 L18/L22 selector（不再用 F3 初始化）+ `round_scheduled_learned_planning_selector` full。队列路径 `outputs/auto_queue_late_to_mid_20260922/`，ETA ≈ 3 h 42 min，预计 19:32 CST；按标准不持续监控。**
@@ -983,6 +1004,107 @@ dropped token 的处理一致，因此该曲线直接对应"在这一层删掉�
    - 严格近无损：`history_only`，ΔPDM +0.0013 CI 跨 0。
 4. **future token hard prune 路线正式停止**。瓶颈不在 selector 训练/初始化/层调度，而在 future token 子集空间本身。
 
+### 2026-09-24 — 切换到重训路线：Route A（Dynamic Select）完整实现 + 受控仿真训练 + 两个关键发现
+
+**背景**：future hard prune 已在全量 7,876 上判决终止（见上）。用户提供
+《DriveVA Dynamic Video Token Compression — Retraining Implementation Plan v2》，
+要求把问题从「冻结模型里哪些 token 可删」改成「训练模型用更少 token 表达同样信息」。
+本人按计划实现了 **Route A（Dynamic Select）**，并做了 CPU 上的可行性验证。
+完整报告：`ROUTE_A_IMPLEMENTATION_AND_TRAINING_REPORT.md`。
+
+**已实现（新增包 `videopress_framework/videopress/retraining/`，未改动任何既有模块）**：
+
+| 文件 | 内容 | 计划章节 |
+|---|---|---|
+| `threshold_gate.py` | `STEThresholdGate`（逐字实现 §4 STE：`scores=σ(logits)`、`soft=σ((scores-τ)/T)`、`hard=scores≥τ`、`mask=hard.detach()-soft.detach()+soft`）、per-domain 阈值、`SafetyClampConfig`、`sparsity_loss`、`SparsityCurriculum`、`jittered_thresholds`、`binding_row_domain_counts`、`gate_health`、`SparsityGuard` | §3–6, §29–30 |
+| `dynamic_selector.py` | `DynamicVideoTokenScorer`：token + action + timestep + position + history/future identity 交互打分；`pooled`/`attention` 两种 action 模式 | §10 |
+| `dense_recovery.py` | `DenseRecoveryDecoder`：全网格 query 对 selected token 做 cross-attention；输出层 zero-init | §12 |
+| `distillation.py` | `RouteALossWeights`、`layer_norm_mse`、`action_hidden_kd`（L11/L18/L29）、`compute_route_a_loss` | §13, §31–32 |
+| `compression_stats.py` | `CompressionStatsRecorder`（§34 schema）、长度分位数、`corr(K,σ)`、`corr(K,difficulty)`、`is_truly_dynamic`（识别退化为固定预算） | §15, §34–35 |
+| `route_a.py` | `RouteAConfig` / `RouteALayoutSpec` / `RouteADynamicSelect`（完整 forward：dense 前端 → 阈值 → 稀疏后端 → traj head → dense recovery → Wan head）、`sync_keep_lengths`、`build_driveva_video_positions`（与部署 `_positions()` 同坐标约定） | §8, §11, §15, §40, §42 |
+| `curriculum.py` | A0–A4 `StageSpec`、`RouterStageSchedule`（18→15→12 层课程）、`apply_stage`、`build_optimizer`（分组 LR）、`jitter_for_step` | §14, §28–30 |
+
+脚本：`scripts/train_route_a_smoke.py`（受控冗余仿真训练 + guarded NAVSIM 入口）、
+`scripts/route_a_budget_report.py`（解析成本模型）。
+测试：`tests/test_retraining_route_a.py`，**59 个测试全部通过；框架总计 323 passed（无回归）**。
+
+**解析成本模型（real layout，mean kept 240 video token ≈ 序列比 15.9%）**：
+
+| 起点层 Lb | 受压缩层数 | backbone MAC 节省 |
+|---|---:|---:|
+| 18 | 12 | **33.9%** |
+| 15 | 15 | **42.4%** |
+| 12 | 18 | **50.9%** |
+
+新增参数：scorer **2.18M**（gate 无参数）；recovery decoder 175M，但按 §42 的
+trajectory-only 推理可完全跳过，故部署额外开销仅 **0.024%** MAC。
+→ 若 Route A 成立，收益比已部署 history press 的 2.8–3.4% 延迟**大一个数量级**。
+
+**受控冗余仿真训练（生产 `DiTBlock`/`TrajectoryHead`/`Head`，CPU）**：
+teacher = 冻结 dense forward 只看 120 个 per-scene 随机 signal token（其余置零）；
+student 看全部 token，必须靠内容自行找出这 120 个。chance overlap = 7.7%。
+
+30 层 / `dim=256` / `Lb=18` / KD anchors L11-L18-L29 / A3 / 80 步 / λ→3e-3（2.02 s/step）：
+
+| step | loss | video_kd | action_hidden_kd | kept video | signal overlap |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 3.889 | 0.689 | 0.155 | 384 | 15.4% |
+| **8** | 3.293 | 0.470 | 0.181 | 40 | **72.5%** |
+| 16 | 3.145 | 0.421 | 0.157 | 40 | 10.0% |
+| 32 | 2.787 | 0.344 | 0.109 | 40 | 0.0% |
+| 80 | 2.615 | 0.283 | 0.087 | 40 | 0.0% |
+
+- step 8 的 72.5% 保留集**需要对照**：signal 是以"幅度 3×"注入的，任何 score 的 top-k 都
+  偏向高方差 token。实测未训练 scorer 的 null 分布（`scripts/route_a_sim_control.py`，200 场景）：
+  K=40 → **0.328±0.080**（p5–p95 = 0.200–0.475）、K=100 → 0.189、K=200 → 0.034、K=384 → 0.032，
+  chance = 0.077。即 K=40 时"远高于 chance"本身不构成证据。
+  step 8 的 0.725 确实超过对照 p95（0.475），是本报告唯一像"真学到"的点，但只有单点、且未存活。
+- **负向证据**：随后单调腐蚀到 0，K 被钉在 safety clamp 下限 40，
+  `is_truly_dynamic` 判定 `dynamic=False`（P10=P90=40）。
+- **完整 λ sweep（12 层 / A3 / 400 步，`capture_layers=4,8,11`）**：
+  gather 路径 5 臂（λ=0/3e-4/1e-3/3e-3/1e-2）**全部**收在 `K=40`、per-domain retention 恒为
+  `0.010/0.041`、overlap 0.000–0.022（**低于未训练对照 0.328**）、λ 对长度完全无影响；
+  dense-gate 路径 3 臂收在 `K=384`、overlap 0.074–0.077（对照在 K=384 为 0.032，但仍在 base rate
+  附近），traj_mse 0.0006 优于 gather 的 0.0010。
+  → **仿真没有产出任何压缩/质量工作点**；dense-gate 的价值是"失败得可控"（gate 仍可调），
+  不是"学会了选择"。在 NAVSIM 之前不能用它替代真实训练。
+
+**关键发现 1（verified，有单测断言）——逐字 `V[mask]` gather 让被丢弃 token 梯度恒为 0**：
+计划 §11 写 `V_sparse = V[mask]`。用整数 gather 实现时，被丢弃 token 的行在算 loss 之前
+就被移除，因此 loss 到它的 score **没有任何梯度路径**。实测：
+`|grad| on KEPT video tokens = 0.0066036`，`|grad| on DROPPED video tokens = 0.0`
+（`test_gather_ste_leaves_dropped_candidates_without_gradient`）。
+后果是结构性的：**选择集只能单调腐蚀**——只有当前被保留的候选在训练，被误删的重要 token
+永远无法把 score 抬回阈值以上。这也解释了上表：早期 K=384 时 384 个候选被监督，selector
+学会了；λ 把 K 压到 40 后只剩 40 个候选被监督，ranking 崩掉且不可恢复。
+**因此 λ_sparse sweep 并不是真正的压缩/质量前沿**：λ 超过某个值后不是"用质量换长度"，
+而是直接摧毁选择并让长度掉到 clamp 下限。
+
+**关键发现 2（修复，有单测断言）——dense-gated 训练**：
+`RouteADynamicSelect.forward(..., physical_shortening=False)` 在**整条序列**上跑后端，
+把被丢弃 token 的残差置零而不是 gather 掉，于是每个候选都能拿到梯度
+（`test_dense_gated_training_supervises_every_candidate` 断言被丢弃候选 `mean|grad| > 0`）。
+这是**训练松弛而非推理等价**（masked residual 的 key 仍留在 softmax 里，物理删除则不在），
+因此正确配方是两段式，driver 已直接支持：
+1. A1 warm-up 用 `--dense-gate`：所有候选都被监督，scorer 能建立全局正确的 ranking；
+2. `--physical-shortening-final-steps N`：最后 N 步切回推理等价的 gather forward，
+   让 backbone 与 recovery decoder 适应真实的短序列。
+另外 `--sparsity-guard`（默认开）每步算 `gate_health(logits, thresholds, T)`，
+一旦 gate 退化（`responsive < 0.05` 或平均 `|d mask/d logit| < 1e-5`）就拒绝继续抬高 λ，
+并记录干预次数——把计划 §14-A1「tau 低、lambda 很小」从 schedule 变成反馈控制。
+
+**未做 / 阻塞**：**没有在 DriveVA/NAVSIM 上训练或评测**。当前 8 张 GPU 全程被他人占用
+（各卡已用 38–42 GiB，最大 free 10.3 GiB，规则要求 free ≥ 40 GiB），无法启动真实训练；
+`--mode navsim` 入口显式拒绝运行并打印接线说明，避免把仿真结果误当 PDM 结论。
+资源估算（§28 配方、单卡）：A1 ≈2–4 GPU·h → A2 LoRA ≈8–12 → A3@Lb18 ≈20–30 →
+578 场景标定 ≈1 → full 7,876 paired ≈1.5，合计 **2–4 GPU·day** 得到第一个诚实答案。
+
+**结论（本阶段）**：
+1. **Route A 可实现、已实现、已单测、已在生产 block 上跑通训练**；
+2. **但计划 §11 的逐字 STE 有信用分配缺口**，不修就无法在低 K 下工作——这是本轮最有价值的发现；
+3. **是否能在 NAVSIM 上过 `CI_lower(ΔPDM) > −0.002` 且 mean video token < 300，仍未验证**，
+   当前唯一阻塞是 GPU 可用性，不是代码。
+
 ## 5. 当前框架能力矩阵
 
 | 能力 | 状态 | 说明 |
@@ -1005,6 +1127,9 @@ dropped token 的处理一致，因此该曲线直接对应"在这一层删掉�
 | future oracle/上界分析 | random-mask / tile / token-level set-level 三种 oracle 均已完成，**全部否定** | 1024 场景 keep0.5：随机 band `−0.0483`，搜索 mask 不优于随机（13 分位 / 输给全部臂）；tile `combined keep0.5` `−0.0182`；下一步只测 keep-ratio frontier |
 | **token-level set-level future oracle** | **已实现并跑完（代码 + 39 单测）；1024 场景验证为否定结果** | `oracle_future_token_mask` selector、`--future-oracle-token-mask-json(s)`、`videopress/oracle/`（token 分组 + set-level greedy/beam/random）、`scripts/search_future_token_set_oracle.py` |
 | future physical smoke | 已跑通 official single scene + 64-scene POC | `outputs/future_token_smoke_20260918/`、`outputs/future_poc64_report_20260917.md` |
+| **Route A retraining（阈值动态压缩 + 重训）** | **已实现 + 56 单测 + 受控仿真训练；未在 NAVSIM 训练** | `videopress/retraining/`：`STEThresholdGate`（plan §4 逐字 STE）、`DynamicVideoTokenScorer`（token+action+time+pos+类型）、`DenseRecoveryDecoder`、`compute_route_a_loss`（trajFM/videoFM/trajKD/videoKD/actionHiddenKD/sparse）、`CompressionStatsRecorder`（§34 schema + `is_truly_dynamic`）、A0–A4 课程 + 18→15→12 层课程 + `SparsityGuard`；脚本 `scripts/train_route_a_smoke.py`、`scripts/route_a_budget_report.py` |
+| **Route A 信用分配修复** | **已实现 + 单测断言** | 逐字 `V[mask]` gather 使 **被丢弃 token 梯度恒为 0**（已实测），选择集只能单调腐蚀；`physical_shortening=False` 的 dense-gate 训练可恢复全部候选梯度，配合 `--physical-shortening-final-steps` 收尾 |
+| **Route A 解析成本模型** | **已完成** | real layout、mean kept 240 video token（序列比 15.9%）：Lb=18 省 33.9% / Lb=15 省 42.4% / Lb=12 省 50.9% backbone MAC；新增 scorer 2.18M 参数（trajectory-only 额外开销 0.024%）、recovery decoder 175M（仅训练用） |
 
 ---
 
@@ -2547,3 +2672,35 @@ future checkpoint 完全不敏感；而 future-only 臂的选择就是 future �
 - `driveva_queue_late` 完成；`late_to_mid` action 首次被外部 SIGTERM，由 `driveva_late_retry` 自动重跑成功。
 - 产物：`outputs/auto_queue_late_to_mid_20260922/FINAL_SUMMARY.md`、`FINAL_CONCLUSION.md`、`QUEUE_COMPLETE`、`RETRY_COMPLETE`。
 - 最终判决：future hard prune 全面失败；最 balance 部署为 future 全保留 `blockq_dyn_h32f68_k1149`，严格近无损为 `history_only`。
+
+
+### 2026-09-24 — Route A（Dynamic Select）实现 + 受控仿真训练会话
+
+- 用户要求：读 AGENTS.md 与 plan v2；把当前代码进度 commit + push；探索实现 prune 路径 A 的
+  可行性；给出完整实现与训练报告。
+- **git**：先把上一会话遗留的改动提交并推送（`4781c1f → b98c6cc`，含
+  `round_scheduled_learned_planning_selector`、`resolve_scorer_layer`、
+  `--persistent-layer-schedule`、`pre_dit_gpu_smoke.py`、DiT 探针结论），再提交本轮的
+  Route A 代码 + 报告（见 §4「2026-09-24」与 `ROUTE_A_IMPLEMENTATION_AND_TRAINING_REPORT.md`）。
+- **新增代码**（不改任何既有模块，因此不影响已部署 press 与既有结论）：
+  `videopress/retraining/`（7 个模块 + `__init__`）、
+  `scripts/train_route_a_smoke.py`、`scripts/route_a_budget_report.py`、
+  `tests/test_retraining_route_a.py`（59 测试）。框架总计 323 passed，无回归。
+- **GPU 资源**：本会话 8 张卡全程被他人占用（各卡 38–42 GiB used，最大 free 10.3 GiB），
+  按"只用 free ≥ 40 GiB 的卡、最多 2 张"的规则**没有启动任何 GPU 任务**。
+  因此 Route A 没有 NAVSIM 训练/评测；`--mode navsim` 显式拒绝运行并打印接线说明。
+- **CPU 计算**：3 个受控冗余仿真训练任务（生产 `DiTBlock`/`TrajectoryHead`/`Head`）：
+  `sim_production_scale.json`（30 层 / dim 256 / Lb=18 / KD L11-L18-L29 / 80 步）、
+  `sim_sweep_a3.json`（12 层 gather 路径 λ sweep）、
+  `sim_sweep_a3_densegate.json`（12 层 dense-gate 路径 λ sweep + 40 步物理收缩收尾）。
+  产物目录 `videopress_framework/outputs/route_a_retraining_20260924/`（被 .gitignore 忽略）。
+- **两个关键发现**（见 §4 详细数据）：
+  1. 计划 §11 的逐字 `V[mask]` gather 使**被丢弃 token 梯度恒为 0**，选择集只能单调腐蚀；
+     30 层仿真实测：step 8 signal overlap 72.5%（chance 7.7%）→ step 32+ 归零，K 钉在 clamp 下限 40。
+  2. 修复：`physical_shortening=False` dense-gate 训练让所有候选拿到梯度，配合
+     `--physical-shortening-final-steps` 收尾；另有 `--sparsity-guard` 在 gate 退化时停止抬高 λ。
+- **下一步（唯一阻塞=GPU）**：按 §7.1 把 `RouteADynamicSelect` 接到
+  `model_fn_wan_video`（`pipe.route_a`，作为正式 `nn.Module` 入 checkpoint，不要做成 runtime hook），
+  复用 `train_navsim_v1.py` 的数据/teacher 路径，A1 用 `--dense-gate` 起步。
+  预计 2–4 GPU·day 拿到第一个诚实答案（A1 全量 + A2 LoRA + A3@Lb18 + 578 场景标定 + full 7,876 paired）。
+  判定门槛沿用 `CI_lower(ΔPDM) > −0.002` 且 `mean video tokens < 300`。
