@@ -1208,6 +1208,71 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
             lora_checkpoint=lora_checkpoint,
         )
 
+        # --- Route A ("Dynamic Select") retraining -------------------------
+        # Route A replaces the dense block loop with a threshold-gated sparse
+        # one, but its output contract is identical to the dense path (same Wan
+        # head, same unpatchify), so the flow-matching targets, the dataset and
+        # the evaluation harness all keep working unchanged.  It is configured
+        # through an environment variable so neither this class's signature nor
+        # main() has to change.
+        import os as _os
+
+        route_a_spec = _os.environ.get("DRIVEVA_ROUTE_A")
+        if route_a_spec:
+            import json as _json
+
+            from videopress.retraining import (
+                RouteAConfig,
+                RouteALayoutSpec,
+                SafetyClampConfig,
+            )
+
+            cfg = _json.loads(route_a_spec)
+            module = RouteAConfig(
+                token_dim=int(self.pipe.dit.dim),
+                bottleneck_layer=int(cfg.get("bottleneck_layer", 18)),
+                num_blocks=len(self.pipe.dit.blocks),
+                layout=RouteALayoutSpec(),
+                history_threshold=float(cfg.get("history_threshold", 0.5)),
+                future_threshold=float(cfg.get("future_threshold", 0.5)),
+                recovery_layers=int(cfg.get("recovery_layers", 2)),
+                safety_clamp=SafetyClampConfig(
+                    min_kept_history=int(cfg.get("min_kept_history", 8)),
+                    min_kept_future=int(cfg.get("min_kept_future", 32)),
+                    max_kept_total=(
+                        None
+                        if cfg.get("max_kept_total", 780) is None
+                        else int(cfg.get("max_kept_total", 780))
+                    ),
+                ),
+            ).build()
+            # Assigning an nn.Module registers it as a submodule of dit, so it is
+            # included in dit.parameters() and therefore in the checkpoints.
+            self.pipe.dit._tokenpress_route_a = module
+            # A1 uses the dense-gated relaxation: every candidate receives a
+            # gradient.  Physical shortening is switched on by the A2/A3 recipe.
+            self.pipe.dit._tokenpress_route_a_physical = bool(
+                cfg.get("physical_shortening", False)
+            )
+            if bool(cfg.get("freeze_backbone", True)):
+                for parameter in self.pipe.dit.parameters():
+                    parameter.requires_grad_(False)
+                for parameter in module.parameters():
+                    parameter.requires_grad_(True)
+            n_route_a = sum(
+                p.numel() for p in module.parameters() if p.requires_grad
+            )
+            n_dit = sum(
+                p.numel() for p in self.pipe.dit.parameters() if p.requires_grad
+            )
+            print(
+                f"[route-a] attached: trainable route_a={n_route_a/1e6:.2f}M "
+                f"trainable dit={n_dit/1e6:.2f}M "
+                f"bottleneck=L{int(cfg.get('bottleneck_layer', 18))} "
+                f"physical_shortening={self.pipe.dit._tokenpress_route_a_physical}",
+                flush=True,
+            )
+
     # ------------------------------------------------------------------
     # Counterfactual teacher helpers (review P0/P1/P3, 2026-09-11)
     # ------------------------------------------------------------------
