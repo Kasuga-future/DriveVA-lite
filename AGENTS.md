@@ -25,7 +25,13 @@
 > **2026-09-22 历史状态：future hard prune 全面失败，最 balance 部署为 future 全保留的
 > `blockq_dyn_h32f68_k1149`，严格近无损为 `history_only`；该结论仍成立，因为 Route A
 > 是"重训"而非"冻结模型里剪枝"，两者不矛盾。**
-> 当前状态：无运行中 GPU 任务；CPU 上有 2 个 Route A 仿真训练任务（见 §12）。
+> 当前状态：CPU 上无任务。GPU 2 跑 MVP substrate 对照（tmux `driveva_mvp`）；GPU 3 空闲。
+> **⚠️ git 推送受阻（2026-09-24）：VSCode git credential 全部失效，本机有 commit 未推送。**
+> 症状：三个 askpass socket（`/run/user/1007/vscode-git-{9c96753744,be1669dea6,d52c86db93}.sock`）
+> 全部返回 `remote: No anonymous write access.` / `Authentication failed`；读权限正常
+> （`git ls-remote` 可用）。`be1669dea6` 在本会话早前可用，之后失效。
+> 处置（用户 2026-09-24 明确要求）：**不要反复重试推送**，失败即上报。
+> 修复方式：在 VSCode 重新授权 GitHub，或人工执行 `git push origin main`。
 > **2026-09-22 长任务队列标准（用户要求）：预计等待/运行 >10 分钟且无需持续观察的 GPU 任务，必须进入持久 tmux 自动队列，自行获取空闲 GPU、写 status/ETA；计算 ETA 后立即结束连续监控，禁止用长 sleep 占前台导致 shell reset/SIGTERM 杀任务。当前队列：`outputs/auto_queue_20260922/`，ETA ≈ 3 h 52 min。**
 > **2026-09-22 自动队列已结束（15:24 CST）。full 7,876 结论：future L22+keep0.75 不可部署——`action_attention_vnorm` ΔPDM −0.011601 CI [−0.014996,−0.008387]；在 L22 校准后的 future selector ΔPDM −0.010396 CI [−0.013780,−0.007042]，只比训练-free scorer 提升 +0.0012，且 e2e 反增 +48.9 ms。未来 hard prune 仍不满足 near-lossless；当前最佳部署仍是 future 全保留的 `blockq_dyn_h32f68_k1149` / history-only press。**
 > **2026-09-22 15:52 新队列 `driveva_queue_late`：补 full `late_to_mid [22,22,18]` + 从零训练 L18/L22 selector（不再用 F3 初始化）+ `round_scheduled_learned_planning_selector` full。队列路径 `outputs/auto_queue_late_to_mid_20260922/`，ETA ≈ 3 h 42 min，预计 19:32 CST；按标准不持续监控。**
@@ -2705,3 +2711,44 @@ future checkpoint 完全不敏感；而 future-only 臂的选择就是 future �
   复用 `train_navsim_v1.py` 的数据/teacher 路径，A1 用 `--dense-gate` 起步。
   预计 2–4 GPU·day 拿到第一个诚实答案（A1 全量 + A2 LoRA + A3@Lb18 + 578 场景标定 + full 7,876 paired）。
   判定门槛沿用 `CI_lower(ΔPDM) > −0.002` 且 `mean video tokens < 300`。
+
+
+### 2026-09-24（续 2） — Route A 真实模型接线完成 + 正式训练受阻于 window 配置
+
+- **用户要求**：两张空闲卡分别跑 MVP 测试与路径 A 训练；git 推送失败不要反复重试，写进本文件。
+- **GPU 2**：`driveva_mvp` tmux 跑匹配长度"选择 vs 聚合"对照（1024 场景面板，keep 0.25，
+  4 臂：no_press / prune_random / merge_random / merge_similarity）。
+  `physical_no_press` 已 **valid=1025/1025**（888 s），`merge_random` 817 s 完成，
+  `merge_similarity` 收尾中。约 15 min/臂。产物 `outputs/substrate_merge_curve_20260924/`。
+- **GPU 3（Route A）已完成的三件事**：
+  1. **真实模型集成打通并证明**：`model_fn_wan_video` 新增 duck-typed
+     `dit._tokenpress_route_a` 分支（在 `x/t_mod/freqs/t` 就绪、dense block 循环之前；
+     属性缺失时是 no-op，323 测试全绿）。`scripts/route_a_real_forward_smoke.py`
+     在真实 `pdms90_9` 权重上跑通：`dim=3072`、30 blocks、bf16、1569 序列、
+     新增 177.5M 参数 → **`VALID_RECORD=True`**（PDM=0.0 属预期，scorer 随机初始化，
+     这是接线验证不是质量结果）。
+  2. **修掉 3 个只有真实集成才暴露的 bug**：① gate 在 fp32，`video*mask` 把残差流提升为 fp32
+     → 后续 block dtype 不匹配；② DriveVA 传**逐 token** timestep（cond=0/future=σ，长度 1560），
+     scorer 只接受标量/长度 B → 已原生支持逐 token（更优：token 自身噪声水平正是计划要求
+     条件化的信息）；③ `build_driveva_video_positions` 返回未 batch 的 `[N,3]`，
+     而 recovery decoder 用 `[B,K,3]` 索引 → omitted-positions 路径报维度错。
+  3. **训练侧接线**：`train_navsim_v1.py` 在 pipeline 构建 + `switch_pipe_to_training_mode`
+     之后按 `DRIVEVA_ROUTE_A` 环境变量挂载 Route A，冻结 backbone、只解冻压缩模块
+     （§14-A1 配方，A1 用 `physical_shortening=false` dense-gate）。环境变量传配置，
+     未改动 trainer 签名与 main()。Route A 输出契约与 dense 路径一致，
+     故 FM target / 数据集 / 评测全部照旧可用。
+- **正式训练未启动（阻塞点唯一）**：改用通用 manifest
+  `outputs/navsim_split_audit/train_manifest.jsonl`（3768 场景，**已确认自洽**：
+  `metadata_path` → `navsim_split_audit/metadata/train`、`sensor_path` →
+  `extra_trainval_32/.../sensor_blobs/trainval`，`usable=true`）后，仍报
+  `ValueError: no valid training window in .../2021.06.08.12.10.22_veh-38_...pkl`，
+  **且该场景并非所传 manifest 的第一条**——说明该异常不是从 `__getitem__` 的
+  `skip_missing_files` 重试路径抛出的（`SKIP_MISSING_FILES=1` 已设置），
+  更像发生在数据集构造/过滤阶段，按 metadata 目录枚举而非按 manifest 过滤。
+  下一步排查方向：`NavsimDriveVADataset.__init__` 里的 window 构建与 manifest 过滤键
+  （`scene_id` vs `scene_token`），以及默认 `configs/navsim_v1.yaml` 的
+  `frame_interval/windows_per_scene/num_future_frames/target_fps` 与该 manifest
+  生成时（`windows.route_valid_windows=16`）是否匹配。
+  队列脚本 `outputs/route_a_train_20260924/run_queue.sh` 为断点续跑，修正后可直接重启。
+- **未推送的 commit**：`b17ac39`（真实管线接线 + smoke）、`e170796`（trainer 接线）。
+  见顶部警告；**不要反复重试推送**。
