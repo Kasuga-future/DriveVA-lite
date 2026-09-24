@@ -110,6 +110,12 @@ class DenseRecoveryDecoder(nn.Module):
         """
         if sparse_hidden.ndim != 3:
             raise ValueError("sparse_hidden must be [B,K,D]")
+        # The backend runs in the model dtype (bf16 for DriveVA) while this
+        # decoder is created in fp32.  Cast on entry rather than forcing every
+        # caller to place the module in the right dtype: bf16 activations
+        # against fp32 weights raise "mat1 and mat2 must have the same dtype".
+        param_dtype = self.query_embed.dtype
+        sparse_hidden = sparse_hidden.to(dtype=param_dtype)
         batch, n_kept, dim = sparse_hidden.shape
         if dim != self.dim:
             raise ValueError(f"sparse_hidden width {dim} != decoder dim {self.dim}")
@@ -138,7 +144,7 @@ class DenseRecoveryDecoder(nn.Module):
         query = self.query_embed.unsqueeze(0).expand(batch, -1, -1) + self.index_embed.unsqueeze(0)
         if query_positions is not None:
             coords = torch.as_tensor(
-                query_positions, device=sparse_hidden.device, dtype=sparse_hidden.dtype
+                query_positions, device=sparse_hidden.device, dtype=param_dtype
             )
             if coords.ndim == 2:
                 coords = coords.unsqueeze(0)
@@ -153,7 +159,7 @@ class DenseRecoveryDecoder(nn.Module):
         key = key + self.key_index_embed(kept)
         if sparse_positions is not None:
             coords = torch.as_tensor(
-                sparse_positions, device=sparse_hidden.device, dtype=sparse_hidden.dtype
+                sparse_positions, device=sparse_hidden.device, dtype=param_dtype
             )
             if coords.ndim == 2:
                 coords = coords.unsqueeze(0)

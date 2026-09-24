@@ -25,7 +25,11 @@
 > **2026-09-22 历史状态：future hard prune 全面失败，最 balance 部署为 future 全保留的
 > `blockq_dyn_h32f68_k1149`，严格近无损为 `history_only`；该结论仍成立，因为 Route A
 > 是"重训"而非"冻结模型里剪枝"，两者不矛盾。**
-> 当前状态：CPU 上无任务。GPU 2 跑 MVP substrate 对照（tmux `driveva_mvp`）；GPU 3 空闲。
+> 当前状态：**Route A 正式训练已在 GPU 4 正常运行**（tmux `driveva_routea`）：
+> A1 / Lb=18 / 3768 场景 / 1 epoch / dense-gate / 冻结 backbone，
+> 实测 **1.04 it/s → 约 60 min**；已验证 `trainable route_a == trainable dit == 177.48M`
+> （优化器只看到 Route A 参数）。产物 `outputs/route_a_train_20260924/a1_l18_densegate/`。
+> MVP substrate 对照（GPU 2，tmux `driveva_mvp`）4/4 臂已完成，结果见 §4。
 > **⚠️ git 推送受阻（2026-09-24）：VSCode git credential 全部失效，本机有 commit 未推送。**
 > 症状：三个 askpass socket（`/run/user/1007/vscode-git-{9c96753744,be1669dea6,d52c86db93}.sock`）
 > 全部返回 `remote: No anonymous write access.` / `Authentication failed`；读权限正常
@@ -2752,3 +2756,62 @@ future checkpoint 完全不敏感；而 future-only 臂的选择就是 future �
   队列脚本 `outputs/route_a_train_20260924/run_queue.sh` 为断点续跑，修正后可直接重启。
 - **未推送的 commit**：`b17ac39`（真实管线接线 + smoke）、`e170796`（trainer 接线）。
   见顶部警告；**不要反复重试推送**。
+
+
+### 2026-09-24（续 3） — 清理 + 排查至 Route A 正式训练跑通；MVP substrate 结果反转既有判断
+
+**用户要求**：清理残留、排查阻塞，直到进入正常训练；git 推送失败不要反复重试（已写入顶部）。
+
+**清理**：删除被杀的 2 卡版队列残留 `outputs/substrate_merge_curve_20260924/QUEUE_COMPLETE`
+（它把 4 个臂全标 MISSING，误导读者）。修正两个队列脚本的完成判定：
+`arm_done` 原按固定路径找 `round01/<arm>/records.jsonl`，但 runner 在同名输出根已存在时会创建
+`_rerunNN` 后缀目录，导致误报 MISSING；改为 `find` 任意深度匹配。
+**教训**：MVP 其实 4/4 臂全部成功（各 1024 行），只是判定写错。
+
+**排查：5 个阻塞点，全部定位并修复（每个都只花 7–60 s 失败，未浪费 GPU 长跑）**
+
+| # | 阻塞 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | `PyYAML is required` | `train_navsim_v1.sh` 读 `$PYTHON`，未设时退回无 pyyaml 的解释器 | 队列脚本 `export PYTHON=<conda>/bin/python` |
+| 2 | `no valid training window`（第一版） | manifest 用 selector-capture split，但 metadata 指向 `navsim_split_audit/metadata/train`，两者不同源 | 按用户指示改用通用 `outputs/navsim_split_audit/train_manifest.jsonl`（3768，已核对 `metadata_path`/`sensor_path` 自洽） |
+| 3 | `no valid training window`（第二版，换 manifest 后仍在） | 出错场景 `2021.06.08...veh-38` 在 manifest 里但 **`route_valid_windows: 0`**；`train_navsim_v1.py:2764` 是 `has_route = not args.allow_missing_route`，未设该 flag 时要求每个场景都有 route。异常发生在**数据集构造期**，故 `skip_missing_files`（只护 `__getitem__`）无效 | `export ALLOW_MISSING_ROUTE=1` |
+| 4 | `NCCL ... RTX 4000 series doesn't support P2P or IB` | 4090 无可用 P2P/IB 路径 | `export NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1` |
+| 5 | `.../StreetWorld/.../navsim_workspace/dataset/maps does not exist!` | DriveVA yaml 里的绝对数据路径已过期（指向 StreetWorld 工作区），且脚本在 `eval config_exports` **之后**才 `export`，覆盖掉环境变量 | 修 `train_navsim_v1.sh`：按官方 runner 的方式从 `$REPO_ROOT/data` 解析 `NUPLAN_MAPS_ROOT` / `OPENSCENE_DATA_ROOT` / `NUPLAN_DATA_ROOT` |
+| 6 | `mat1 and mat2 must have the same dtype, but got BFloat16 and Float` | recovery decoder 建成 fp32，而 backbone 是 bf16（smoke 脚本里我用 `.to(dtype=)` 绕过，trainer 挂载时漏了） | ① `DenseRecoveryDecoder.forward` 入口把输入 cast 到自身 dtype（对调用方鲁棒）；② trainer 挂载时 `.to(device=..., dtype=dit 参数 dtype)` |
+
+**结果：Route A 正式训练已跑通。** smoke `rc=0`，日志含
+`[route-a] attached: trainable route_a=177.48M trainable dit=177.48M bottleneck=L18 physical_shortening=False`，
+A1 进入正常 step（`[train][step 225/3768] loss=3.343 video_loss=3.321 traj_loss=0.022`），
+1.04 it/s，GPU 4 97%，ETA ≈ 60 min。
+**已知无害噪声**：训练后自动 eval 会报 `/path/to/navsim_v1.1/navsim_logs/test` 不存在
+（yaml 占位符），异常被捕获、训练继续；它只影响 checkpoint 后的自动评测，不影响训练。
+
+**MVP substrate 对照结果（verdict on 之前的"聚合 vs 选择"判断，1024 场景面板，
+匹配长度，domain=last_history，pre-DiT(block 0)，keep_ratio=0.25）**
+
+| 臂 | PDM | Δ vs NoPress |
+|---|---:|---:|
+| `physical_no_press` | 0.911205 | — |
+| `prune_random`（选择/删除） | 0.830022 | **−0.0812** CI≈[−0.0999,−0.0624] |
+| `merge_random`（纯平均聚合） | 0.569067 | **−0.3421** CI≈[−0.3707,−0.3136] |
+| `merge_similarity`（合理分组聚合） | 0.589208 | **−0.3220** CI≈[−0.3504,−0.2936] |
+
+配对（1025 共同场景）：
+- `merge_random − prune_random = −0.2610`，CI≈[−0.2887,−0.2332]，**CI 排除 0**
+- `merge_similarity − prune_random = −0.2408`，CI≈[−0.2680,−0.2136]，**CI 排除 0**
+
+**⚠️ 这推翻了本会话早前基于 keep 0.5 的方向性判断。** 之前观察到 keep 0.5 / K=195 时
+merge(0.9057) 优于 random prune(0.8843)，据此认为"同 K 下聚合保留更多信息"。
+在 keep 0.25 上结论**完全反转**：聚合比删除低 0.24–0.26 PDM，且 PDM 崩到 0.57–0.59
+（接近随机驾驶）。所以：
+1. "聚合 ⊇ 选择（rank-K ⊇ 坐标选择）"是**表达力的上界论证，不是无训练时的经验结论**——
+   未训练的聚合可以远差于删除；
+2. 该优势强烈依赖 K，且在激进压缩端反向；
+3. 在 pre-DiT/L0 这个位置做聚合尤其糟（与既有"Pre-DiT 压缩 history 不可行"一致）：
+   25% 保留意味着每组平均 4 个 token，直接把残差流抹平，而 video FM 目标是**逐 patch**
+   重建目标，平均在结构上就有害。
+4. 因此 **Route B 的理由不能建立在"聚合本身更好"上**，只能建立在
+   ①**可学习** resampler（不必是平均）与 ②**从 block 0 起压**（同 K 省 84.9% vs 33.9%）
+   这两点上。这是对 §4 早期论断的修正。
+
+**未推送的 commit**：见顶部警告。按用户要求**只尝试一次**，失败即上报，不再重试。

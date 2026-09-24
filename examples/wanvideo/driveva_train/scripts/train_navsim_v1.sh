@@ -32,6 +32,19 @@ eval "${config_exports}"
 driveva_setup_distributed_env
 
 export PYTHONPATH="${REPO_ROOT}:${DRIVEVA_TRAIN_DIR}:${DRIVEVA_INFER_DIR}:${REPO_ROOT}/third_party:${REPO_ROOT}/third_party/nuscenes-devkit/python-sdk:${PYTHONPATH:-}"
+# The DriveVA yaml carries absolute data paths that go stale whenever the
+# workspace moves (it still points at a StreetWorld navsim_workspace copy).  The
+# official eval runner resolves these roots relative to the repo instead, so do
+# the same here; an explicit environment override still wins.
+_driveva_map_root=""
+for _cand in "${REPO_ROOT}/data/nuplan/nuplan-maps-v1.0" "${REPO_ROOT}/data/nuplan/maps"; do
+  if [[ -f "${_cand}/nuplan-maps-v1.0.json" ]]; then _driveva_map_root="${_cand}"; break; fi
+done
+if [[ -n "${_driveva_map_root}" ]]; then export NUPLAN_MAPS_ROOT="${_driveva_map_root}"; fi
+if [[ -d "${REPO_ROOT}/data/navsim_v1.1/openscene-v1.1" ]]; then
+  export OPENSCENE_DATA_ROOT="${REPO_ROOT}/data/navsim_v1.1/openscene-v1.1"
+fi
+if [[ -d "${REPO_ROOT}/data/nuplan" ]]; then export NUPLAN_DATA_ROOT="${REPO_ROOT}/data/nuplan"; fi
 export NUPLAN_MAPS_ROOT
 export NUPLAN_DATA_ROOT
 export NCCL_TIMEOUT="${NCCL_TIMEOUT:-${DDP_TIMEOUT_SECONDS}}"

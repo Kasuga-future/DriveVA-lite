@@ -1246,6 +1246,11 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
                     ),
                 ),
             ).build()
+            # Match the pipeline's dtype/device.  The decoder is dtype-robust by
+            # construction, but keeping the whole module in the model dtype
+            # avoids needless casts and keeps any saved checkpoint consistent.
+            _dit_param = next(self.pipe.dit.parameters())
+            module = module.to(device=_dit_param.device, dtype=_dit_param.dtype)
             # Assigning an nn.Module registers it as a submodule of dit, so it is
             # included in dit.parameters() and therefore in the checkpoints.
             self.pipe.dit._tokenpress_route_a = module
