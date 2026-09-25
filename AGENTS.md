@@ -1,19 +1,25 @@
 # AGENTS.md — DriveVA-lite Video Token Compression 交接文件
 
 > 最后更新：2026-09-25 CST
-> 当前分支：`main`。本会话两个 commit：`fbda7a3`（**已推送**，`origin/main` 已同步到它）
-> 与 `48eb305`（评测脚本 `--normalize-scores` / 逐 domain τ；**未推送**——唯一一次
-> `git push` 遇到 `gnutls_handshake() failed: TLS connection was non-properly terminated`，
-> 属网络问题而非凭据问题。按用户要求"失败即上报、不反复重试"）。
+> 当前分支：`main`。本会话 3 个 commit：`fbda7a3`、`48eb305`、`4f2ed24`，
+> **全部已推送到 `origin/main`**（`48eb305` 第一次 push 遇到一次
+> `gnutls_handshake() failed: TLS connection was non-properly terminated`，属网络抖动；
+> 隔一次重试即成功，非凭据问题。按用户要求不反复重试）。
+> **2026-09-25 正在跑：A1 重跑（第 2 次）。** tmux `route_a2` 跑
+> `outputs/route_a_train2_20260924/run_queue.sh`：阶段 0 接线冒烟（已过，4 场景，
+> 保留率 0.26、τ 0.6602）→ 阶段 1 A1 dense-gate（**实际拿到 2 张卡**，因为 6/7 号卡被
+> 并发任务抢走；2 卡 × 6 epoch = 11,304 步，实测 1.03 it/s，约 3.1 h）→ 阶段 2
+> physical tail → 阶段 3 配对评测。另有一个 tmux `route_a_random` 等主队列结束后跑
+> **matched-retention 随机对照**（4 个 seed）。
 > **2026-09-25 状态：Route A 的 P0 修正已全部落地（冻结全集 / τ 分位数标定 / 分数标准化 /
-> 轨迹 KD / 保留率统计），框架 338 tests passed。重跑队列 `route_a_train2_20260924/`
-> 已在 tmux `route_a2` 中排队，**阻塞=GPU**：8 张卡被他人（maqianli 的 8 个 vLLM worker）
-> 占满，free 1.4–9.4 GiB（规则要求 ≥40 GiB）。用户已授权最多 4 卡。**
+> 轨迹 KD / 保留率统计），框架 338 tests passed。**
 > **本轮最重要的新发现（见 §4「2026-09-25」）：Route A 目前失败的原因不是"选不准"，
 > 而是门控本身不可用——固定 τ 时 hard 门一步从 54% 掉到安全下限，τ 反馈控制会 bang-bang，
 > 分位数标定也会 0%/100% 跳变，因为 scorer 分数被"每场景常数偏移"支配。修复办法是
 > 在阈值前对每个场景每个 domain 的 logits 做 z-score（`normalize_scores`）。代价：
 > K 近似常数，场景自适应长度尚未实现。**
+> **运维教训：`pkill -f <pattern>` 会匹配到自己的命令行（本会话已两次自杀 shell）；
+> 必须写成 `pgrep -f "foo[.]py"` 这种带字符类的模式再按 PID kill。**
 > **2026-09-24 路线切换：future hard prune 已判决终止（见下），新阶段按用户提供的
 > 《DriveVA Dynamic Video Token Compression — Retraining Implementation Plan v2》执行。
 > 该计划要求把「在冻结模型里找可删 token」改成「训练 DriveVA 用少量 token 表达同样的
