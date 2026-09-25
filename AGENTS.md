@@ -1,23 +1,22 @@
 # AGENTS.md — DriveVA-lite Video Token Compression 交接文件
 
 > 最后更新：2026-09-25 CST
-> 当前分支：`main`。本会话 3 个 commit：`fbda7a3`、`48eb305`、`4f2ed24`，
-> **全部已推送到 `origin/main`**（`48eb305` 第一次 push 遇到一次
-> `gnutls_handshake() failed: TLS connection was non-properly terminated`，属网络抖动；
-> 隔一次重试即成功，非凭据问题。按用户要求不反复重试）。
-> **2026-09-25 正在跑：A1 重跑（第 2 次）。** tmux `route_a2` 跑
-> `outputs/route_a_train2_20260924/run_queue.sh`：阶段 0 接线冒烟（已过，4 场景，
-> 保留率 0.26、τ 0.6602）→ 阶段 1 A1 dense-gate（**实际拿到 2 张卡**，因为 6/7 号卡被
-> 并发任务抢走；2 卡 × 6 epoch = 11,304 步，实测 1.03 it/s，约 3.1 h）→ 阶段 2
-> physical tail → 阶段 3 配对评测。另有一个 tmux `route_a_random` 等主队列结束后跑
-> **matched-retention 随机对照**（4 个 seed）。
-> **2026-09-25 状态：Route A 的 P0 修正已全部落地（冻结全集 / τ 分位数标定 / 分数标准化 /
-> 轨迹 KD / 保留率统计），框架 338 tests passed。**
-> **本轮最重要的新发现（见 §4「2026-09-25」）：Route A 目前失败的原因不是"选不准"，
+> 当前分支：`main`。**无运行中 GPU 任务。** A1 重跑已完成并评测完毕。
+> **A1 判决（本轮最终结论，完整表格见 `ROUTE_A_A1_VERDICT_20260925.md` 与 §4「2026-09-25（续）」）：
+> 保留率终于被控住（全程 0.239–0.251，目标 0.25；对比上一轮 99.7%→50% 的失控漂移），
+> 所以在 1024 场景配对上第一次测到的是 Route A 本身。结果：Route A physical 检查点
+> **0.7422**（保留 22.6%），配对 ΔPDM **−0.1688** CI [−0.1921,−0.1464]；
+> matched-retention 随机对照 band **0.7501–0.7624**，
+> paired `physical − mean(random)` = **−0.0145 CI [−0.0317,+0.0021]（与随机不可区分）**；
+> dense-gate 检查点**显著差于随机**（−0.0490 CI 排除 0）。
+> 即：**「保留分数最高的 K 个」并不优于「均匀随机保留 K 个」——学到的排序没有可用信号**，
+> 与历史 frozen-oracle 结论一致。**建议 Route A 停在 A1。**
+> 随机对照不是普通 top-k：它在 domain 内**置换同一检查点自己的分数**，因此阈值、保留数、
+> 分数直方图完全一致，只有"保哪些"变了。
+> **本轮最重要的新发现（见 §4「2026-09-25」）：Route A 之前失败的原因不是"选不准"，
 > 而是门控本身不可用——固定 τ 时 hard 门一步从 54% 掉到安全下限，τ 反馈控制会 bang-bang，
 > 分位数标定也会 0%/100% 跳变，因为 scorer 分数被"每场景常数偏移"支配。修复办法是
-> 在阈值前对每个场景每个 domain 的 logits 做 z-score（`normalize_scores`）。代价：
-> K 近似常数，场景自适应长度尚未实现。**
+> 在阈值前对每个场景每个 domain 的 logits 做 z-score（`normalize_scores`）。**
 > **运维教训：`pkill -f <pattern>` 会匹配到自己的命令行（本会话已两次自杀 shell）；
 > 必须写成 `pgrep -f "foo[.]py"` 这种带字符类的模式再按 PID kill。**
 > **2026-09-24 路线切换：future hard prune 已判决终止（见下），新阶段按用户提供的
