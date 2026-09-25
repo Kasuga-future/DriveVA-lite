@@ -68,8 +68,17 @@ def parse_args(argv=None):
     p.add_argument("--out-root", type=Path, required=True)
     p.add_argument("--bottleneck", type=int, default=18)
     p.add_argument("--history-threshold", type=float, default=0.5)
-    p.add_argument("--future-threshold", type=float, default=0.5)
+    # ``None`` means "follow --history-threshold / --threshold", so an explicit
+    # per-domain value always wins over the shared override.
+    p.add_argument("--future-threshold", type=float, default=None)
     p.add_argument("--max-kept-total", type=int, default=780)
+    p.add_argument(
+        "--normalize-scores",
+        type=int,
+        default=0,
+        help="standardise each domain's logits within each scene before "
+        "thresholding; must match the recipe the checkpoint was trained with",
+    )
     p.add_argument("--physical-shortening", type=int, default=1)
     p.add_argument("--threshold", type=float, default=None,
                    help="override both domain thresholds; for the calibration sweep")
@@ -161,13 +170,31 @@ def main(argv=None) -> int:
             raise SystemExit("--route-a-checkpoint is required for --arm route_a")
         dit = pipe.dit
         param_dtype = next(dit.parameters()).dtype
+        # Resolve the per-domain thresholds once, with an explicit per-domain
+        # value always beating the shared ``--threshold`` override.
+        history_tau = float(args.history_threshold)
+        future_tau = (
+            history_tau
+            if args.future_threshold is None
+            else float(args.future_threshold)
+        )
+        if args.threshold is not None:
+            history_tau = float(args.threshold)
+            if args.future_threshold is None:
+                future_tau = float(args.threshold)
         module = RouteAConfig(
             token_dim=int(dit.dim),
             bottleneck_layer=int(args.bottleneck),
             num_blocks=len(dit.blocks),
             layout=RouteALayoutSpec(),
-            history_threshold=float(args.history_threshold),
-            future_threshold=float(args.future_threshold),
+            history_threshold=history_tau,
+            future_threshold=future_tau,
+            # Must match the training recipe exactly.  A checkpoint trained with
+            # a standardised gate evaluated without it (or vice versa) is a
+            # different model: the raw gate sees a per-scene score offset that
+            # swamps the ranking and only has "keep everything"/"keep nothing"
+            # states, so the retention would not match the run's calibration.
+            normalize_scores=bool(args.normalize_scores),
             safety_clamp=SafetyClampConfig(
                 min_kept_history=8, min_kept_future=32, max_kept_total=int(args.max_kept_total)
             ),
@@ -191,8 +218,6 @@ def main(argv=None) -> int:
             f"physical_shortening={bool(args.physical_shortening)}",
             flush=True,
         )
-        if args.threshold is not None:
-            module.gate.set_thresholds([float(args.threshold)] * module.gate.n_domain)
         # The A1 trainer also left the trajectory modules trainable, so the
         # checkpoint contains them.  Loading only the Route A tensors would
         # evaluate a Route A module against the ORIGINAL trajectory head, i.e. a
