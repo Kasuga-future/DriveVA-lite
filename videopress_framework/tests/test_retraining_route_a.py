@@ -26,7 +26,9 @@ from videopress.retraining import (
     DynamicVideoTokenScorer,
     RouteAConfig,
     RouteADynamicSelect,
+    QuantileThresholdCalibrator,
     RouteALayoutSpec,
+    RetentionController,
     RouterStageSchedule,
     SafetyClampConfig,
     SparsityCurriculum,
@@ -42,6 +44,7 @@ from videopress.retraining import (
     jitter_for_step,
     jittered_thresholds,
     layer_norm_mse,
+    per_domain_zscore,
     select_kept_indices,
     sparsity_loss,
     sync_keep_lengths,
@@ -256,6 +259,206 @@ def test_sparsity_curriculum_warmup_and_ramp():
 def test_sparsity_curriculum_validates_range():
     with pytest.raises(ValueError):
         SparsityCurriculum(warmup_steps=5, ramp_end_step=1, max_weight=1e-3)
+
+
+# --------------------------------------------------------------------------
+# retention controller (the fix for A1's uncontrolled keep-ratio drift)
+# --------------------------------------------------------------------------
+def test_retention_controller_raises_lambda_when_retention_is_too_high():
+    controller = RetentionController(target=0.25, gain=0.02, ema=0.0, tolerance=0.0)
+    assert controller.lambda_value == 0.0
+    for _ in range(10):
+        value = controller.observe(0.9)
+    assert value > 0.0
+    assert controller.updates == 10
+    assert controller.describe()["lambda"] == pytest.approx(value)
+
+
+def test_retention_controller_lowers_lambda_when_retention_is_too_low():
+    controller = RetentionController(
+        target=0.25, initial_lambda=1.0, gain=0.02, ema=0.0, tolerance=0.0
+    )
+    value = controller.observe(0.05)
+    assert value < 1.0
+
+
+def test_retention_controller_dead_band_stops_updates():
+    controller = RetentionController(target=0.25, gain=0.02, ema=0.0, tolerance=0.02)
+    value = controller.observe(0.26)
+    assert value == 0.0
+    assert controller.updates == 0
+    assert controller.skips == 1
+
+
+def test_retention_controller_clamps_step_and_lambda():
+    controller = RetentionController(
+        target=0.0 + 1e-6, gain=10.0, max_step=0.05, max_lambda=0.2, ema=0.0, tolerance=0.0
+    )
+    value = controller.observe(1.0)
+    assert value == pytest.approx(0.05)
+    for _ in range(100):
+        value = controller.observe(1.0)
+    assert value == pytest.approx(0.2)
+
+
+def test_retention_controller_ema_smooths_a_single_outlier():
+    controller = RetentionController(target=0.5, gain=0.1, ema=0.99, tolerance=0.0)
+    controller.observe(1.0)
+    assert controller.describe()["ema_observed"] == pytest.approx(1.0)
+    controller.observe(0.0)
+    # A lone adversarial batch may not move the smoothed estimate far.
+    assert controller.describe()["ema_observed"] > 0.9
+
+
+def test_retention_controller_validates_configuration():
+    with pytest.raises(ValueError):
+        RetentionController(target=0.0)
+    with pytest.raises(ValueError):
+        RetentionController(target=1.5)
+    with pytest.raises(ValueError):
+        RetentionController(initial_lambda=2.0, max_lambda=1.0)
+    with pytest.raises(ValueError):
+        RetentionController(ema=1.0)
+    controller = RetentionController()
+    with pytest.raises(ValueError):
+        controller.observe(float("nan"))
+    with pytest.raises(ValueError):
+        controller.observe(-0.1)
+
+
+# --------------------------------------------------------------------------
+# score standardisation + quantile calibration (the actual fix for the A1 gate)
+# --------------------------------------------------------------------------
+def test_per_domain_zscore_is_invariant_to_a_scene_offset():
+    base = torch.randn(1, 8)
+    shifted = base + 5.0
+    a = per_domain_zscore(base, [4, 4])
+    b = per_domain_zscore(shifted, [4, 4])
+    assert torch.allclose(a, b, atol=1e-5)
+    assert a[:, :4].mean().abs() < 1e-5
+    assert (a[:, :4].std(unbiased=False) - 1.0).abs() < 1e-3
+
+
+def test_per_domain_zscore_normalises_domains_separately():
+    logits = torch.cat([torch.randn(1, 4) * 3.0, torch.randn(1, 4) * 0.1 + 9.0], dim=1)
+    out = per_domain_zscore(logits, [4, 4])
+    for start in (0, 4):
+        chunk = out[:, start : start + 4]
+        assert chunk.mean().abs() < 1e-5
+        assert (chunk.std(unbiased=False) - 1.0).abs() < 1e-3
+
+
+def test_per_domain_zscore_validates_shape():
+    with pytest.raises(ValueError):
+        per_domain_zscore(torch.randn(2, 5), [4, 4])
+
+
+def test_normalised_gate_gives_a_stable_retention_across_scene_offsets():
+    """The regression this exists for.
+
+    Without standardisation the same scorer output shifted by a per-scene
+    constant moved the gate between 0% and 100%; the 40-step smoke on real
+    weights recorded exactly that (0.026, 0.46, 1.00, 0.29 ...).
+    """
+    torch.manual_seed(0)
+    base = torch.randn(780)
+    clamp = SafetyClampConfig(min_kept_history=0, min_kept_future=0, max_kept_total=None)
+    normalised = STEThresholdGate(
+        (780, 780), thresholds=(0.66, 0.66), normalize_scores=True, clamp=clamp
+    )
+    raw = STEThresholdGate(
+        (780, 780), thresholds=(0.66, 0.66), normalize_scores=False, clamp=clamp
+    )
+    ratios = []
+    for offset in (0.0, 4.0, -4.0):
+        scores = torch.stack([torch.cat([base + offset, base + offset])])
+        ratios.append(sum(normalised(scores).kept_counts))
+    assert len(set(ratios)) == 1
+    assert 0.15 < ratios[0] / 1560 < 0.35
+    raw_ratios = []
+    for offset in (0.0, 0.05, -0.05):
+        scores = torch.stack([torch.cat([base * 0.01 + 0.47 + offset] * 2)])
+        raw_ratios.append(sum(raw(scores).kept_counts))
+    assert len(set(raw_ratios)) == 1  # the raw gate cannot see the ranking
+
+
+def test_quantile_calibrator_hits_the_target_quantile():
+    calibrator = QuantileThresholdCalibrator(
+        target=0.25, interval=10, warmup_samples=3, smoothing=1.0
+    )
+    scores = torch.cat(
+        [
+            torch.rand(3, 780) * 0.02 + 0.45,
+            torch.rand(3, 780) * 0.02 + 0.47,
+        ],
+        dim=1,
+    )
+    out = None
+    for step in range(3):
+        out = calibrator.observe(scores, [780, 780], step)
+    assert out is not None
+    assert calibrator.calibrations == 1
+    # The chosen threshold keeps roughly the requested fraction of the pool.
+    for index, tau in enumerate(out):
+        pool = scores[:, index * 780 : (index + 1) * 780].reshape(-1)
+        kept = (pool >= tau).float().mean()
+        assert 0.15 < float(kept) < 0.35
+
+
+def test_quantile_calibrator_respects_the_interval():
+    calibrator = QuantileThresholdCalibrator(
+        target=0.5, interval=100, warmup_samples=2, smoothing=0.0
+    )
+    scores = torch.rand(1, 8)
+    assert calibrator.observe(scores, [4, 4], 0) is None
+    assert calibrator.observe(scores, [4, 4], 1) is not None
+    assert calibrator.observe(scores, [4, 4], 2) is None
+    assert calibrator.observe(scores, [4, 4], 50) is None
+    assert calibrator.observe(scores, [4, 4], 101) is not None
+    assert calibrator.calibrations == 2
+
+
+def test_quantile_calibrator_smooths_towards_the_new_quantile():
+    calibrator = QuantileThresholdCalibrator(
+        target=0.5, initial=(0.2, 0.2), interval=1, warmup_samples=1, smoothing=1.0
+    )
+    scores = torch.ones(1, 32) * 0.9
+    calibrator.observe(scores, [16, 16], 0)
+    assert calibrator.values[0] == pytest.approx(0.9, abs=1e-6)
+    calibrator.values = [0.2, 0.2]
+    calibrator.smoothing = 0.5
+    calibrator._last_calibration_step = 0
+    calibrator.observe(scores, [16, 16], 5)
+    assert calibrator.values[0] == pytest.approx(0.55, abs=1e-6)
+
+
+def test_quantile_calibrator_skips_domains_with_too_few_samples():
+    calibrator = QuantileThresholdCalibrator(
+        target=0.5, initial=(0.5, 0.5), interval=1, warmup_samples=1, smoothing=1.0
+    )
+    out = calibrator.observe(torch.ones(1, 8) * 0.9, [4, 4], 0)
+    assert out is not None
+    # A 4-candidate domain carries no usable quantile, so it keeps its value.
+    assert calibrator.values == [0.5, 0.5]
+    assert calibrator.last_quantiles == [None, None]
+
+
+def test_quantile_calibrator_validates_configuration():
+    with pytest.raises(ValueError):
+        QuantileThresholdCalibrator(target=0.0)
+    with pytest.raises(ValueError):
+        QuantileThresholdCalibrator(interval=0)
+    with pytest.raises(ValueError):
+        QuantileThresholdCalibrator(warmup_samples=0)
+    with pytest.raises(ValueError):
+        QuantileThresholdCalibrator(smoothing=1.5)
+    with pytest.raises(ValueError):
+        QuantileThresholdCalibrator(lower=0.9, upper=0.1)
+    calibrator = QuantileThresholdCalibrator()
+    with pytest.raises(ValueError):
+        calibrator.observe(torch.rand(2, 5), [4, 4], 0)
+    with pytest.raises(ValueError):
+        calibrator.observe(torch.rand(2, 8).unsqueeze(0), [4, 4], 0)
 
 
 def test_jittered_thresholds_stay_in_range():

@@ -602,6 +602,12 @@ class InProcessAutoEvalModelLogger(ModelLogger):
             file_name = f"step-{self.num_steps}.safetensors"
             self.save_model(accelerator, model, file_name)
             self._run_auto_eval(accelerator, model, os.path.splitext(file_name)[0])
+        # Route A's compression report must be written even when the run dies
+        # before the last save.
+        unwrapped = getattr(model, "module", model)
+        finalize = getattr(unwrapped, "_route_a_finalize_stats", None)
+        if callable(finalize):
+            finalize()
 
     def _eval_module(self, name: str):
         if name not in self._eval_modules:
@@ -1219,15 +1225,15 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
 
         route_a_spec = _os.environ.get("DRIVEVA_ROUTE_A")
         if route_a_spec:
-            import json as _json
-
             from videopress.retraining import (
+                RetentionController,
+                QuantileThresholdCalibrator,
                 RouteAConfig,
                 RouteALayoutSpec,
                 SafetyClampConfig,
             )
 
-            cfg = _json.loads(route_a_spec)
+            cfg = json.loads(route_a_spec)
             module = RouteAConfig(
                 token_dim=int(self.pipe.dit.dim),
                 bottleneck_layer=int(cfg.get("bottleneck_layer", 18)),
@@ -1245,6 +1251,14 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
                         else int(cfg.get("max_kept_total", 780))
                     ),
                 ),
+                # Standardise each domain's logits within each scene before
+                # thresholding.  Without this the gate is blind to the actual
+                # compression decision: measured on real weights the per-scene
+                # score offset is as large as the within-scene spread, so one
+                # global tau alternated between "keep nothing" and "keep
+                # everything" on consecutive steps (AGENTS.md section 4,
+                # 2026-09-24).
+                normalize_scores=bool(cfg.get("normalize_scores", False)),
             ).build()
             # Match the pipeline's dtype/device.  The decoder is dtype-robust by
             # construction, but keeping the whole module in the model dtype
@@ -1260,7 +1274,15 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
                 cfg.get("physical_shortening", False)
             )
             if bool(cfg.get("freeze_backbone", True)):
-                for parameter in self.pipe.dit.parameters():
+                # Freeze the WHOLE pipeline, not just ``dit``.  The first A1 run
+                # only froze ``dit``, so ``switch_pipe_to_training_mode``'s
+                # ``--use_trajectory`` default ("trajectory_encoder,
+                # trajectory_head") left the trajectory modules trainable and
+                # they were written into the Route A checkpoint.  That made the
+                # run measure a co-trained trajectory head as well as the
+                # selector, which is why its result cannot be attributed to
+                # Route A.  Route A must own every trainable parameter.
+                for parameter in self.pipe.parameters():
                     parameter.requires_grad_(False)
                 for parameter in module.parameters():
                     parameter.requires_grad_(True)
@@ -1270,13 +1292,401 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
             n_dit = sum(
                 p.numel() for p in self.pipe.dit.parameters() if p.requires_grad
             )
+            _other = [
+                (name, sum(p.numel() for p in mod.parameters() if p.requires_grad))
+                for name, mod in self.pipe.named_children()
+                if name != "dit"
+            ]
+            _other = [(name, n) for name, n in _other if n > 0]
+            if _other:
+                raise RuntimeError(
+                    "Route A with freeze_backbone=True must be the only trainable "
+                    f"module, but these pipe children still require grad: {_other}"
+                )
+            # --- loss policy -------------------------------------------------
+            # ``trajectory_loss_scale`` exists because the flow-matching loss
+            # averages 780 video tokens against ~8 trajectory points: without an
+            # explicit reweighting the scorer is overwhelmingly optimised to
+            # preserve future-video reconstruction rather than the plan, and PDM
+            # is what the compression policy is judged on.
+            self.route_a_trajectory_loss_scale = float(
+                cfg.get("trajectory_loss_scale", 1.0)
+            )
+            # --- budget control -----------------------------------------------
+            # Which knob controls the keep count, and why (see the wiring smokes
+            # recorded in AGENTS.md section 4):
+            #
+            # * The count comes from the per-scene quantile threshold: the gate
+            #   standardises each domain's logits within each scene and keeps
+            #   ``score >= tau``.  A dual-ascent controller on tau was tried
+            #   first and bang-banged, because the realised keep ratio is a
+            #   near-step function of tau.
+            # * ``lambda_sparse`` is therefore off by default
+            #   (``lambda_sparse_max=0``).  With a standardised gate a uniform
+            #   score shift changes nothing at all, so the plan's mean-score
+            #   penalty can only distort the shape of the ranking rather than
+            #   control the budget.  It stays wired up for an un-normalised
+            #   recipe, where it does act on the score scale.
+            self.route_a_lambda_controller = RetentionController(
+                target=float(
+                    cfg.get("lambda_target", cfg.get("retention_target", 0.25))
+                ),
+                initial_lambda=float(cfg.get("lambda_sparse_initial", 0.0)),
+                max_lambda=float(cfg.get("lambda_sparse_max", 0.0)),
+                gain=float(cfg.get("lambda_gain", 0.05)),
+                tolerance=float(cfg.get("lambda_tolerance", 0.02)),
+                max_step=float(cfg.get("lambda_max_step", 0.02)),
+                ema=float(cfg.get("lambda_ema", 0.9)),
+            )
+            self.route_a_threshold_controller = QuantileThresholdCalibrator(
+                target=float(cfg.get("retention_target", 0.25)),
+                initial=(
+                    float(cfg.get("history_threshold", 0.5)),
+                    float(cfg.get("future_threshold", 0.5)),
+                ),
+                interval=max(1, int(cfg.get("tau_interval", 100))),
+                warmup_samples=max(1, int(cfg.get("tau_warmup_samples", 4))),
+                smoothing=float(cfg.get("tau_smoothing", 0.5)),
+            )
+            self.route_a_retention = self.route_a_threshold_controller
+            self.route_a_sparsity_source = str(cfg.get("sparsity_source", "scores"))
+            if self.route_a_sparsity_source not in {"soft", "scores"}:
+                raise ValueError(
+                    "sparsity_source must be 'soft' (STE keep probability) or "
+                    f"'scores' (sigmoid(logit)), got {self.route_a_sparsity_source!r}"
+                )
+            # Trajectory-flow distillation against the frozen dense teacher.
+            # ``kd_interval > 1`` amortises the extra dense forward pass, which
+            # roughly doubles the step cost.
+            self.route_a_traj_kd_weight = float(cfg.get("traj_kd_weight", 0.0))
+            self.route_a_kd_interval = max(1, int(cfg.get("kd_interval", 1)))
+            self.route_a_stats_every = max(1, int(cfg.get("stats_every", 50)))
+            self.route_a_bottleneck_layer = int(cfg.get("bottleneck_layer", 18))
+            self.route_a_lambda_value = 0.0
+            self.route_a_stats_path = cfg.get("stats_path")
+            # Warm start / stage hand-off.  ``FULL_CKPT`` cannot carry this: it
+            # holds the DriveVA backbone, whereas a Route A checkpoint holds only
+            # the compression module, so the two are loaded independently.
+            route_a_ckpt = _os.environ.get("DRIVEVA_ROUTE_A_CKPT")
+            if route_a_ckpt:
+                from diffsynth.models.utils import load_state_dict as _load_sd
+
+                prefix = "dit._tokenpress_route_a."
+                saved = _normalize_train_ckpt_keys(_load_sd(route_a_ckpt))
+                stripped = {
+                    key[len(prefix) :]: value
+                    for key, value in saved.items()
+                    if key.startswith(prefix)
+                }
+                foreign = [
+                    key
+                    for key in saved
+                    if not key.startswith(prefix)
+                ]
+                if not stripped:
+                    raise RuntimeError(
+                        f"no {prefix}* parameters found in {route_a_ckpt}"
+                    )
+                missing, unexpected = module.load_state_dict(stripped, strict=False)
+                print(
+                    f"[route-a] warm start from {route_a_ckpt}: "
+                    f"loaded={len(stripped)} missing={len(missing)} "
+                    f"unexpected={len(unexpected)} "
+                    f"ignored_non_route_a={len(foreign)}",
+                    flush=True,
+                )
+                if foreign:
+                    print(
+                        "[route-a] WARNING: the warm-start checkpoint contains "
+                        f"non-Route-A parameters ({sorted(set(k.split('.')[0] for k in foreign))}); "
+                        "they are ignored, which also means the run that wrote it "
+                        "was training more than Route A",
+                        flush=True,
+                    )
             print(
                 f"[route-a] attached: trainable route_a={n_route_a/1e6:.2f}M "
                 f"trainable dit={n_dit/1e6:.2f}M "
                 f"bottleneck=L{int(cfg.get('bottleneck_layer', 18))} "
-                f"physical_shortening={self.pipe.dit._tokenpress_route_a_physical}",
+                f"physical_shortening={self.pipe.dit._tokenpress_route_a_physical} "
+                f"sparsity_source={self.route_a_sparsity_source} "
+                f"retention_target={self.route_a_threshold_controller.target} "
+                f"tau_init={self.route_a_threshold_controller.values} "
+                f"traj_loss_scale={self.route_a_trajectory_loss_scale} "
+                f"traj_kd_weight={self.route_a_traj_kd_weight} "
+                f"kd_interval={self.route_a_kd_interval}",
                 flush=True,
             )
+
+    # ------------------------------------------------------------------
+    # Route A training loss and retention monitoring
+    # ------------------------------------------------------------------
+    def _route_a_module(self):
+        """The attached Route A module, or ``None`` for a dense run."""
+        module = getattr(self.pipe.dit, "_tokenpress_route_a", None)
+        if module is None or not hasattr(self, "route_a_retention"):
+            return None
+        return module
+
+    def _route_a_teacher_flow(self, models, inputs, timestep):
+        """Dense NoPress forward paired with the student step.
+
+        ``training_loss`` reads its arguments from a fresh kwargs dict, so the
+        caller's ``inputs`` survives the call and the two forwards see exactly
+        the same video noise, trajectory noise and timestep.  The Route A hook is
+        detached rather than the parameters being swapped, which keeps the
+        frozen backbone bit-identical to the deployed dense model.
+        """
+        dit = self.pipe.dit
+        saved = dit._tokenpress_route_a
+        teacher_inputs = dict(inputs)
+        teacher_inputs["forced_training_timestep"] = float(
+            timestep.detach().reshape(-1)[0]
+        )
+        dit._tokenpress_route_a = None
+        try:
+            with torch.no_grad():
+                teacher = self.pipe.training_loss(
+                    **models, **teacher_inputs, return_loss_breakdown=True
+                )
+        finally:
+            dit._tokenpress_route_a = saved
+        return teacher
+
+    def _route_a_apply_loss(self, result, inputs, models):
+        """Add Route A's sparsity pressure and optional KD to ``result``.
+
+        Three things were missing from the first A1 run and are added here:
+
+        1. a sparsity term, so the keep ratio is controlled at all;
+        2. a retention controller / log, so an uncontrolled drift is visible
+           immediately instead of only at evaluation time;
+        3. trajectory-weighted supervision, so the selector is optimised for the
+           plan rather than for future-video reconstruction.
+        """
+        module = self._route_a_module()
+        if module is None:
+            return result
+        out = getattr(self.pipe.dit, "_tokenpress_route_a_last_output", None)
+        if out is None:
+            return result
+
+        gate = out.gate
+        soft_mask = gate.soft_mask.float()
+        hard_mask = gate.hard_mask.float()
+        soft_ratio = float(soft_mask.mean().detach())
+        hard_ratio = float(hard_mask.mean().detach())
+        scores = gate.scores.float()
+        candidate_total = int(sum(gate.candidate_counts))
+        kept_total = int(sum(gate.kept_counts))
+        candidate_counts = list(gate.candidate_counts)
+        score_mean = float(scores.mean().detach())
+        score_std = float(scores.std(unbiased=False).detach())
+        # Per-domain realised keep ratios: history is the first domain block,
+        # every later block is a future latent (see ``build_token_type_vector``).
+        history_size = candidate_counts[0] if candidate_counts else 0
+        kept_ratios = [
+            float(hard_mask[:, history_size:].mean().detach()) if history_size < hard_mask.shape[1] else 0.0
+        ]
+        if history_size:
+            kept_ratios.insert(0, float(hard_mask[:, :history_size].mean().detach()))
+
+        # --- sparsity pressure (score scale) ------------------------------
+        # ``scores`` is the plan's ``s_i = sigmoid(logit_i)``.  Its target is a
+        # *scale* budget: it only has to keep the distribution off the
+        # saturation rail, because ``tau`` controls the count.
+        penalty = scores.mean() if self.route_a_sparsity_source == "scores" else soft_mask.mean()
+        lam = self.route_a_lambda_controller.observe(score_mean)
+        self.route_a_lambda_value = float(lam)
+        result["loss"] = result["loss"] + lam * penalty
+        result["route_a_sparse_loss"] = (lam * penalty).detach()
+        result["route_a_lambda"] = float(lam)
+        result["route_a_retention"] = hard_ratio
+        result["route_a_retention_soft"] = soft_ratio
+        result["route_a_kept_total"] = float(kept_total)
+        result["route_a_candidate_total"] = float(candidate_total)
+        result["route_a_score_mean"] = score_mean
+        result["route_a_score_std"] = score_std
+        result["route_a_threshold_history"] = float(gate.thresholds[0])
+        result["route_a_threshold_future"] = float(gate.thresholds[-1])
+        # --- online threshold calibration (the count) ---------------------
+        # Applied *after* this forward, so the next step runs the calibrated
+        # threshold.  Quantile calibration rather than feedback: the keep ratio
+        # is a near-step function of tau, so a proportional loop bang-banged
+        # between the safety floor and 100% on consecutive steps.
+        new_thresholds = self.route_a_threshold_controller.observe(
+            gate.scores, candidate_counts, int(self.global_step)
+        )
+        if new_thresholds is not None:
+            module.gate.set_thresholds(new_thresholds)
+        if len(gate.kept_counts) > 1:
+            result["route_a_kept_history"] = float(gate.kept_counts[0])
+            result["route_a_kept_future"] = float(sum(gate.kept_counts[1:]))
+        result["route_a_physical"] = float(out.physical_shortening)
+        result["route_a_backend_len"] = float(out.backend_sequence_length)
+
+        # --- trajectory-flow distillation against the frozen teacher ------
+        kd_due = (
+            self.route_a_traj_kd_weight > 0.0
+            and self.global_step % self.route_a_kd_interval == 0
+        )
+        if kd_due:
+            student = result.get("trajectory_pred_raw")
+            if student is None:
+                raise RuntimeError(
+                    "Route A trajectory distillation needs "
+                    "result['trajectory_pred_raw']; the pipeline returned None"
+                )
+            teacher = self._route_a_teacher_flow(
+                models, inputs, self.pipe._last_training_timestep
+            )
+            teacher_pred = teacher.get("trajectory_pred")
+            if teacher_pred is None:
+                raise RuntimeError("dense teacher produced no trajectory prediction")
+            if tuple(student.shape) != tuple(teacher_pred.shape):
+                raise RuntimeError(
+                    "student/teacher trajectory shape mismatch: "
+                    f"{tuple(student.shape)} vs {tuple(teacher_pred.shape)}"
+                )
+            kd = torch.nn.functional.mse_loss(
+                student.float(), teacher_pred.detach().float()
+            )
+            result["loss"] = result["loss"] + self.route_a_traj_kd_weight * kd
+            result["route_a_traj_kd"] = kd.detach()
+            # The teacher forward is only needed for its trajectory output; its
+            # own loss terms were computed for monitoring and are dropped here.
+            result["route_a_teacher_traj_loss"] = teacher["trajectory_loss"]
+            # Drop the graph-carrying handle: everything that needed it has run,
+            # and keeping it alive across the optimiser step only holds storage.
+            result.pop("trajectory_pred_raw", None)
+        elif "trajectory_pred_raw" in result:
+            result.pop("trajectory_pred_raw", None)
+
+        # --- retention / dynamic-length monitoring ------------------------
+        # Sampled rather than per-step: ``CompressionStatsRecorder.record``
+        # synchronises to read quantiles off the GPU, and a 50-step sample is
+        # already far denser than the per-scene panel the plan asks about.
+        if self.global_step % self.route_a_stats_every == 0:
+            if not hasattr(self, "_route_a_stats"):
+                from videopress.retraining import CompressionStatsRecorder
+
+                self._route_a_stats = CompressionStatsRecorder()
+                self._route_a_csv = None
+                self._route_a_is_rank0 = _is_rank0()
+                stats_path = getattr(self, "route_a_stats_path", None)
+                if stats_path and self._route_a_is_rank0:
+                    self._route_a_csv = open(stats_path, "a", encoding="utf-8")
+            sigma = None
+            timestep = getattr(self.pipe, "_last_training_timestep", None)
+            if timestep is not None:
+                sigma = float(timestep.detach().reshape(-1)[0])
+            self._route_a_stats.record(
+                scores=gate.scores.detach(),
+                kept_counts=gate.kept_counts,
+                candidate_counts=gate.candidate_counts,
+                scene_id=str(self.global_step),
+                round_index=0,
+                sigma=sigma,
+                thresholds=gate.thresholds,
+                extra={
+                    "lambda": float(lam),
+                    "hard_ratio": hard_ratio,
+                    "soft_ratio": soft_ratio,
+                    "physical": bool(out.physical_shortening),
+                },
+            )
+            dynamic = self._route_a_stats.is_truly_dynamic()
+            result["route_a_dynamic"] = float(bool(dynamic.get("dynamic")))
+            result["route_a_len_p10"] = float(dynamic.get("p10", 0.0))
+            result["route_a_len_p90"] = float(dynamic.get("p90", 0.0))
+            result["route_a_len_mean"] = float(dynamic.get("mean", 0.0))
+            if getattr(self, "_route_a_is_rank0", True):
+                _kd = result.get("route_a_traj_kd")
+                print(
+                    f"[route-a][step {int(self.global_step)}] "
+                    f"keep={kept_total}/{candidate_total} "
+                    f"hard={hard_ratio:.4f} soft={soft_ratio:.4f} "
+                    f"dom={['%.3f' % v for v in kept_ratios]} "
+                    f"tau={['%.4f' % v for v in gate.thresholds]} "
+                    f"lambda={float(lam):.5f} "
+                    f"score_mean={score_mean:.4f} score_std={score_std:.4f} "
+                    f"kd={('n/a' if _kd is None else f'{float(_kd):.5f}')} "
+                    f"len_p10={dynamic.get('p10')} len_p90={dynamic.get('p90')} "
+                    f"dynamic={dynamic.get('dynamic')}",
+                    flush=True,
+                )
+            if self._route_a_csv is not None:
+                self._route_a_csv.write(
+                    json.dumps(
+                        {
+                            "step": int(self.global_step),
+                            "lambda": float(lam),
+                            "hard_ratio": hard_ratio,
+                            "soft_ratio": soft_ratio,
+                            "domain_ratios": list(kept_ratios),
+                            "thresholds": list(gate.thresholds),
+                            "kept_total": kept_total,
+                            "candidate_total": candidate_total,
+                            "kept_counts": list(gate.kept_counts),
+                            "score_mean": score_mean,
+                            "score_std": score_std,
+                            "dynamic": dynamic,
+                            "lambda_controller": self.route_a_lambda_controller.describe(),
+                            "threshold_controller": self.route_a_threshold_controller.describe(),
+                        }
+                    )
+                    + "\n"
+                )
+                self._route_a_csv.flush()
+        return result
+
+    def _route_a_finalize_stats(self) -> None:
+        """Write the compression report, the calibration, and close the JSONL."""
+        stats = getattr(self, "_route_a_stats", None)
+        if stats is None:
+            return
+        if not getattr(self, "_route_a_is_rank0", True):
+            return
+        path = getattr(self, "route_a_stats_path", None)
+        if not path:
+            try:
+                path = os.path.join(
+                    str(self.train_args.output_path), "route_a_stats.jsonl"
+                )
+            except AttributeError:
+                path = None
+        if path:
+            try:
+                stats.write_json(str(path).replace(".jsonl", "_summary.json"))
+            except Exception as error:  # pragma: no cover - diagnostics only
+                print(f"[route-a] stats summary failed: {error}", flush=True)
+            # The thresholds that the run converged on are the *deployment*
+            # configuration: the evaluator must be given exactly them, because
+            # the gate buffer is runtime state and is not part of the checkpoint.
+            calibration = {
+                "thresholds": self.route_a_threshold_controller.values,
+                "retention_target": self.route_a_threshold_controller.target,
+                "lambda_final": float(self.route_a_lambda_value),
+                "lambda_controller": self.route_a_lambda_controller.describe(),
+                "threshold_controller": self.route_a_threshold_controller.describe(),
+                "bottleneck_layer": int(self.route_a_bottleneck_layer),
+                "physical_shortening": bool(
+                    self.pipe.dit._tokenpress_route_a_physical
+                ),
+                "trajectory_loss_scale": float(self.route_a_trajectory_loss_scale),
+                "traj_kd_weight": float(self.route_a_traj_kd_weight),
+            }
+            try:
+                Path(str(path).replace(".jsonl", "_calibration.json")).write_text(
+                    json.dumps(calibration, indent=2), encoding="utf-8"
+                )
+            except Exception as error:  # pragma: no cover - diagnostics only
+                print(f"[route-a] calibration write failed: {error}", flush=True)
+            print(f"[route-a] calibration: {json.dumps(calibration['thresholds'])}", flush=True)
+        if getattr(self, "_route_a_csv", None) is not None:
+            try:
+                self._route_a_csv.close()
+            finally:
+                self._route_a_csv = None
 
     # ------------------------------------------------------------------
     # Counterfactual teacher helpers (review P0/P1/P3, 2026-09-11)
@@ -1627,12 +2037,36 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
             )
         if sparse_step and not teacher_step and hasattr(self, "_selector_mask"):
             inputs["history_token_mask"] = self._selector_mask
+        route_a_active = self._route_a_module() is not None
+        if route_a_active:
+            # Route A never combines with the online history selector: it owns
+            # its own scorer and its own mask, and the two would fight over the
+            # same video tokens.
+            if self.enable_online_selector:
+                raise RuntimeError(
+                    "Route A and the online history selector cannot be enabled "
+                    "in the same run"
+                )
+            # Planning-first weighting: the FM loss averages 780 video tokens
+            # against ~8 trajectory points, so without this the scorer optimises
+            # future-video reconstruction instead of the plan that PDM measures.
+            if self.route_a_trajectory_loss_scale != 1.0:
+                inputs["trajectory_loss_scale"] = self.route_a_trajectory_loss_scale
+            if self.route_a_traj_kd_weight > 0.0:
+                # Both the student and the paired teacher forward must draw the
+                # same trajectory noise, otherwise the distillation target is
+                # computed at a different sigma-point than the student output.
+                inputs["fixed_trajectory_noise_seed"] = (
+                    90001 + int(self.global_step)
+                )
         models = {name: getattr(self.pipe, name) for name in self.pipe.in_iteration_models}
         if counterfactual_step:
             with torch.no_grad():
                 result = self.pipe.training_loss(**models, **inputs, return_loss_breakdown=True)
         else:
             result = self.pipe.training_loss(**models, **inputs, return_loss_breakdown=True)
+        if route_a_active:
+            result = self._route_a_apply_loss(result, inputs, models)
         if not self.enable_online_selector or self.selector is None:
             return result
         tokens = getattr(self.pipe, "_last_history_tokens", None)

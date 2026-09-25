@@ -168,6 +168,47 @@ def binding_row_domain_counts(
     return [int(value) for value in per_row[row].tolist()]
 
 
+def per_domain_zscore(
+    logits: torch.Tensor,
+    domain_sizes: Sequence[int],
+    *,
+    eps: float = 1e-5,
+) -> torch.Tensor:
+    """Standardise the logits of each domain *within each sample*.
+
+    This is what makes a probability threshold usable at all.  On real NAVSIM
+    weights the scorer's scores turn out to be dominated by a per-scene offset:
+    the pooled score std over 1560 candidates is about 0.023 while the shift
+    between scenes is of the same order, so a single global ``tau`` leaves the
+    gate with only two states -- keep everything or keep nothing.  A 40-step
+    smoke recorded 0.026, 0.039, 0.46, 0.96, 0.29, 1.00, 0.92, 1.00 ... on
+    consecutive steps with a *calibrated* threshold.
+
+    Standardising per sample removes the scene-level offset and forces the gate
+    to act on the only thing that carries a compression decision: the ranking of
+    candidates inside that scene.  The cost is explicit and is recorded in the
+    compression report: retention then depends only on the *shape* of the score
+    distribution, so K becomes nearly constant and scene-dependent length is no
+    longer produced by the gate itself.
+    """
+    sizes = [int(v) for v in domain_sizes]
+    if logits.ndim != 2:
+        raise ValueError(f"logits must be [B, N], got {tuple(logits.shape)}")
+    if sum(sizes) != int(logits.shape[1]):
+        raise ValueError(
+            f"domain sizes {sizes} do not sum to logit width {int(logits.shape[1])}"
+        )
+    parts = []
+    offset = 0
+    for size in sizes:
+        chunk = logits[:, offset : offset + size]
+        mean = chunk.mean(dim=1, keepdim=True)
+        std = chunk.std(dim=1, keepdim=True, unbiased=False)
+        parts.append((chunk - mean) / (std + float(eps)))
+        offset += size
+    return torch.cat(parts, dim=1)
+
+
 class STEThresholdGate(nn.Module):
     """Per-domain threshold gate with straight-through gradients.
 
@@ -183,6 +224,7 @@ class STEThresholdGate(nn.Module):
         temperature: float = 0.2,
         min_temperature: float = 0.05,
         clamp: Optional[SafetyClampConfig] = None,
+        normalize_scores: bool = False,
     ):
         super().__init__()
         sizes = [int(s) for s in domain_sizes]
@@ -204,6 +246,7 @@ class STEThresholdGate(nn.Module):
             raise ValueError("temperature must be finite and positive")
         if not math.isfinite(float(min_temperature)) or float(min_temperature) <= 0:
             raise ValueError("min_temperature must be finite and positive")
+        self.normalize_scores = bool(normalize_scores)
         self.register_buffer(
             "threshold_values", torch.tensor(values, dtype=torch.float32)
         )
@@ -253,6 +296,8 @@ class STEThresholdGate(nn.Module):
                 f"scores width {int(scores.shape[1])} != candidate total {self.n_candidate}"
             )
         logits = scores.float()
+        if self.normalize_scores:
+            logits = per_domain_zscore(logits, self.domain_sizes)
         tau = self._expanded_thresholds(logits)
         temp = float(self.temperature if temperature is None else temperature)
         if temp <= 0:
@@ -483,6 +528,243 @@ class SparsityGuard:
             "last_lambda": self.last_lambda,
             "interventions": self.interventions,
             "last_health": None if self.last_health is None else self.last_health.as_dict(),
+        }
+
+
+class RetentionController:
+    """Dual-ascent controller for the realised keep ratio.
+
+    The plan's sparsity curriculum ramps a *fixed* ``lambda_sparse`` and hopes
+    the resulting keep ratio lands near the compression budget.  The first
+    NAVSIM A1 run showed why that is not enough: with no sparsity term at all
+    the gate drifted from 99.7% retention at step 1250 to 50% at step 3768, so
+    the run measured an uncontrolled, moving operating point rather than the
+    policy under test.
+
+    This controller treats the retention budget as a constraint and solves for
+    ``lambda`` instead of guessing it::
+
+        lambda <- clip(lambda + gain * (observed - target), 0, max_lambda)
+
+    ``observed`` is the realised (hard) keep ratio, i.e. the quantity that
+    actually runs at inference; a dead band of ``tolerance`` around the target
+    prevents the controller from chasing estimator noise, and ``max_step``
+    bounds one update so a single pathological batch cannot slam ``lambda`` to
+    its ceiling.
+
+    The class is deliberately a plain Python object with no tensors: it is an
+    outer control loop over the optimiser, not part of the graph.
+    """
+
+    def __init__(
+        self,
+        *,
+        target: float = 0.25,
+        initial_lambda: float = 0.0,
+        max_lambda: float = 5.0,
+        gain: float = 0.02,
+        tolerance: float = 0.02,
+        max_step: float = 0.05,
+        ema: float = 0.9,
+    ):
+        for name, value in (("target", target), ("tolerance", tolerance), ("ema", ema)):
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+        if not 0.0 < float(target) < 1.0:
+            raise ValueError(f"target must be in (0, 1), got {target}")
+        if not 0.0 <= float(tolerance) < 1.0:
+            raise ValueError(f"tolerance must be in [0, 1), got {tolerance}")
+        if float(initial_lambda) < 0 or float(max_lambda) < 0:
+            raise ValueError("lambda bounds must be non-negative")
+        if float(initial_lambda) > float(max_lambda):
+            raise ValueError("initial_lambda must be <= max_lambda")
+        if float(gain) < 0 or float(max_step) < 0:
+            raise ValueError("gain and max_step must be non-negative")
+        if not 0.0 <= float(ema) < 1.0:
+            raise ValueError(f"ema must be in [0, 1), got {ema}")
+        self.target = float(target)
+        self.max_lambda = float(max_lambda)
+        self.gain = float(gain)
+        self.tolerance = float(tolerance)
+        self.max_step = float(max_step)
+        self.ema = float(ema)
+        self.lambda_value = float(initial_lambda)
+        self.updates = 0
+        self.skips = 0
+        self._ema_observed: Optional[float] = None
+        self.last_error = 0.0
+
+    def observe(self, observed_ratio: float) -> float:
+        """Feed one realised keep ratio and return the lambda to apply next."""
+        value = float(observed_ratio)
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"observed_ratio must be finite and non-negative, got {value}")
+        self._ema_observed = (
+            value
+            if self._ema_observed is None
+            else self.ema * self._ema_observed + (1.0 - self.ema) * value
+        )
+        error = self._ema_observed - self.target
+        self.last_error = error
+        if abs(error) <= self.tolerance:
+            self.skips += 1
+            return self.lambda_value
+        step = max(-self.max_step, min(self.max_step, self.gain * error))
+        self.lambda_value = min(
+            max(self.lambda_value + step, 0.0), self.max_lambda
+        )
+        self.updates += 1
+        return self.lambda_value
+
+    def describe(self) -> Dict[str, object]:
+        return {
+            "target": self.target,
+            "lambda": self.lambda_value,
+            "ema_observed": self._ema_observed,
+            "last_error": self.last_error,
+            "updates": self.updates,
+            "skips": self.skips,
+            "max_lambda": self.max_lambda,
+            "gain": self.gain,
+            "tolerance": self.tolerance,
+            "max_step": self.max_step,
+            "ema": self.ema,
+        }
+
+
+class QuantileThresholdCalibrator:
+    """Calibrate ``tau`` from the pooled score quantiles (plan section 25).
+
+    Feedback control on ``tau`` does *not* work here, and a 12-scene wiring
+    smoke on real NAVSIM weights showed exactly why.  The realised keep ratio is
+    a step function of ``tau``: with 1560 candidates whose scores have std 0.026,
+    the whole transition from "keep nothing" to "keep everything" spans about
+    0.1, so the loop gain is of order 10 per unit ``tau``.  A proportional
+    controller therefore bang-bangs: history sat at the safety floor (0.041)
+    while its ``tau`` climbed monotonically, and future alternated between 0.082
+    and 1.000 on consecutive steps.
+
+    The stable formulation is to stop controlling and start *estimating*: pool
+    the scores seen since the last calibration and set each domain's threshold to
+    the empirical ``1 - target`` quantile::
+
+        tau_d = Quantile_{1-target}( scores_d )
+
+    That is unbiased for the average keep ratio, is immune to the per-step
+    discontinuity because it is computed from thousands of candidates at once,
+    and leaves K free to vary per scene -- a fixed per-scene quantile would make
+    K constant and defeat the dynamic-length goal.  Calibration is deliberately
+    infrequent (hundreds of steps) so ``tau`` tracks the slow drift of the score
+    scale rather than per-batch noise.
+    """
+
+    def __init__(
+        self,
+        *,
+        target: float = 0.25,
+        initial: Sequence[float] = (0.5, 0.5),
+        interval: int = 100,
+        warmup_samples: int = 4,
+        smoothing: float = 0.5,
+        lower: float = 0.001,
+        upper: float = 0.999,
+    ):
+        values = [float(v) for v in initial]
+        if not values:
+            raise ValueError("at least one initial threshold is required")
+        if not 0.0 < float(target) < 1.0:
+            raise ValueError(f"target must be in (0, 1), got {target}")
+        if int(interval) < 1:
+            raise ValueError("interval must be >= 1")
+        if int(warmup_samples) < 1:
+            raise ValueError("warmup_samples must be >= 1")
+        if not 0.0 <= float(smoothing) <= 1.0:
+            raise ValueError("smoothing must be in [0, 1]")
+        if not 0.0 < float(lower) < float(upper) < 1.0:
+            raise ValueError("threshold bounds must satisfy 0 < lower < upper < 1")
+        self.target = float(target)
+        self.interval = int(interval)
+        self.warmup_samples = int(warmup_samples)
+        self.smoothing = float(smoothing)
+        self.lower = float(lower)
+        self.upper = float(upper)
+        self.values = [min(max(v, self.lower), self.upper) for v in values]
+        self.calibrations = 0
+        self.last_quantiles: Optional[List[Optional[float]]] = None
+        self._pool: Optional[List[List[torch.Tensor]]] = None
+        self._last_calibration_step: Optional[int] = None
+
+    # ------------------------------------------------------------------ API
+    def observe(
+        self,
+        scores: torch.Tensor,
+        domain_sizes: Sequence[int],
+        step: int,
+    ) -> Optional[List[float]]:
+        """Pool one batch's scores; return new ``tau`` when a calibration is due.
+
+        ``None`` means "keep the current thresholds".
+        """
+        if scores.ndim != 2:
+            raise ValueError(f"scores must be [B, N], got {tuple(scores.shape)}")
+        sizes = [int(v) for v in domain_sizes]
+        if sum(sizes) != int(scores.shape[1]):
+            raise ValueError(
+                f"domain sizes {sizes} do not sum to candidate width {int(scores.shape[1])}"
+            )
+        flat = scores.detach().float()
+        if self._pool is None:
+            self._pool = [[] for _ in sizes]
+        offset = 0
+        for index, size in enumerate(sizes):
+            self._pool[index].append(flat[:, offset : offset + size].reshape(-1).cpu())
+            offset += size
+        step = int(step)
+        if self._last_calibration_step is None:
+            due = len(self._pool[0]) >= self.warmup_samples
+        else:
+            due = (step - self._last_calibration_step) >= self.interval
+        if not due:
+            return None
+        return self._calibrate(step)
+
+    def _calibrate(self, step: int) -> List[float]:
+        assert self._pool is not None
+        quantile = 1.0 - self.target
+        pooled: List[Optional[float]] = []
+        for samples in self._pool:
+            values = torch.cat(samples) if samples else torch.empty(0)
+            if values.numel() < 8:
+                pooled.append(None)
+                continue
+            pooled.append(float(torch.quantile(values, quantile)))
+        self.last_quantiles = list(pooled)
+        for index, value in enumerate(pooled):
+            if value is None:
+                continue
+            blended = (
+                value
+                if self.calibrations == 0
+                else (1.0 - self.smoothing) * self.values[index]
+                + self.smoothing * value
+            )
+            self.values[index] = min(max(blended, self.lower), self.upper)
+        self.calibrations += 1
+        self._last_calibration_step = int(step)
+        self._pool = [[] for _ in self.values]
+        return list(self.values)
+
+    def describe(self) -> Dict[str, object]:
+        return {
+            "target": self.target,
+            "thresholds": list(self.values),
+            "interval": self.interval,
+            "warmup_samples": self.warmup_samples,
+            "smoothing": self.smoothing,
+            "calibrations": self.calibrations,
+            "last_quantiles": self.last_quantiles,
+            "last_calibration_step": self._last_calibration_step,
+            "bounds": [self.lower, self.upper],
         }
 
 

@@ -113,6 +113,10 @@ class RouteAConfig:
     recovery_heads: int = 16
     recovery_mlp_ratio: float = 2.0
     safety_clamp: SafetyClampConfig = field(default_factory=SafetyClampConfig)
+    #: Standardise each domain's logits within each sample before thresholding.
+    #: Without it the gate only has "keep everything"/"keep nothing" states on
+    #: real weights; see :func:`per_domain_zscore`.
+    normalize_scores: bool = False
 
     def __post_init__(self) -> None:
         if not 0 <= int(self.bottleneck_layer) < int(self.num_blocks):
@@ -269,6 +273,7 @@ class RouteADynamicSelect(nn.Module):
             temperature=self.config.temperature,
             min_temperature=self.config.min_temperature,
             clamp=self.config.safety_clamp,
+            normalize_scores=self.config.normalize_scores,
         )
         self.recovery = DenseRecoveryDecoder(
             dim=self.config.token_dim,

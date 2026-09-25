@@ -654,6 +654,13 @@ class WanVideoPipeline(BasePipeline):
                 "trajectory_pred": (
                     traj_pred.detach() if torch.is_tensor(traj_pred) else None
                 ),
+                # Non-detached twin of ``trajectory_pred``.  Route A's
+                # trajectory-flow distillation needs the graph-carrying student
+                # prediction; every existing consumer keeps using the detached
+                # key, so this addition is inert for them.
+                "trajectory_pred_raw": (
+                    traj_pred if torch.is_tensor(traj_pred) else None
+                ),
                 "trajectory_x0_pred": (
                     traj_x0_pred.detach()
                     if torch.is_tensor(traj_x0_pred)
@@ -2101,6 +2108,11 @@ def model_fn_wan_video(
                 ),
                 use_checkpoint=bool(use_gradient_checkpointing),
             )
+            # Runtime-only handle: the trainer reads the gate statistics from
+            # here every step (retention monitoring, sparsity pressure).  It is
+            # deliberately an attribute rather than a module field so that
+            # nothing about it reaches a checkpoint.
+            dit._tokenpress_route_a_last_output = route_a_out
             route_a_video = (
                 dit.unpatchify(route_a_out.video_flow, (f, h, w))
                 if route_a_out.video_flow is not None

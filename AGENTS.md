@@ -1,9 +1,17 @@
 # AGENTS.md — DriveVA-lite Video Token Compression 交接文件
 
-> 最后更新：2026-09-24 CST
-> 当前分支：`main`，当前 HEAD：`2d00842`（**已与 `origin/main` 同步；推送已恢复正常**）
-> 当前工作区：tracked clean。本会话共 6 个 commit 已全部推送（`b98c6cc` … `2d00842`）。
-> 训练/评测产物写入被忽略的 `videopress_framework/outputs/route_a_{train,eval}_20260924/`。
+> 最后更新：2026-09-25 CST
+> 当前分支：`main`，当前 HEAD：`9a98fb8`（与 `origin/main` 同步）。
+> 本会话新增改动**尚未 commit**（等本轮 A1 重跑结果一并提交）。
+> **2026-09-25 状态：Route A 的 P0 修正已全部落地（冻结全集 / τ 分位数标定 / 分数标准化 /
+> 轨迹 KD / 保留率统计），框架 338 tests passed。重跑队列 `route_a_train2_20260924/`
+> 已在 tmux `route_a2` 中排队，**阻塞=GPU**：8 张卡被他人（maqianli 的 8 个 vLLM worker）
+> 占满，free 1.4–9.4 GiB（规则要求 ≥40 GiB）。用户已授权最多 4 卡。**
+> **本轮最重要的新发现（见 §4「2026-09-25」）：Route A 目前失败的原因不是"选不准"，
+> 而是门控本身不可用——固定 τ 时 hard 门一步从 54% 掉到安全下限，τ 反馈控制会 bang-bang，
+> 分位数标定也会 0%/100% 跳变，因为 scorer 分数被"每场景常数偏移"支配。修复办法是
+> 在阈值前对每个场景每个 domain 的 logits 做 z-score（`normalize_scores`）。代价：
+> K 近似常数，场景自适应长度尚未实现。**
 > **2026-09-24 路线切换：future hard prune 已判决终止（见下），新阶段按用户提供的
 > 《DriveVA Dynamic Video Token Compression — Retraining Implementation Plan v2》执行。
 > 该计划要求把「在冻结模型里找可删 token」改成「训练 DriveVA 用少量 token 表达同样的
@@ -2837,3 +2845,74 @@ merge(0.9057) 优于 random prune(0.8843)，据此认为"同 K 下聚合保留�
 - 产物：训练 `outputs/route_a_train_20260924/`；评测 `outputs/route_a_eval_20260924/`。
   新增 `scripts/eval_route_a_navsim.py`（含保留数埋点与 --threshold）。
 - Git 仍未推送（用户要求不反复重试，见顶部警告）。
+
+### 2026-09-25 — P0 修正落地：冻结全集 + τ 标定 + 分数标准化；排队等待 4 卡
+
+上一节列的 P0 修正清单已实现，并且在真实权重上做冒烟时**又发现两个更根本的缺陷**。
+结论：**Route A 的失败到目前为止不在"选择能力"，而在门控本身根本不可用**。
+
+**已完成（代码 + 测试，框架 338 passed）**
+
+1. **冻结除 Route A 外一切**：`switch_pipe_to_training_mode` 的
+   `--trainable_models` 默认含 `trajectory_encoder,trajectory_head`，而旧代码只冻结
+   `self.pipe.dit`。现改为冻结整个 `self.pipe` 再解冻 Route A，并在挂载时**断言**
+   `pipe` 除 `dit` 外没有任何 `requires_grad` 的子模块（不满足就抛错，而不是静默训练）。
+2. **学习率调度损失接入**：`trajectory_loss_scale`（默认 1，本轮 10）——FM 视频损失对
+   780 个 token 取均值而轨迹损失只有 ~8 个点，不重加权时 scorer 实际在优化"未来视频
+   重建"而不是 PDM。
+3. **轨迹流 KD**：与冻结 dense teacher 配对（同 video noise、同 trajectory noise、
+   同 timestep；`fixed_trajectory_noise_seed = 90001 + global_step`）。新增
+   `training_loss` 返回键 `trajectory_pred_raw`（非 detach，旧键 `trajectory_pred` 不变）。
+   teacher forward 通过临时把 `dit._tokenpress_route_a` 置 `None` 实现，`no_grad`。
+4. **保留率统计接入训练循环**：`CompressionStatsRecorder` + `is_truly_dynamic`，
+   每 `stats_every` 步写 JSONL，结束时写 `route_a_stats_summary.json` 与
+   `route_a_stats_calibration.json`（评测必须用标定出来的 τ）。
+5. **热启动**：新增 `DRIVEVA_ROUTE_A_CKPT=<route_a ckpt>`，只加载
+   `dit._tokenpress_route_a.*`，遇到非 Route A 键会打印 WARNING（旧 A1 检查点就有 16 个
+   trajectory 键，正是缺陷 2 的物证）。`FULL_CKPT` 仍只负责 backbone。
+
+**冒烟发现的新缺陷（关键）**
+
+6. **固定 τ=0.5 时门控在刀刃上**：scorer 初始化后 scores 集中在 0.5、std≈0.03。
+   一个优化步就让 **hard 保留率从 54.1% 掉到安全下限 6.2%**，而 STE 软掩码还停在
+   0.44——**前向硬门与反向代理已经不是同一个东西**。
+7. **改成 τ 双上升反馈控制后变成 bang-bang**：保留率是 τ 的近似阶跃函数（1560 个
+   candidate、score std 0.026 → 全过渡带只有 ~0.1，回路增益 ~10/单位 τ）。
+   实测 history 卡在下限 0.041 而 τ 单调爬升，future 在相邻步之间 0.082 ↔ 1.000 跳变。
+   → 该控制器已删除（不做成死代码），改为下面的分位数标定。
+8. **分位数标定仍然 0%/100% 跳变**（40 步冒烟）：把 τ 设为 score 的
+   `1-target` 分位数后，保留率仍然在 0.026 / 0.46 / 1.00 / 0.29 之间跳。原因：
+   **scorer 的分数被"每个场景的常数偏移"支配**——池化 std 只有 ~0.023，而场景之间
+   的均值漂移同量级，所以任何**全局** τ 都只能落在某个场景分布的上面或下面。
+9. **修复 = 分数标准化**：新增 `normalize_scores`（`per_domain_zscore`），在阈值之前
+   对**每个场景、每个 domain** 的 logits 做 z-score。冒烟复测：保留率稳定在
+   0.22–0.28（目标 0.25），score_mean 0.50 / std 0.20，τ 稳定在 0.6719，不再跳变。
+
+**诚实的代价与限制（必须写进结论）**
+
+- 分数标准化后，保留率只取决于分数分布的**形状**，因此 **K 近似常数**，
+  场景自适应长度**不再由门控产生**。`is_truly_dynamic` 在冒烟里仍报 True 但
+  spread 很小（p10≈357 / p90≈417），只能算"弱动态"。Route A 计划里的
+  "scene-dependent K" 用这条路**尚未实现**，需要绝对尺度标定（A2/A3 解冻后）或
+  额外的场景难度预测头。
+- 因为标准化后"整体平移"对门控**完全无影响**，`λ_sparse`（计划里的 `L_sparse`）
+  对预算**不再是有效旋钮**，只会在形状上施加扭曲。因此本轮 `lambda_sparse_max=0`
+  （关闭），代码路径保留给未标准化配方。**这是对计划 §5/§30 的一处有意偏离**，
+  原因就是上面第 6–8 条实测。
+- 本轮 A1 因此只回答一个问题：**给定固定保留率，训练出来的 scorer 排序是否优于随机**。
+  它不回答"动态长度"。
+
+**当前状态**
+
+- **A1 重跑已排队**：`outputs/route_a_train2_20260924/run_queue.sh`，tmux 会话
+  `route_a2`。阶段 0 = 8 场景接线冒烟（1 卡）；阶段 1 = 4 卡 A1 dense-gate，
+  3,768 场景 8 epoch；阶段 2 = 从阶段 1 最后一个检查点热启动，切
+  `physical_shortening=True` 跑 1 epoch 收敛机制差。
+- **阻塞=GPU，不是代码**：2026-09-24 21:32 起 8 张卡被他人（maqianli 的 8 个
+  vLLM worker）占满，free 仅 1.4–9.4 GiB（规则要求 ≥40 GiB）。队列按标准自行等待，
+  不抢卡。**用户 2026-09-24 已授权最多 4 卡。**
+- 顺带清理：删除了自 2026-09-20 起一直空等 GPU 的旧 `token_oracle` 队列会话
+  （future hard prune 已判决终止，该队列只会抢卡）。
+- 教训（操作）：`pkill -f <pattern>` 会匹配到自己的命令行；本会话已两次因此自杀
+   shell。**禁止用 pkill -f 带会自我匹配的模式**，改用 `pgrep` + 显式 PID。
+
