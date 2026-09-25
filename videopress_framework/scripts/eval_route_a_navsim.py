@@ -38,6 +38,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+import torch.nn as nn
 
 FRAMEWORK_ROOT = Path(__file__).resolve().parents[1]
 PROJECT_ROOT = FRAMEWORK_ROOT.parent
@@ -59,10 +60,55 @@ DEFAULT_SCENE_FILTER = (
 ROUTE_A_PREFIX = "dit._tokenpress_route_a."
 
 
+class MatchedRandomScorer(nn.Module):
+    """Keep the trained score *distribution*, destroy the ranking.
+
+    This is the control the Route A result cannot be interpreted without.  A
+    plain random top-k arm would run at a different retention than the trained
+    gate, so a PDM difference could come from either the ranking or the budget.
+    Permuting the trained scorer's own scores *inside each domain* leaves the
+    threshold, and therefore the realised keep count and the score histogram,
+    exactly as they are; the only thing that changes is which tokens survive.
+
+    It needs no training and no extra checkpoint: it wraps whatever scorer the
+    evaluated checkpoint provides.  Run several ``--random-seed`` values and
+    report the band, because one permutation is one sample from the
+    random-selection distribution.
+    """
+
+    def __init__(self, inner: nn.Module, domain_sizes, seed: int = 0):
+        super().__init__()
+        self.inner = inner
+        self.domain_sizes = [int(v) for v in domain_sizes]
+        self.seed = int(seed)
+        self.calls = 0
+
+    def forward(self, *args, **kwargs):
+        out = self.inner(*args, **kwargs)
+        offset = 0
+        pieces = []
+        for size in self.domain_sizes:
+            chunk = out[:, offset : offset + size]
+            generator = torch.Generator()  # CPU generator: device-agnostic
+            generator.manual_seed(self.seed * 1000003 + self.calls * 7919 + offset)
+            order = torch.randperm(size, generator=generator).to(chunk.device)
+            pieces.append(chunk[:, order])
+            offset += size
+        self.calls += 1
+        return torch.cat(pieces, dim=1)
+
+
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--arm", choices=["route_a", "no_press"], required=True)
+    p.add_argument("--arm", choices=["route_a", "route_a_random", "no_press"], required=True)
     p.add_argument("--route-a-checkpoint", type=Path, default=None)
+    p.add_argument(
+        "--random-seed",
+        type=int,
+        default=0,
+        help="seed for --arm route_a_random; one seed is one sample of the "
+        "matched-retention random-selection band",
+    )
     p.add_argument("--max-eval-tokens", type=int, default=256,
                    help="scenes PER RANK (total = this x world_size)")
     p.add_argument("--out-root", type=Path, required=True)
@@ -165,7 +211,7 @@ def main(argv=None) -> int:
     pipe = official_runner._build_official_pipeline(eval_mod, build_args, device)
     print(f"[eval-route-a] pipeline built in {time.time() - started:.1f}s", flush=True)
 
-    if args.arm == "route_a":
+    if args.arm in ("route_a", "route_a_random"):
         if args.route_a_checkpoint is None:
             raise SystemExit("--route-a-checkpoint is required for --arm route_a")
         dit = pipe.dit
@@ -245,6 +291,19 @@ def main(argv=None) -> int:
 
         module = module.to(device=device, dtype=param_dtype).eval()
 
+        # Matched-retention random control: same checkpoint, same thresholds,
+        # same score histogram -- only the ranking inside each domain is
+        # replaced by a random permutation.
+        if args.arm == "route_a_random":
+            module.scorer = MatchedRandomScorer(
+                module.scorer, module.gate.domain_sizes, seed=int(args.random_seed)
+            )
+            print(
+                f"[eval-route-a] MATCHED RANDOM control: permuting the scored "
+                f"ranking inside each domain (seed={int(args.random_seed)})",
+                flush=True,
+            )
+
         # The evaluation CSV does not carry compression statistics (the official
         # runner adds those from records.jsonl, which this path bypasses), so
         # record the gate's kept counts here.  Without this number a PDM drop
@@ -298,11 +357,11 @@ def main(argv=None) -> int:
     try:
         eval_mod.run_eval(eval_args, external_pipe=pipe)
     finally:
-        if args.arm == "route_a":
+        if args.arm in ("route_a", "route_a_random"):
             pipe.dit._tokenpress_route_a = None
     print(f"[eval-route-a] rank{rank} run_eval done in {time.time() - started:.1f}s", flush=True)
 
-    if args.arm == "route_a":
+    if args.arm in ("route_a", "route_a_random"):
         import statistics as _st
 
         def _summ(values):
