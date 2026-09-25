@@ -205,6 +205,19 @@ class ModelLogger:
     def on_training_end(self, accelerator, model, save_steps=None):
         if save_steps is not None and self.num_steps % int(save_steps) != 0:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
+        # Optional per-module end-of-training hook.  Route A uses it to write its
+        # compression report and the thresholds the run converged on.  It has to
+        # live here rather than on a logger subclass: with AUTO_EVAL=0 the base
+        # logger is the one that runs, which is how the first Route A run ended
+        # up with no calibration file at all.
+        finalize = getattr(
+            getattr(model, "module", model), "_route_a_finalize_stats", None
+        )
+        if callable(finalize):
+            try:
+                finalize()
+            except Exception as error:  # pragma: no cover - diagnostics only
+                print(f"[train] end-of-training hook failed: {error}", flush=True)
 
     def save_model(self, accelerator, model, file_name):
         accelerator.wait_for_everyone()

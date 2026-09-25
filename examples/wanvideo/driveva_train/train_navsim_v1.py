@@ -1518,6 +1518,14 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
         )
         if new_thresholds is not None:
             module.gate.set_thresholds(new_thresholds)
+            # Rewrite the calibration side-car on every update, not only at the
+            # end of the run.  The evaluator needs the threshold the run
+            # converged on and the gate buffer is runtime state that is NOT in
+            # the checkpoint; relying on an end-of-run hook made the evaluation
+            # silently skip its Route A arms the first time (the hook lived on
+            # the auto-eval logger subclass, while AUTO_EVAL=0 selects the base
+            # ModelLogger).
+            self._route_a_write_calibration()
         if len(gate.kept_counts) > 1:
             result["route_a_kept_history"] = float(gate.kept_counts[0])
             result["route_a_kept_future"] = float(sum(gate.kept_counts[1:]))
@@ -1639,6 +1647,49 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
                 self._route_a_csv.flush()
         return result
 
+    def _route_a_calibration_path(self) -> Optional[str]:
+        path = getattr(self, "route_a_stats_path", None)
+        if not path:
+            try:
+                path = os.path.join(
+                    str(self.train_args.output_path), "route_a_stats.jsonl"
+                )
+            except AttributeError:
+                return None
+        return str(path).replace(".jsonl", "_calibration.json")
+
+    def _route_a_write_calibration(self) -> None:
+        """Persist the deployment thresholds for the evaluator.
+
+        The gate's threshold buffer is runtime state and is *not* part of the
+        checkpoint, so the evaluator can only reproduce the run's keep budget if
+        the converged thresholds are written out separately.  This is called on
+        every calibration update as well as at the end of training, because
+        depending on an end-of-run hook alone silently produced no file at all
+        when ``AUTO_EVAL=0`` selected the base ``ModelLogger``.
+        """
+        path = self._route_a_calibration_path()
+        if path is None or not getattr(self, "_route_a_is_rank0", True):
+            return
+        calibration = {
+            "thresholds": list(self.route_a_threshold_controller.values),
+            "retention_target": self.route_a_threshold_controller.target,
+            "lambda_final": float(self.route_a_lambda_value),
+            "lambda_controller": self.route_a_lambda_controller.describe(),
+            "threshold_controller": self.route_a_threshold_controller.describe(),
+            "bottleneck_layer": int(self.route_a_bottleneck_layer),
+            "physical_shortening": bool(
+                getattr(self.pipe.dit, "_tokenpress_route_a_physical", False)
+            ),
+            "trajectory_loss_scale": float(self.route_a_trajectory_loss_scale),
+            "traj_kd_weight": float(self.route_a_traj_kd_weight),
+            "global_step": int(getattr(self, "global_step", 0) or 0),
+        }
+        try:
+            Path(path).write_text(json.dumps(calibration, indent=2), encoding="utf-8")
+        except Exception as error:  # pragma: no cover - diagnostics only
+            print(f"[route-a] calibration write failed: {error}", flush=True)
+
     def _route_a_finalize_stats(self) -> None:
         """Write the compression report, the calibration, and close the JSONL."""
         stats = getattr(self, "_route_a_stats", None)
@@ -1659,29 +1710,12 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
                 stats.write_json(str(path).replace(".jsonl", "_summary.json"))
             except Exception as error:  # pragma: no cover - diagnostics only
                 print(f"[route-a] stats summary failed: {error}", flush=True)
-            # The thresholds that the run converged on are the *deployment*
-            # configuration: the evaluator must be given exactly them, because
-            # the gate buffer is runtime state and is not part of the checkpoint.
-            calibration = {
-                "thresholds": self.route_a_threshold_controller.values,
-                "retention_target": self.route_a_threshold_controller.target,
-                "lambda_final": float(self.route_a_lambda_value),
-                "lambda_controller": self.route_a_lambda_controller.describe(),
-                "threshold_controller": self.route_a_threshold_controller.describe(),
-                "bottleneck_layer": int(self.route_a_bottleneck_layer),
-                "physical_shortening": bool(
-                    self.pipe.dit._tokenpress_route_a_physical
-                ),
-                "trajectory_loss_scale": float(self.route_a_trajectory_loss_scale),
-                "traj_kd_weight": float(self.route_a_traj_kd_weight),
-            }
-            try:
-                Path(str(path).replace(".jsonl", "_calibration.json")).write_text(
-                    json.dumps(calibration, indent=2), encoding="utf-8"
-                )
-            except Exception as error:  # pragma: no cover - diagnostics only
-                print(f"[route-a] calibration write failed: {error}", flush=True)
-            print(f"[route-a] calibration: {json.dumps(calibration['thresholds'])}", flush=True)
+            self._route_a_write_calibration()
+            print(
+                "[route-a] calibration: "
+                f"{json.dumps(list(self.route_a_threshold_controller.values))}",
+                flush=True,
+            )
         if getattr(self, "_route_a_csv", None) is not None:
             try:
                 self._route_a_csv.close()
