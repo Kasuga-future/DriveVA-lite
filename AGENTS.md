@@ -1,8 +1,10 @@
 # AGENTS.md — DriveVA-lite Video Token Compression 交接文件
 
 > 最后更新：2026-09-25 CST
-> 当前分支：`main`，当前 HEAD：`9a98fb8`（与 `origin/main` 同步）。
-> 本会话新增改动**尚未 commit**（等本轮 A1 重跑结果一并提交）。
+> 当前分支：`main`。本会话两个 commit：`fbda7a3`（**已推送**，`origin/main` 已同步到它）
+> 与 `48eb305`（评测脚本 `--normalize-scores` / 逐 domain τ；**未推送**——唯一一次
+> `git push` 遇到 `gnutls_handshake() failed: TLS connection was non-properly terminated`，
+> 属网络问题而非凭据问题。按用户要求"失败即上报、不反复重试"）。
 > **2026-09-25 状态：Route A 的 P0 修正已全部落地（冻结全集 / τ 分位数标定 / 分数标准化 /
 > 轨迹 KD / 保留率统计），框架 338 tests passed。重跑队列 `route_a_train2_20260924/`
 > 已在 tmux `route_a2` 中排队，**阻塞=GPU**：8 张卡被他人（maqianli 的 8 个 vLLM worker）
