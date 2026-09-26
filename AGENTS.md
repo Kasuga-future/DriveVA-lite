@@ -3066,3 +3066,33 @@ tmux 会话 `route_a_oom`，4 个变体（`v0_a1_control` / `v1_full_dit_ema` /
 
 **教训/提醒**：本次回答"会不会 OOM"这类问题时，先算参数与 dtype 的账再排队，
 可以避免把"等卡"当成唯一路径；同时要检查并行策略——DDP 下的显存问题**不会被加卡缓解**。
+
+**追问（同日）：ZeRO-2 + EMA 放 CPU + 每隔多轮平均一次，能否不 OOM？——不能。**
+`sharding_model.py`（2 rank，48 GiB/卡）给出：
+
+| 方案 | EMA 在 GPU | EMA 在 CPU |
+|---|---:|---:|
+| `ddp`（现状） | 79.4 GiB ✗ | 60.1 GiB ✗ |
+| `zero2`（DeepSpeed 默认） | 74.6 ✗ | **55.3 ✗** |
+| `zero2` + `bf16_master_weights_and_grads` + `bf16_optimizer_states` | 60.1 ✗ | **40.8 ✓** |
+| `zero2` + `offload_optimizer: cpu` | 45.6 ✓ | **26.4 ✓** |
+| `zero3` + `offload_optimizer: cpu` | 40.8 ✓ | **21.5 ✓** |
+| `fsdp` FULL_SHARD（**不需要装 deepspeed**） | 50.5 ✗ | **31.2 ✓** |
+
+三个原因：① **DeepSpeed ZeRO 默认保留 fp32 master weights + fp32 优化器状态**
+（`bf16_master_weights_and_grads` 与 `bf16_optimizer_states` 默认都是 `false`，见官方
+config-json 文档），即 ~12 B/参数；而本仓库现在用 bf16 参数的 `torch.optim.AdamW`，
+状态只有 **4 B/参数**——切分一个更贵的东西不等于切分便宜的那个，所以 `zero2` 的 55.3 GiB
+反而输给 FSDP 的 31.2 GiB。② **"相隔多轮平均"不省任何显存**：EMA shadow 是一块固定大小
+的 buffer（fp32 19.29 GiB），刷新频率只影响 PCIe 流量；`update_every>1` 值得开（省时间），
+但显存收益为零。真正省显存的是把它放到 host，而这已有开关：`EMA_ON_CPU=1` / `--ema_on_cpu`。
+③ **分片管不到 11.89 GiB 的冻结 VAE + 文本编码器**：`prepare_model` 对非 HF 模块会走
+`model.to(device)`（`verify_device_map` 返回 False 时 `elif` 分支成立），把整条 pipeline
+搬上卡——VAE 704.7M→bf16 1.31 GiB、umt5-xxl 5680.9M（原生 bf16）10.58 GiB；且数据集返回
+的是 prompt 字符串，文本编码器每步都要用，不能丢。
+**结论：要跑 A3，首选 FSDP FULL_SHARD + `EMA_ON_CPU=1`（~31 GiB/rank，零新依赖，
+注意 `use_orig_params=True`），或 ZeRO-2 + `offload_optimizer: cpu`（~26 GiB/rank）。**
+接线是好消息：循环已经用 `accelerator.backward` / `clip_grad_norm_` / prepared optimizer，
+FSDP 与 DeepSpeed 在循环层面是 drop-in；但 `NCCL_P2P_DISABLE=1` 下每步都要走 PCIe 的
+reduce-scatter/all-gather，**省显存不等于可用**，必须实测吞吐。
+**注意 `deepspeed` 未安装**（`bitsandbytes` 也未安装）；FSDP 只需现有 accelerate 1.14.0。

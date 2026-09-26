@@ -82,6 +82,16 @@ From `memory_model.py --json memory_model.json` (all figures GiB, per rank):
 The A1 subtotal of 11.62 GiB is consistent with the A1 rerun's measured behaviour (it trained
 at 1.03–1.04 it/s with `rc=0` on 2 cards), which cross-validates the model's terms.
 
+Two **frozen** residents are deliberately left out of the table above because they are not part
+of the trainable state; they are quantified in §5.1. `prepare_model` calls
+`model.to(self.device)` on the whole training module (accelerate's `verify_device_map` returns
+`False` for these non-HF modules, so the `elif` branch does fire), and the pipeline's VAE and
+text encoder are ordinary submodules — so they ride along to the card and stay there:
+VAE 704.7 M fp32 → **1.31 GiB** after the bf16 cast, umt5-xxl text encoder 5,680.9 M natively
+bf16 → **10.58 GiB**. That is **11.89 GiB replicated on every rank**, which DDP never shards.
+The dataset returns a prompt *string* (`_build_prompt_fixed`), so the text encoder is genuinely
+needed every step and cannot simply be dropped.
+
 Sequence of failure for A3 with EMA: model load (9.64) → DDP wrap → `init_ema` (+19.29 =
 28.9) → first backward (+ grads 9.64, + buckets 9.64 = 48.2) → `optimizer.step()`
 (+19.29 states = 67.5). It dies inside the first training step, not at load, **provided the
@@ -134,6 +144,72 @@ Ordered by (effort, payoff). None of these is implemented; they are options for 
    `switch_pipe_to_training_mode` calls `freeze_except` **before** LoRA injection, so a
    correct A2 recipe must not leave the DiT base weights trainable.
 
+## 5.1 Follow-up (2026-09-26): ZeRO-2 + EMA in host memory + averaging every N steps?
+
+**Short answer: no.** That combination still OOMs on 2×49 GiB, because ZeRO-2's default state
+precision is *worse* than the patch, and because the update interval does not change any
+memory figure. Model: `sharding_model.py` (2 ranks, 48 GiB usable/card, frozen VAE + text
+encoder counted at 11.89 GiB/rank).
+
+| strategy | EMA on GPU | EMA on CPU |
+|---|---:|---:|
+| `ddp` (current code) | 79.4 GiB ✗ | 60.1 GiB ✗ |
+| **`zero2` (DeepSpeed defaults)** | 74.6 GiB ✗ | **55.3 GiB ✗** |
+| `zero2` + `bf16_master_weights_and_grads` + `bf16_optimizer_states` | 60.1 GiB ✗ | **40.8 GiB ✓** |
+| `zero2` + `offload_optimizer: cpu` | 45.6 GiB ✓ | **26.4 GiB ✓** |
+| `zero3` (defaults) | 69.8 GiB ✗ | 50.5 GiB ✗ |
+| `zero3` + `offload_optimizer: cpu` | 40.8 GiB ✓ | **21.5 GiB ✓** |
+| `fsdp` FULL_SHARD (no DeepSpeed needed) | 50.5 GiB ✗ | **31.2 GiB ✓** |
+| `ddp` + frozen VAE/text encoder kept off the card | 67.5 GiB ✗ | 48.2 GiB ✗ |
+
+Three separate reasons the proposed recipe is not enough:
+
+1. **ZeRO-2's optimizer state is fp32 by default, and that is the dominant term.** DeepSpeed
+   keeps fp32 *master weights* plus fp32 `exp_avg`/`exp_avg_sq` unless told otherwise —
+   `bf16.bf16_master_weights_and_grads` and `bf16.bf16_optimizer_states` both default to
+   `false` ([config docs](https://www.deepspeed.ai/docs/config-json/)). That is ~12 B/param of
+   state before sharding, against **4 B/param** for the repo's current `torch.optim.AdamW` on
+   bf16 parameters. Halving a 12 B/param state (19.29 GiB/rank) is not the same as halving the
+   cheap one (9.64 GiB/rank). This is why `zero2` at 55.3 GiB still loses to plain FSDP at
+   31.2 GiB.
+2. **"相隔多轮平均" saves no GPU memory at all.** The EMA shadow is one fixed-size buffer; its
+   *size* is 19.29 GiB fp32 and it does not depend on how often it is refreshed.
+   `update_every=N` only reduces the number of GPU→host fp32 transfers (and, incidentally,
+   changes the effective averaging horizon). Moving the shadow to host is the part that
+   matters, and it is already implemented: `EMA_ON_CPU=1` / `--ema_on_cpu`. Do use
+   `update_every>1` for speed, but count it as zero memory saving.
+3. **Sharding does not touch the 11.89 GiB of frozen VAE + text encoder.** ZeRO-2 replicates
+   them; only FSDP/ZeRO-3 would shard them, and then they are all-gathered transiently during
+   the forward (a 10.58 GiB spike for the text encoder unless it is a separate unit or in
+   `ignored_modules`).
+
+**What to do instead, on 2 cards**
+
+* **FSDP `FULL_SHARD` + `EMA_ON_CPU=1` → ~31 GiB/rank.** Best value: it fits with real
+  headroom, needs **no new dependency** (`deepspeed` is not installed in the `DriveVA` env;
+  `accelerate` 1.14.0 + torch FSDP are), and it keeps the cheap bf16 optimizer state instead of
+  introducing an fp32 master copy. Needs `use_orig_params=True` because only a subset of
+  parameters requires grad.
+* **ZeRO-2 + `offload_optimizer: cpu` + `EMA_ON_CPU=1` → ~26 GiB/rank.** Fits comfortably and
+  keeps the familiar 2-card DDP topology, at the cost of CPU-side optimizer steps and a
+  per-step GPU→CPU gradient transfer. Host RAM is not a constraint here (755 GiB total,
+  ~651 GiB available; the shadow plus offloaded state is ~50–60 GiB).
+* **ZeRO-2 with bf16 master weights and bf16 optimizer states → ~41 GiB/rank.** Fits, but with
+  only ~7 GiB left for activations, communication buffers and fragmentation, and it puts the
+  master copy in bf16 (a convergence trade-off). Verify the option actually engages with a
+  client-passed `torch.optim.AdamW` before relying on it.
+
+**Good news on wiring:** the training loop already calls `accelerator.backward(loss)`,
+`accelerator.clip_grad_norm_` and uses the prepared optimizer, so both FSDP and DeepSpeed are
+drop-in at the loop level — no changes to `launch_training_task`'s inner loop are required.
+The launch script does need to switch from bare `torch.distributed.run` to the corresponding
+accelerate env (`ACCELERATE_USE_FSDP=true` + `FSDP_SHARDING_STRATEGY=FULL_SHARD`, or
+`ACCELERATE_USE_DEEPSPEED=true` + a DeepSpeed config JSON).
+
+**Cost warning:** with `NCCL_P2P_DISABLE=1` (required on these 4090s) every ZeRO/FSDP step pays
+reduce-scatter/all-gather over PCIe with no P2P path. Expect a substantial throughput loss
+relative to the current DDP A1/A3 runs; memory feasibility is not the same as viability.
+
 ## 6. Reproduction
 
 ```bash
@@ -148,7 +224,14 @@ tail -f status.log
 
 ## 7. One-line verdict
 
-**A3 "全量训练 DiT" OOMs on 2 GPUs — and on 4 or 8 GPUs too, because the stack is plain DDP.**
-The requirement is ~67.5 GiB/rank (48.2 GiB even with EMA off) against a 49 GiB card; sharding
-(FSDP/ZeRO) or an 8-bit optimizer plus host-side EMA is required before A3 can be attempted,
-and plan §14's **A2 (LoRA)** remains the only adaptation stage that fits on 2 cards as-is.
+**A3 "全量训练 DiT" OOMs on 2 GPUs with the current code — and on 4 or 8 GPUs too, because the
+stack is plain DDP.** The requirement is ~79.4 GiB/rank once the frozen VAE and text encoder are
+counted (60.1 GiB with the EMA shadow moved to host) against a 49 GiB card. Moving the EMA to
+host RAM is necessary but not sufficient; **the proposed ZeRO-2 + host-EMA + every-N-averaging
+recipe still needs ~55.3 GiB/rank, because DeepSpeed's default fp32 master weights and fp32
+optimizer states cost 12 B/param versus the 4 B/param this repo currently pays, and the
+averaging interval saves no memory at all.** What does fit on 2 cards: **FSDP FULL_SHARD +
+`EMA_ON_CPU=1` (~31 GiB/rank, no new dependency)**, ZeRO-2 with `offload_optimizer: cpu`
+(~26 GiB/rank), or ZeRO-2 with bf16 master weights and bf16 optimizer states (~41 GiB/rank).
+Plan §14's **A2 (LoRA)** remains the only adaptation stage that fits on 2 cards without any
+sharding at all.
