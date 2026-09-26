@@ -1,7 +1,22 @@
 # AGENTS.md — DriveVA-lite Video Token Compression 交接文件
 
-> 最后更新：2026-09-25 CST
-> 当前分支：`main`。**无运行中 GPU 任务。** A1 重跑已完成并评测完毕。
+> 最后更新：2026-09-26 CST
+> 当前分支：`main`。**GPU 队列 `route_a_oom` 在等空闲卡**（见下），其余无任务。
+> **2026-09-26 新结论：Route A A3「全量训练 DiT」会 OOM，且根因不是"2 卡不够"而是
+> "DDP 不切分模型"。** Wan DiT 精确 **4,999,787,712** 参数（磁盘 F32，显存 bf16），
+> Route A 177,475,841，A3 可训练 5,177,263,553。per-rank 稳态 = bf16 参数 9.64 GiB +
+> bf16 梯度 9.64 + AdamW(bf16，已实测 `torch 2.5.0` 对 bf16 参数建 bf16 state) 19.29 +
+> **EMA fp32 shadow 19.29**（`init_ema` 无条件 upcast fp32）+ DDP 梯度桶 9.64 =
+> **67.5 GiB**，单卡 49.14 GiB；**关掉 EMA 仍有 48.2 GiB（不含激活）**。
+> `launch_training_task` 只给 `Accelerator` 配了 DDP kwargs，全仓库没有 FSDP/DeepSpeed，
+> 所以每卡显存与卡数无关——**加到 4/8 卡也一样 OOM**。要让 A3 可跑必须先上
+> FSDP/ZeRO-2/3（或 8-bit Adam + `EMA_ON_CPU=1`）；按计划 §14，2 卡上现成可跑的适应
+> 阶段只有 **A2（LoRA rank 64，~70–140M 可训练参数）**。
+> 解析模型 `memory_model.py` 与完整报告见 `ROUTE_A_FULL_DIT_OOM_20260926.md`；
+> 实测队列 `videopress_framework/outputs/route_a_full_dit_oom_20260926/`（tmux
+> `route_a_oom`，4 个变体 × 2 卡，只等 free ≥ 40 GiB 的空闲卡、不共卡）——
+> 2026-09-26 11:49 起 8 张卡全部被他人占用（最大 free 8.4 GiB），故**实测数字尚未产出**。
+> 上一个会话：A1 重跑已完成并评测完毕（结论见下）。
 > **A1 判决（本轮最终结论，完整表格见 `ROUTE_A_A1_VERDICT_20260925.md` 与 §4「2026-09-25（续）」）：
 > 保留率终于被控住（全程 0.239–0.251，目标 0.25；对比上一轮 99.7%→50% 的失控漂移），
 > 所以在 1024 场景配对上第一次测到的是 Route A 本身。结果：Route A physical 检查点
@@ -2977,3 +2992,77 @@ dense-gate 阶段 score_std 稳定在 0.192[0.143,0.218]，physical 阶段掉到
 评测阶段因拿不到 τ 而**静默跳过两个 Route A 臂**。修法：每次 τ 标定即重写标定文件 +
 基类 `on_training_end` 也调用该钩子 + `run_eval_recovered.sh` 从逐步 JSONL 恢复
 （取最后 5 个 log 点的中位数，实测恢复 [0.6641,0.6719]，对应保留率 0.2559）。
+
+### 2026-09-26 — Route A A3「全量训练 DiT」显存可行性：解析判决 = 必 OOM；实测队列已武装
+
+**用户要求**：读 AGENTS.md 与 plan v2；把当前所有代码进度 commit + push；测试 prune 路径 A 中
+**全量训练 DiT** 是否会 OOM（可用 2 张 GPU）。
+
+**git（先做）**：会话开始时 `git status` **完全干净**，`HEAD == origin/main == 8437694`
+（`git ls-remote origin main` 也返回同一 SHA），即"当前所有代码进度"**本来就已 commit 并推送**，
+无需新增提交。本会话新增的实验脚手架按仓库策略被 `.gitignore` 的 `outputs/` 忽略，
+只有本文件与根目录报告 `ROUTE_A_FULL_DIT_OOM_20260926.md` 入库。
+
+**问题澄清**：「全量训练 DiT」= 计划 §14 的 **A3（Full DiT adaptation，解冻 dit +
+trajectory_encoder + trajectory_head + selector + decoder）**，不是"全量数据"。
+按"全量数据"读也不 OOM：A1 重跑已在 **2 卡**上跑完整个 3,768 场景 manifest × 6 epoch
+（11,304 步，`rc=0`，1.03–1.04 it/s）。**不 fit 的是可训练参数量，不是数据量。**
+
+**解析结论（verified by parameter counting + 代码路径审计）**
+
+| 量 | 值 | 来源 |
+|---|---:|---|
+| Wan DiT 参数（精确） | **4,999,787,712** | safetensors index `total_size` 19,999,150,848 B，全 `F32`；逐 shard header 求和 |
+| 显存 dtype | bf16 | `from_pretrained(torch_dtype=torch.bfloat16)` |
+| Route A 参数 | **177,475,841**（scorer 2,183,937 / gate 0 / recovery 175,291,904） | `RouteAConfig(...).build()` |
+| A1 可训练 | 177.48M | 日志 `trainable dit=177.48M` |
+| **A3 可训练** | **5,177,263,553** | DiT + Route A + traj（YAML `TRAINABLE_MODELS` 默认已含 `dit`） |
+
+per-rank 稳态（`memory_model.py`，GiB）：
+
+| recipe | 项 | GiB |
+|---|---|---:|
+| A1（冻结骨干） | 全部合计 | **11.62** |
+| **A3 + EMA** | bf16 参数 9.64 + bf16 梯度 9.64 + AdamW(bf16) 19.29 + **EMA fp32 shadow 19.29** + DDP 梯度桶 9.64 | **67.50** |
+| A3，关 EMA | 同上减 EMA | **48.22**（不含激活，已贴/超单卡 48.0 GiB 可用） |
+
+两个决定性实现事实：
+1. `torch.optim.AdamW(model.trainable_modules())` 建在 **bf16** 参数上，state 也是 bf16
+   （**本机实测**：`torch 2.5.0+cu124`，bf16 参数 → `exp_avg/exp_avg_sq torch.bfloat16`），
+   即 4 B/参数；不是 fp32 master 的 8 B（那会更糟）。
+2. `DiffusionTrainingModule.init_ema` **无条件**把每个可训练参数 `.to(dtype=torch.float32)`
+   存影子（`EMA_ON_CPU=0` 默认），A3 下就是 **19.29 GiB** 额外显存。这是默认配方不可行的最大单项。
+
+**最关键的定性发现：这不是"2 卡不够"，而是"DDP 不切分模型"。**
+`launch_training_task` 构造的 `Accelerator` 只带 `DistributedDataParallelKwargs` /
+`InitProcessGroupKwargs`；`grep -rn "FullyShardedDataParallel|fsdp_plugin|deepspeed_plugin"`
+在全仓库（除 `third_party`）**零命中**。纯 DDP 每个 rank 复制完整 5.18B 参数，
+**每卡显存与卡数无关——加到 4/8 卡同样 OOM**。修复方向是分片（FSDP/ZeRO-2/3），不是加卡。
+
+**要让 A3 可跑（按性价比）**：① FSDP/ZeRO-2/3（参数+梯度+优化器态分片，2 卡约 19.3 GiB/rank，
+这是唯一能真正解决问题的改动）；② `EMA_ON_CPU=1`（已支持 `--ema_on_cpu`，省 19.29 GiB，
+必要但不充分）；③ 8-bit Adam（省约 14.5 GiB，配 ② 后约 33.7 GiB，单卡可容，需加依赖与代码路径）；
+④ **改走计划 §14 的 A2（LoRA rank 64，约 70–140M 可训练参数，接近 A1 的 ~12 GiB），
+这是 2 卡上现成可跑的适应阶段**。注意 A2 接线要小心：`switch_pipe_to_training_mode`
+是先 `freeze_except` **再**注入 LoRA，直接设 `LORA_BASE_MODEL=dit` 会把 DiT 基座留在可训练态。
+
+**实测（未完成，阻塞=GPU 不是代码）**：队列
+`videopress_framework/outputs/route_a_full_dit_oom_20260926/run_oom_test.sh`，
+tmux 会话 `route_a_oom`，4 个变体（`v0_a1_control` / `v1_full_dit_ema` /
+`v2_full_dit_no_ema` / `v3_full_dit_offload`），每个只用 **2 张 free ≥ 40 GiB 的空闲卡、
+不共卡**；1 Hz `nvidia-smi` 采样器保证 OOM 被杀后仍有峰值数据；`SAVE_RAW_CKPT=0 SAVE_EMA=0`
+避免写 ~10 GiB 检查点。**2026-09-26 11:49 起 8 张卡全部被他人占用（最大 free 8.4 GiB），
+队列在 acquire 循环里等待，尚无实测数字。** 证据将落在 `status.log` / `<variant>.log` /
+`<variant>.mem.jsonl(.peak.json)` / `<variant>.result.json` / `RAW_RESULTS.md` / `QUEUE_COMPLETE`。
+
+**为什么坚持等空闲卡而不是"有 35 GiB 就上"**：A3 会在**第一个训练步内**死
+（load 9.64 → EMA +19.29 → backward +梯度/桶 → step 再加 19.29 优化器态）。
+若借一张只剩 8–15 GiB 的卡，它会在**模型加载期**就死，只能得到"装不下 5B 模型"这种
+无信息量的结论，无法区分"DDP 复制"与"卡被他人占着"。
+
+**产物**：`ROUTE_A_FULL_DIT_OOM_20260926.md`（完整报告）、
+`videopress_framework/outputs/route_a_full_dit_oom_20260926/memory_model.py`（可复现解析模型，
+`--json` 输出机器可读结果）。
+
+**教训/提醒**：本次回答"会不会 OOM"这类问题时，先算参数与 dtype 的账再排队，
+可以避免把"等卡"当成唯一路径；同时要检查并行策略——DDP 下的显存问题**不会被加卡缓解**。
