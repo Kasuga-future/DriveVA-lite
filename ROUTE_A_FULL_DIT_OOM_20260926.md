@@ -210,6 +210,95 @@ accelerate env (`ACCELERATE_USE_FSDP=true` + `FSDP_SHARDING_STRATEGY=FULL_SHARD`
 reduce-scatter/all-gather over PCIe with no P2P path. Expect a substantial throughput loss
 relative to the current DDP A1/A3 runs; memory feasibility is not the same as viability.
 
+## 5.2 Follow-up (2026-09-26): can the 5B backbone be swapped for "Wan2.2 1.3B"?
+
+**Short answer: there is no Wan2.2 1.3B, and the 1.3B that does exist (Wan2.1-T2V-1.3B) is not a
+drop-in swap — it would discard the DriveVA checkpoint, make the sequence 4× longer, and only
+then would it fit in memory.** Memory is the one thing it fixes, and FSDP/LoRA fix that without
+breaking comparability.
+
+**(a) Factual correction.** The Wan2.2 release (July 2025) is **T2V-A14B, I2V-A14B and
+TI2V-5B** (later S2V-14B / Animate-14B) — see the
+[Alibaba Cloud announcement](https://www.alibabacloud.com/blog/602413). The 1.3B tier exists
+only in **Wan2.1** (`Wan2.1-T2V-1.3B`, `Wan2.1-VACE-1.3B`), whose reference config is
+[`wan_t2v_1_3B.py`](https://huggingface.co/spaces/VIDraft/Wan2GP/blob/8949c1a9bb2ed622d80ec2de4b820f13b8bd9db4/wan/configs/wan_t2v_1_3B.py).
+
+**(b) The two backbones are architecturally incompatible.**
+
+| | Wan2.2-TI2V-5B (current) | Wan2.1-T2V-1.3B |
+|---|---|---|
+| DiT params | 4,999,787,712 | **1,418,996,800** (built from its config to count) |
+| `dim` / `ffn_dim` / heads | 3072 / 14336 / 24 | 1536 / 8960 / 12 |
+| latent channels | **48** | **16** |
+| VAE stride | **4×16×16** (high-compression) | **4×8×8** |
+| task | TI2V (text+image→video) | T2V (text→video) |
+
+The 5B's high-compression VAE is the whole reason its token count is small: at 480×832,
+16×16 compression gives a 30×52 latent → 390 tokens/latent frame; 8×8 gives 60×104 →
+**1560 tokens/latent frame**.
+
+**(c) Token count goes UP 4×, not down.** With the same 4 latent frames (2 history + 2 future):
+
+| backbone | tokens/latent frame | 4 latent frames | DiT sequence |
+|---|---:|---:|---:|
+| Wan2.2-TI2V-5B | 390 | **1,560** ✓ (matches the project docs) | ~1,569 |
+| Wan2.1-T2V-1.3B | 1,560 | **6,240** | ~6,249 |
+
+Attention cost scales ~L² and MLP ~L, so the 4× shorter parameter count is largely given back.
+More importantly for this project, the compression target changes from "1560 → ~240" to
+"6240 → ~240" — a far more aggressive problem, so any Route A result on 1.3B would not transfer
+to the 5B setting the paper is about.
+
+**(d) The DriveVA checkpoint cannot be loaded at all.** `pdms90_9.safetensors` is shape-locked
+to the 5B. Read from the safetensors header:
+
+```
+dit.patch_embedding.weight      [3072, 48, 1, 2, 2]   vs 1.3B: [1536, 16, 1, 2, 2]
+dit.blocks.0.self_attn.q.weight [3072, 3072]          vs 1.3B: [1536, 1536]
+dit.head.head.weight            [192, 3072]           vs 1.3B: [16, 1536]
+trajectory_head.proj.2.weight   [3, 3072]             vs 1.3B: [3, 1536]
+```
+
+Every DiT and trajectory-head key differs. Swapping the backbone therefore **throws away the
+DriveVA driving prior** and turns the task into "re-finetune DriveVA on NAVSIM from a generic
+Wan2.1 base" — a much larger project than token compression, after which none of the historical
+numbers (NoPress `0.909839`, the press results, the A1 verdict) are comparable.
+
+**(e) It would fit, though.** Per-rank, plain DDP, no sharding (Route A rebuilt at `dim=1536`
+comes to 48.9 M instead of 177.5 M):
+
+| model | params | grads | AdamW | EMA | buckets | frozen VAE+TE | total (EMA GPU) | total (EMA CPU) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Wan2.2-TI2V-5B | 9.64 | 9.64 | 19.29 | 19.29 | 9.64 | 11.89 | **79.40** ✗ | **60.11** ✗ |
+| Wan2.1-T2V-1.3B | 2.73 | 2.73 | 5.47 | 5.47 | 2.73 | 10.82 | **29.96** ✓ | **24.49** ✓ |
+
+So a 1.3B backbone needs no sharding, no optimizer offload and no host EMA — it fits on one
+49 GiB card as-is.
+
+**(f) Repo readiness.** DiffSynth already carries Wan2.1 plumbing: `WanVideoPipeline.from_pretrained`
+has a `redirect_common_files` map that points `models_t5_umt5-xxl-enc-bf16.pth` and
+`Wan2.1_VAE.pth` at `Wan-AI/Wan2.1-T2V-1.3B`, and `wan_video_dit.py` has 1.3B config branches.
+But the weights are **not** on disk (`models/Wan-AI/` contains only `Wan2.2-TI2V-5B`), and
+every DriveVA-specific piece is 5B-bound: the checkpoint, the trajectory head width, the PDM
+eval protocol and metric cache, and the documented 1560-token layout. The press framework's
+`TokenLayout` is parameterised (`tokens_per_latent`, `num_cond_latents`, `video_f/h/w`), so it
+would adapt with configuration rather than rewrites — the *scientific* foundation is what does
+not survive.
+
+**Recommendation.**
+
+* **If the goal is "A3 must fit on 2 GPUs" → do not change the backbone.** FSDP FULL_SHARD +
+  `EMA_ON_CPU=1` (~31 GiB/rank) or plan A2 LoRA reach the same place while keeping the 5B
+  checkpoint, the eval baseline and every prior result comparable. Changing the backbone to fix
+  a memory problem trades a one-line launcher change for the entire experimental foundation.
+* **If the goal is a cheap vehicle for iterating on Route A mechanics** → a 1.3B backbone is
+  defensible, but only as a separately labelled *scaling study*, with a from-scratch DriveVA
+  re-finetune and a rebuilt layout/eval path. Budget it as its own project.
+* **If the goal is fewer video tokens** → the 5B is already the token-efficient choice
+  (16×16 VAE); moving to Wan2.1 moves backwards. For reference, the only same-family way to
+  shrink the DiT while keeping the VAE and token layout would be a self-constructed narrower
+  DiT with `in_dim=48`, which forfeits the pretrained prior just the same.
+
 ## 6. Reproduction
 
 ```bash

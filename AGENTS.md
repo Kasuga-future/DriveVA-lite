@@ -3096,3 +3096,35 @@ config-json 文档），即 ~12 B/参数；而本仓库现在用 bf16 参数的 
 FSDP 与 DeepSpeed 在循环层面是 drop-in；但 `NCCL_P2P_DISABLE=1` 下每步都要走 PCIe 的
 reduce-scatter/all-gather，**省显存不等于可用**，必须实测吞吐。
 **注意 `deepspeed` 未安装**（`bitsandbytes` 也未安装）；FSDP 只需现有 accelerate 1.14.0。
+
+**追问（同日）：能否把 5B 换成 "Wan2.2 1.3B"？——先纠正事实，再给结论：不划算。**
+① **官方没有 Wan2.2 1.3B**：Wan2.2 家族是 T2V-A14B / I2V-A14B / TI2V-5B（后来 S2V-14B、
+Animate-14B），1.3B 档只在 **Wan2.1**（`Wan2.1-T2V-1.3B`、`Wan2.1-VACE-1.3B`）。
+② **两者结构不兼容**：5B 是 `dim=3072 / ffn=14336 / 24 heads / latent 48 通道 / VAE 4×16×16`；
+Wan2.1-1.3B 是 `dim=1536 / ffn=8960 / 12 heads / latent 16 通道 / VAE 4×8×8`。
+按官方 config 实例化 WanModel 得 **1,418,996,800** 参数（"1.3B" 是近似名）。
+③ **token 数会涨 4 倍，不是降**：480×832 下 5B 的 16×16 VAE → 30×52 → patch2×2 →
+**390 token/latent frame**（与本文档一致，4 帧 1560）；Wan2.1 的 8×8 VAE → 60×104 →
+**1560 token/latent frame**（4 帧 **6240**，序列 ~6249）。注意力 ~L²、MLP ~L，
+参数量省 4 倍基本被序列涨 4 倍吃掉；而且压缩目标从"1560→~240"变成"6240→~240"，
+Route A 结论无法迁移。**5B 的高压缩 VAE 正是它 token 少的原因。**
+④ **DriveVA 检查点完全无法加载**（这是最硬的一条）。读 `pdms90_9.safetensors` header：
+`dit.patch_embedding.weight=[3072,48,1,2,2]`（1.3B 需 `[1536,16,1,2,2]`）、
+`blocks.0.self_attn.q.weight=[3072,3072]`（需 `[1536,1536]`）、
+`trajectory_head.proj.2.weight=[3,3072]`（需 `[3,1536]`）——DiT 与轨迹头**没有一个 key 对得上**。
+换骨干 = **丢掉 DriveVA 驾驶先验**，等于从通用 Wan2.1 基座在 NAVSIM 上重训 DriveVA，
+那是比 token 压缩大得多的另一个项目，且历史全部数字（NoPress 0.909839、press、A1 判决）失效。
+⑤ **显存上确实能过**（唯一的好处）：1.3B DiT + Route A(dim1536→48.9M) 在纯 DDP 下
+per-rank = params 2.73 + grads 2.73 + AdamW 5.47 + EMA 5.47 + buckets 2.73 + 冻结 10.82
+= **~30.0 GiB（EMA 在 GPU）/ 24.5 GiB（EMA 在 CPU）**，单张 49 GiB 卡直接装得下，
+不需要任何分片或 offload。
+⑥ **仓库半可用**：DiffSynth 有通用 Wan2.1 支持（`redirect_common_files` 把 t5 encoder 与
+`Wan2.1_VAE.pth` 指向 `Wan-AI/Wan2.1-T2V-1.3B`，`wan_video_dit.py` 有 1.3B 配置分支），
+但**权重未下载**（`models/Wan-AI/` 只有 `Wan2.2-TI2V-5B`），且 DriveVA 侧（checkpoint、
+轨迹头宽度、PDM 评测协议与 metric cache、1560 layout 文档）全部绑定 5B。
+press 框架的 `TokenLayout` 是参数化的（`tokens_per_latent` 等），改配置即可适配——
+**活不下来的是科学基础，不是代码**。
+**建议**：若目标是"A3 在 2 卡上跑得起来"，**不要换骨干**，用 FSDP FULL_SHARD + `EMA_ON_CPU=1`
+（~31 GiB/rank）或 A2 LoRA；若目标是"便宜的 Route A 机制试验台"，1.3B 可以作为
+**明确标注的 scaling study**，但要按独立项目预算（重训 DriveVA + 重建 layout/eval）；
+若目标是"更少 video token"，5B 已经是更优选择，换 Wan2.1 是倒退。
