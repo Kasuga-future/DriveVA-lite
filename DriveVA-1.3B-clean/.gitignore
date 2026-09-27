@@ -1,0 +1,50 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# OS/editor files
+.DS_Store
+._*
+__MACOSX/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local datasets, model weights, and generated outputs
+data/
+models/
+outputs/
+eval_results/
+logs/
+wandb/
+runs/
+tmp/
+temp/
+
+# Checkpoints and large model artifacts
+checkpoints/*
+!checkpoints/README.md
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+
+# Media generated during local evaluation
+*.mp4
+*.avi
+*.mov
+*.webm
