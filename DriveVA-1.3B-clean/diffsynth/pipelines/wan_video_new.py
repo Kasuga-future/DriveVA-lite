@@ -29,15 +29,6 @@ from ..prompters import WanPrompter
 from ..vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear, WanAutoCastLayerNorm
 
 
-def _debug_tensor(pipe, name: str, tensor: torch.Tensor) -> None:
-    if pipe is None or not pipe.debug_shapes:
-        return
-    if not torch.isfinite(tensor).all():
-        raise FloatingPointError(f"{name} contains NaN or Inf")
-    pipe.debug_tensor_shapes[name] = tuple(tensor.shape)
-    print(f"{name} shape: {tuple(tensor.shape)}")
-
-
 class WanVideoPipeline(BasePipeline):
 
     def __init__(self, device="cuda", torch_dtype=torch.bfloat16, tokenizer_path=None):
@@ -56,8 +47,6 @@ class WanVideoPipeline(BasePipeline):
         self.trajectory_head: Optional[TrajectoryHead] = None
         self.target_fps: Optional[float] = None
         self.num_history_frames: int = 0
-        self.debug_shapes: bool = False
-        self.debug_tensor_shapes: Dict[str, Tuple[int, ...]] = {}
         # Relative trajectory normalization (zero-centered). Scales can be tuned per dataset.
         # Trajectory normalization offsets/scales
         self.noise_x_offset = 2
@@ -584,12 +573,6 @@ class WanVideoPipeline(BasePipeline):
         loss_weight = self.scheduler.training_weight(timestep).to(device=loss_unweighted.device)
         loss = loss_unweighted * loss_weight
 
-        if self.debug_shapes:
-            print(f"trajectory GT shape: {tuple(traj_target.shape) if traj_target is not None else None}")
-            print(f"total loss: {loss.detach().float().item()}")
-            print(f"video loss: {(video_loss * video_loss_scale * loss_weight).detach().float().item()}")
-            print(f"trajectory loss: {(traj_loss * traj_loss_weight * trajectory_loss_scale * loss_weight).detach().float().item()}")
-
         if return_loss_breakdown:
             return {
                 "loss": loss,
@@ -914,9 +897,7 @@ class WanVideoUnit_InputVideoEmbedder(PipelineUnit):
             return {"latents": noise}
         pipe.load_models_to_device(["vae"])
         input_video = pipe.preprocess_video(input_video)
-        _debug_tensor(pipe, "VAE input", input_video)
         input_latents = pipe.vae.encode(input_video, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
-        _debug_tensor(pipe, "VAE latent", input_latents)
         if vace_reference_image is not None:
             if not isinstance(vace_reference_image, list):
                 vace_reference_image = [vace_reference_image]
@@ -1365,7 +1346,6 @@ class WanVideoUnit_LongCatVideo(PipelineUnit):
             return {}
         pipe.load_models_to_device(self.onload_model_names)
         longcat_video = pipe.preprocess_video(longcat_video)
-        _debug_tensor(pipe, "history frame tensor", longcat_video)
         longcat_latents = pipe.vae.encode(longcat_video, device=pipe.device).to(dtype=pipe.torch_dtype, device=pipe.device)
         return {"longcat_latents": longcat_latents}
 
@@ -1669,7 +1649,6 @@ def model_fn_wan_video(
     
     # Camera control
     x = dit.patchify(x)
-    _debug_tensor(pipe, "patchified token grid", x)
     
     # Animate
     if pose_latents is not None and face_pixel_values is not None:
@@ -1690,7 +1669,6 @@ def model_fn_wan_video(
         if len(t_mod.shape) == 4:
             t_traj = t_mod[:, :1].expand(t_mod.shape[0], traj_len, 6, dit.dim)
             t_mod = torch.cat([t_mod, t_traj], dim=1)
-    _debug_tensor(pipe, "Wan transformer input", x)
 
     if x.dtype != dit_dtype:
         x = x.to(dit_dtype)
@@ -1813,8 +1791,6 @@ def model_fn_wan_video(
         if tea_cache is not None:
             tea_cache.store(x)
 
-    _debug_tensor(pipe, "Wan hidden", x)
-
     gathered = False
     if use_unified_sequence_parallel and dist.is_initialized() and dist.get_world_size() > 1 and traj_len > 0:
         x = get_sp_group().all_gather(x, dim=1)
@@ -1824,13 +1800,11 @@ def model_fn_wan_video(
     traj_pred = None
     if traj_len > 0:
         traj_out = x[:, -traj_len:]
-        _debug_tensor(pipe, "action head input", traj_out)
         x = x[:, :-traj_len]
         if return_traj_pred and trajectory_head is not None:
             # Trajectory head outputs noise prediction (same space as video eps).
             # Postprocess is handled outside via scheduler updates; keep raw prediction here.
             traj_pred = trajectory_head(traj_out)
-            _debug_tensor(pipe, "trajectory prediction", traj_pred)
 
     x = dit.head(x, t)
     if use_unified_sequence_parallel:
@@ -1838,7 +1812,6 @@ def model_fn_wan_video(
             x = get_sp_group().all_gather(x, dim=1)
             x = x[:, :-pad_shape] if pad_shape > 0 else x
     x = dit.unpatchify(x, (f, h, w))
-    _debug_tensor(pipe, "Wan video output", x)
     if return_traj_pred:
         return {"video": x, "traj": traj_pred}
     return x

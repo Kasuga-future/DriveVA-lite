@@ -3,21 +3,22 @@
 
 FULL_CKPT: "${REPO_ROOT}/checkpoints/pdms90_9.safetensors"
 LOCAL_MODEL_PATH: "${REPO_ROOT}/models"
+BACKBONE_TYPE: wan2.2-ti2v-5b
 OUTPUT_DIR: "${REPO_ROOT}/outputs/navsim_v1"
 
 NAVSIM_LOG_PATH:
-  default: "/path/to/navsim_v1.1/navsim_logs/test"
+  default: "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/navsim_split_audit/metadata/test"
   aliases:
     - EVAL_V1_NAVSIM_LOG_PATH
     - EVAL_NAVSIM_LOG_PATH
 NAVSIM_SENSOR_BLOBS_PATH:
-  default: "/path/to/navsim_v1.1/sensor_blobs/test"
+  default: "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/openscene-v1.1/sensor_blobs/test"
   aliases:
     - SENSOR_BLOBS_PATH
     - EVAL_V1_SENSOR_BLOBS_PATH
     - EVAL_SENSOR_BLOBS_PATH
 NAVSIM_METRIC_CACHE_PATH:
-  default: "/path/to/navsim_v1.1/metric_cache"
+  default: "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/metric_cache_full"
   aliases:
     - EVAL_V1_METRIC_CACHE_PATH
     - EVAL_METRIC_CACHE_PATH
@@ -25,7 +26,7 @@ NUPLAN_MAPS_ROOT: "/path/to/nuplan/dataset/maps"
 NUPLAN_DATA_ROOT: "/path/to/navsim_v1.1/dataset"
 
 SCENE_FILTER_YAML:
-  default: "${DRIVEVA_INFER_DIR}/navsim_scene_filters/navtest.yaml"
+  default:
   aliases:
     - EVAL_SCENE_FILTER_YAML
 SCENE_FILTER_YAML_FILTER_ONLY:

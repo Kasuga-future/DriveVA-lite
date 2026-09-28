@@ -40,6 +40,7 @@ args=(
   --metric_cache_path "${NAVSIM_METRIC_CACHE_PATH}"
   --output_dir "${OUTPUT_DIR}"
   --local_model_path "${LOCAL_MODEL_PATH}"
+  --backbone_type "${BACKBONE_TYPE:-wan2.2-ti2v-5b}"
   --full_ckpt "${FULL_CKPT}"
   --num_inference_steps "${NUM_INFERENCE_STEPS}"
   --cfg_scale "${CFG_SCALE}"

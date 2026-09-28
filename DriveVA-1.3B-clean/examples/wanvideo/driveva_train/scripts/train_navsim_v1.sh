@@ -44,6 +44,7 @@ args=(
   --navsim_log_path "${NAVSIM_LOG_PATH}"
   --sensor_blobs_path "${SENSOR_BLOBS_PATH}"
   --local_model_path "${LOCAL_MODEL_PATH}"
+  --backbone_type "${BACKBONE_TYPE:-wan2.2-ti2v-5b}"
   --output_path "${OUTPUT_PATH}"
   --height "${HEIGHT}"
   --width "${WIDTH}"

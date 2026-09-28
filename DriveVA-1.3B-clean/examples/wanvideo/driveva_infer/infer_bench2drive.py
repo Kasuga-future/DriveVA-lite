@@ -21,9 +21,6 @@ from tqdm import tqdm
 
 from diffsynth import load_state_dict
 from diffsynth.pipelines.wan_video_new import ModelConfig, WanVideoPipeline
-from examples.wanvideo.backbone_config import (
-    BACKBONES, WAN22_TI2V_5B, build_model_configs, get_backbone_config, validate_loaded_backbone,
-)
 
 try:
     from .bench2drive_dataset import Bench2DriveEvalDataset
@@ -108,7 +105,6 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
     # Model args
     parser.add_argument("--local_model_path", type=str, default=None)
-    parser.add_argument("--backbone_type", type=str, default=WAN22_TI2V_5B, choices=sorted(BACKBONES))
     parser.add_argument("--full_ckpt", type=str, default=None, help="Path to full DiT checkpoint (.safetensors).")
     parser.add_argument("--lora_checkpoint", type=str, default=None)
     parser.add_argument("--lora_alpha", type=float, default=1.0)
@@ -1481,19 +1477,36 @@ def run_eval(args: argparse.Namespace, external_pipe: Optional[WanVideoPipeline]
 
     if external_pipe is None:
         model_offload_device = str(device)
-        backbone_config = get_backbone_config(args.backbone_type)
-        model_configs, tokenizer_config, _ = build_model_configs(
-            backbone_config, args.local_model_path, offload_device=model_offload_device
-        )
+        model_configs = [
+            ModelConfig(
+                model_id="Wan-AI/Wan2.2-TI2V-5B",
+                origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth",
+                offload_device=model_offload_device,
+                local_model_path=args.local_model_path,
+                skip_download=True,
+            ),
+            ModelConfig(
+                model_id="Wan-AI/Wan2.2-TI2V-5B",
+                origin_file_pattern="diffusion_pytorch_model*.safetensors",
+                offload_device=model_offload_device,
+                local_model_path=args.local_model_path,
+                skip_download=True,
+            ),
+            ModelConfig(
+                model_id="Wan-AI/Wan2.2-TI2V-5B",
+                origin_file_pattern="Wan2.2_VAE.pth",
+                offload_device=model_offload_device,
+                local_model_path=args.local_model_path,
+                skip_download=True,
+            ),
+        ]
 
         pipe = WanVideoPipeline.from_pretrained(
             torch_dtype=torch.bfloat16,
             device=str(device),
             model_configs=model_configs,
-            tokenizer_config=tokenizer_config,
             use_trajectory=True,
         )
-        validate_loaded_backbone(pipe.dit, backbone_config)
     else:
         pipe = external_pipe
         if rank == 0:

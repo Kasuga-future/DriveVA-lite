@@ -6,22 +6,23 @@ FULL_CKPT:
   aliases:
     - TRAIN_FULL_CKPT
 LOCAL_MODEL_PATH: "${REPO_ROOT}/models"
+BACKBONE_TYPE: wan2.2-ti2v-5b
 OUTPUT_PATH:
   default: "${REPO_ROOT}/outputs/train_navsim_v1"
   aliases:
     - TRAIN_OUTPUT_PATH
 
 NAVSIM_LOG_PATH:
-  default: "/path/to/navsim_v1.1/navsim_logs/trainval"
+  default: "/mnt/chenpeijian/autodrive/DriveVA-lite/videopress_framework/outputs/navsim_split_audit/metadata/train"
   aliases:
     - TRAIN_NAVSIM_LOG_PATH
 SENSOR_BLOBS_PATH:
-  default: "/path/to/nuplan/dataset/nuplan-v1.1/sensor_blobs"
+  default: "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/extra_trainval_32/openscene-v1.1/sensor_blobs/trainval"
   aliases:
     - NAVSIM_SENSOR_BLOBS_PATH
     - TRAIN_SENSOR_BLOBS_PATH
 CACHE_PATH:
-  default:
+  default: "/mnt/nvme/chenpeijian/autodrive/DriveVA/data/navsim_v1.1/metric_cache_full"
   aliases:
     - NAVSIM_CACHE_PATH
 USE_CACHE_ONLY: 0

@@ -28,9 +28,7 @@ from diffsynth.pipelines.wan_video_new import ModelConfig, WanVideoPipeline
 from diffsynth.trainers.utils import DiffusionTrainingModule, ModelLogger, launch_training_task
 
 from navsim_dataset import DEFAULT_NEGATIVE_PROMPT, NavsimDriveVAConfig, NavsimDriveVADataset
-from examples.wanvideo.backbone_config import (
-    BACKBONES, WAN21_T2V_1P3B, build_model_configs, get_backbone_config, validate_loaded_backbone,
-)
+from examples.wanvideo.backbone_config import BACKBONES, WAN22_TI2V_5B, build_model_configs, get_backbone_config, validate_loaded_backbone
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -543,9 +541,7 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
         self.min_timestep_boundary = float(min_timestep_boundary)
 
         self.backbone_config = get_backbone_config(backbone_type)
-        model_configs, tokenizer_config, _ = build_model_configs(
-            self.backbone_config, local_model_path, offload_device="cpu"
-        )
+        model_configs, tokenizer_config, _ = build_model_configs(self.backbone_config, local_model_path, offload_device="cpu")
         self.pipe = WanVideoPipeline.from_pretrained(
             torch_dtype=torch.bfloat16,
             device="cpu",
@@ -650,12 +646,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--target_fps", type=int, default=2)
 
     parser.add_argument("--local_model_path", type=str, default=None)
-    parser.add_argument(
-        "--backbone_type",
-        type=str,
-        default=WAN21_T2V_1P3B,
-        choices=sorted(BACKBONES),
-    )
+    parser.add_argument("--backbone_type", type=str, default=WAN22_TI2V_5B, choices=sorted(BACKBONES))
     parser.add_argument("--full_ckpt", type=str, default=None)
     parser.add_argument("--trainable_models", type=str, default=None)
     parser.add_argument("--lora_base_model", type=str, default=None)
@@ -664,8 +655,6 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--lora_checkpoint", type=str, default=None)
 
     parser.add_argument("--learning_rate", type=float, default=1e-4)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--precision", choices=["bf16", "fp16", "no"], default="bf16")
     parser.add_argument("--max_optimizer_steps", type=int, default=None)
     parser.add_argument("--num_epochs", type=int, default=8)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
@@ -807,6 +796,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         state_dict = _normalize_train_ckpt_keys(load_state_dict(args.full_ckpt))
         missing, unexpected = model.pipe.load_state_dict(state_dict, strict=False)
         print(f"[train] full_ckpt loaded: keys={len(state_dict)}, missing={len(missing)}, unexpected={len(unexpected)}")
+        if len(missing) > 0:
+            print(f"[train] full_ckpt missing summary: {_summarize_ckpt_keys(list(missing))}")
+        if len(unexpected) > 0:
+            print(f"[train] full_ckpt unexpected summary: {_summarize_ckpt_keys(list(unexpected))}")
 
     remove_prefix = "pipe.dit." if args.lora_base_model is not None else "pipe."
     logger_cls = InProcessAutoEvalModelLogger if args.auto_eval else ModelLogger

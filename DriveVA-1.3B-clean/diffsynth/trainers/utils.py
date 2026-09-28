@@ -2,12 +2,10 @@ import json
 import math
 import os
 import time
-import random
 from datetime import timedelta
 from typing import Optional
 
 import torch
-import numpy as np
 from tqdm import tqdm
 
 from ..models.utils import load_state_dict
@@ -299,28 +297,10 @@ def launch_training_task(
     if gradient_clip_norm is not None:
         gradient_clip_norm = float(gradient_clip_norm)
     use_ema = bool(getattr(args, "use_ema", False)) if args is not None else False
-    seed = int(getattr(args, "seed", 42)) if args is not None else 42
-    max_optimizer_steps = getattr(args, "max_optimizer_steps", None) if args is not None else None
-    max_optimizer_steps = int(max_optimizer_steps) if max_optimizer_steps is not None else None
-    mixed_precision = str(getattr(args, "precision", "bf16")) if args is not None else "bf16"
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    rank = int(os.environ.get("RANK", "0"))
-    sampler = None
-    if world_size > 1:
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=seed, drop_last=False
-        )
     dataloader_kwargs = dict(
-        shuffle=sampler is None,
-        sampler=sampler,
+        shuffle=True,
         collate_fn=lambda x: x[0],
         num_workers=num_workers,
         pin_memory=True,
@@ -331,12 +311,13 @@ def launch_training_task(
     dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
     updates_per_epoch = max(math.ceil(len(dataloader) / gradient_accumulation_steps), 1)
     total_steps = max(num_epochs * updates_per_epoch, 1)
+    max_optimizer_steps = getattr(args, "max_optimizer_steps", None) if args is not None else None
     if max_optimizer_steps is not None:
+        max_optimizer_steps = max(int(max_optimizer_steps), 1)
         total_steps = min(total_steps, max_optimizer_steps)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
-        mixed_precision=mixed_precision,
         kwargs_handlers=[
             DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters),
             InitProcessGroupKwargs(timeout=timedelta(seconds=max(ddp_timeout_seconds, 1))),
@@ -355,10 +336,8 @@ def launch_training_task(
             f"grad_accum={gradient_accumulation_steps}",
         )
 
-    model, optimizer = accelerator.prepare(model, optimizer)
+    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     unwrapped_model = accelerator.unwrap_model(model)
-    parameter_count = sum(p.numel() for p in unwrapped_model.parameters())
-    trainable_parameter_count = sum(p.numel() for p in unwrapped_model.parameters() if p.requires_grad)
     if hasattr(unwrapped_model, "init_ema"):
         if use_ema:
             ema_device = "cpu" if bool(getattr(args, "ema_on_cpu", False)) else str(accelerator.device)
@@ -375,20 +354,11 @@ def launch_training_task(
             unwrapped_model.init_ema(enabled=False)
 
     step_id = 0
-    step_times = []
-    metrics_path = os.path.join(model_logger.output_path, "train_metrics.jsonl")
-    if accelerator.is_main_process:
-        os.makedirs(model_logger.output_path, exist_ok=True)
-        open(metrics_path, "w", encoding="utf-8").close()
-    torch.cuda.reset_peak_memory_stats(accelerator.device)
     optimizer.zero_grad()
     last_log = time.perf_counter()
     for epoch_id in range(num_epochs):
-        if sampler is not None:
-            sampler.set_epoch(epoch_id)
         progress = tqdm(dataloader, disable=not accelerator.is_main_process, desc=f"epoch {epoch_id}")
         for data in progress:
-            step_started = time.perf_counter()
             with accelerator.accumulate(model):
                 current_lr = learning_rate * _lr_factor(
                     step_id,
@@ -410,25 +380,6 @@ def launch_training_task(
                     video_loss = None
                     traj_loss = None
 
-                finite = torch.isfinite(loss.detach()).to(accelerator.device, dtype=torch.int32)
-                all_finite = finite.clone()
-                if torch.distributed.is_available() and torch.distributed.is_initialized():
-                    torch.distributed.all_reduce(all_finite, op=torch.distributed.ReduceOp.MIN)
-                if all_finite.item() != 1:
-                    diagnostic = {
-                        "rank": accelerator.process_index,
-                        "loss": _to_float(loss),
-                        "video_loss": video_loss,
-                        "trajectory_loss": traj_loss,
-                    }
-                    for key in ("trajectory", "ego_vel"):
-                        value = data.get(key) if isinstance(data, dict) else None
-                        if torch.is_tensor(value):
-                            diagnostic[f"{key}_finite"] = bool(torch.isfinite(value).all())
-                            diagnostic[f"{key}_shape"] = list(value.shape)
-                    print(f"[train][nonfinite] {json.dumps(diagnostic)}", flush=True)
-                    accelerator.wait_for_everyone()
-                    raise FloatingPointError(f"non-finite loss before backward at optimizer step {step_id + 1}")
                 accelerator.backward(loss)
                 if gradient_clip_norm is not None and accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(model.parameters(), gradient_clip_norm)
@@ -437,37 +388,26 @@ def launch_training_task(
 
                 if accelerator.sync_gradients:
                     step_id += 1
-                    step_times.append(time.perf_counter() - step_started)
-                    loss_reduced = accelerator.reduce(loss.detach().float(), reduction="mean")
-                    video_reduced = accelerator.reduce(output["video_loss"].detach().float(), reduction="mean") if isinstance(output, dict) else None
-                    traj_reduced = accelerator.reduce(output["trajectory_loss"].detach().float(), reduction="mean") if isinstance(output, dict) else None
                     if use_ema and hasattr(unwrapped_model, "update_ema"):
                         unwrapped_model.update_ema(step_id)
                     model_logger.on_step_end(accelerator, model, save_steps)
 
-                    if accelerator.is_main_process:
-                        record = {
-                            "step": step_id, "epoch": epoch_id,
-                            "loss": _to_float(loss_reduced),
-                            "video_loss": _to_float(video_reduced),
-                            "trajectory_loss": _to_float(traj_reduced),
-                            "lr": current_lr,
-                        }
-                        with open(metrics_path, "a", encoding="utf-8") as metrics_file:
-                            metrics_file.write(json.dumps(record) + "\n")
                     if accelerator.is_main_process and log_every_steps > 0 and step_id % log_every_steps == 0:
                         elapsed = time.perf_counter() - last_log
                         last_log = time.perf_counter()
                         print(
                             f"[train][step {step_id}/{total_steps}] "
-                            f"loss={_to_float(loss_reduced):.6f} "
-                            f"video_loss={_to_float(video_reduced) if video_reduced is not None else 'n/a'} "
-                            f"traj_loss={_to_float(traj_reduced) if traj_reduced is not None else 'n/a'} "
+                            f"loss={_to_float(loss):.6f} "
+                            f"video_loss={video_loss if video_loss is not None else 'n/a'} "
+                            f"traj_loss={traj_loss if traj_loss is not None else 'n/a'} "
                             f"lr={current_lr:.6e} "
                             f"elapsed_s={elapsed:.2f}"
                         )
                     if max_optimizer_steps is not None and step_id >= max_optimizer_steps:
                         break
+
+            if max_optimizer_steps is not None and step_id >= max_optimizer_steps:
+                break
 
         if max_optimizer_steps is not None and step_id >= max_optimizer_steps:
             break
@@ -476,26 +416,3 @@ def launch_training_task(
             model_logger.on_epoch_end(accelerator, model, epoch_id)
 
     model_logger.on_training_end(accelerator, model, save_steps)
-    local_stats = torch.tensor([
-        float(torch.cuda.max_memory_allocated(accelerator.device)),
-        float(torch.cuda.max_memory_reserved(accelerator.device)),
-        float(sum(step_times) / max(len(step_times), 1)),
-    ], device=accelerator.device)
-    gathered_stats = accelerator.gather(local_stats).reshape(accelerator.num_processes, 3)
-    if accelerator.is_main_process:
-        summary = {
-            "optimizer_steps": step_id,
-            "world_size": accelerator.num_processes,
-            "micro_batch_per_gpu": 1,
-            "gradient_accumulation_steps": gradient_accumulation_steps,
-            "global_batch_size": accelerator.num_processes * gradient_accumulation_steps,
-            "peak_allocated_bytes_per_gpu": gathered_stats[:, 0].cpu().tolist(),
-            "peak_reserved_bytes_per_gpu": gathered_stats[:, 1].cpu().tolist(),
-            "average_step_seconds_per_gpu": gathered_stats[:, 2].cpu().tolist(),
-            "nan_or_inf": False,
-            "parameter_count": parameter_count,
-            "trainable_parameter_count": trainable_parameter_count,
-            "frozen_parameter_count": parameter_count - trainable_parameter_count,
-        }
-        with open(os.path.join(model_logger.output_path, "training_summary.json"), "w", encoding="utf-8") as handle:
-            json.dump(summary, handle, indent=2)

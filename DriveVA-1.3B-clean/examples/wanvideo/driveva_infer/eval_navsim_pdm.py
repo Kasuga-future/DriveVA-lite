@@ -29,9 +29,7 @@ from tqdm import tqdm
 
 from diffsynth import load_state_dict
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
-from examples.wanvideo.backbone_config import (
-    BACKBONES, WAN21_T2V_1P3B, build_model_configs, get_backbone_config, validate_loaded_backbone,
-)
+from examples.wanvideo.backbone_config import BACKBONES, WAN22_TI2V_5B, build_model_configs, get_backbone_config, validate_loaded_backbone
 try:
     from examples.wanvideo.driveva_infer.navsim_dataset import (
         _build_prompt_fixed,
@@ -287,9 +285,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     # Model args
     parser.add_argument("--local_model_path", type=str, default=None)
-    parser.add_argument(
-        "--backbone_type", type=str, default=WAN21_T2V_1P3B, choices=sorted(BACKBONES),
-    )
+    parser.add_argument("--backbone_type", type=str, default=WAN22_TI2V_5B, choices=sorted(BACKBONES))
     parser.add_argument("--full_ckpt", type=str, required=True, help="Path to full checkpoint (.safetensors).")
     parser.add_argument("--num_inference_steps", type=int, default=3)
     parser.add_argument("--cfg_scale", type=float, default=1.0)
@@ -1708,6 +1704,9 @@ def _resolve_driveva_feature_builders():
 
 def _build_scene_loader(SceneLoader: Any, SensorConfig: Any, args: argparse.Namespace, scene_filter: Any):
     sensor_config = SensorConfig.build_all_sensors(include=True)
+    # The supplied sensor export contains the DriveVA surround cameras but no
+    # MergedPointCloud files; PDM reads map/agent state from the metric cache.
+    sensor_config.lidar_pc = False
     init_sig = inspect.signature(SceneLoader.__init__)
     if "sensor_blobs_path" in init_sig.parameters:
         loader = SceneLoader(
