@@ -214,11 +214,11 @@ class InProcessAutoEvalModelLogger(ModelLogger):
         if self.auto_eval_ckpt_kind not in {"raw", "ema", "all"}:
             raise ValueError(f"auto_eval_ckpt_kind must be raw, ema, or all; got {self.auto_eval_ckpt_kind}")
 
-    def on_step_end(self, accelerator, model, save_steps=None):
+    def on_step_end(self, accelerator, model, save_steps=None, optimizer=None, training_state=None):
         self.num_steps += 1
-        if save_steps is not None and self.num_steps % int(save_steps) == 0:
+        if self.should_save_step(save_steps):
             file_name = f"step-{self.num_steps}.safetensors"
-            self.save_model(accelerator, model, file_name)
+            self.save_model(accelerator, model, file_name, optimizer, training_state)
             self._run_auto_eval(accelerator, model, os.path.splitext(file_name)[0])
 
     def on_epoch_end(self, accelerator, model, epoch_id):
@@ -226,10 +226,10 @@ class InProcessAutoEvalModelLogger(ModelLogger):
         self.save_model(accelerator, model, file_name)
         self._run_auto_eval(accelerator, model, os.path.splitext(file_name)[0])
 
-    def on_training_end(self, accelerator, model, save_steps=None):
-        if save_steps is not None and self.num_steps % int(save_steps) != 0:
+    def on_training_end(self, accelerator, model, save_steps=None, optimizer=None, training_state=None):
+        if save_steps is not None and not self.should_save_step(save_steps):
             file_name = f"step-{self.num_steps}.safetensors"
-            self.save_model(accelerator, model, file_name)
+            self.save_model(accelerator, model, file_name, optimizer, training_state)
             self._run_auto_eval(accelerator, model, os.path.splitext(file_name)[0])
 
     def _eval_module(self, name: str):
@@ -648,6 +648,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--local_model_path", type=str, default=None)
     parser.add_argument("--backbone_type", type=str, default=WAN22_TI2V_5B, choices=sorted(BACKBONES))
     parser.add_argument("--full_ckpt", type=str, default=None)
+    parser.add_argument("--ema_checkpoint", type=str, default=None)
+    parser.add_argument("--resume_training_state", type=str, default=None)
+    parser.add_argument("--initial_global_step", type=int, default=0)
     parser.add_argument("--trainable_models", type=str, default=None)
     parser.add_argument("--lora_base_model", type=str, default=None)
     parser.add_argument("--lora_target_modules", type=str, default="q,k,v,o,ffn.0,ffn.2")
@@ -696,6 +699,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--train_log_file", type=str, default="train.log")
     parser.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT)
     parser.add_argument("--save_steps", type=int, default=None)
+    parser.add_argument("--checkpoint_steps", type=str, default=None)
     parser.add_argument("--auto_eval", dest="auto_eval", action="store_true")
     parser.add_argument("--no_auto_eval", dest="auto_eval", action="store_false")
     parser.set_defaults(auto_eval=False)
@@ -719,6 +723,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
+    if args.resume_training_state and not args.full_ckpt:
+        raise ValueError("--resume_training_state requires --full_ckpt for matching raw model weights")
     if args.lora_base_model is not None and args.lora_base_model.strip().lower() in {"none", "null", ""}:
         args.lora_base_model = None
     if int(args.target_fps) <= 0:
@@ -817,6 +823,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         remove_prefix_in_ckpt=remove_prefix,
         save_raw_ckpt=args.save_raw_ckpt,
         save_ema_ckpt=args.save_ema,
+        initial_step=args.initial_global_step,
+        checkpoint_steps=(
+            [int(step.strip()) for step in args.checkpoint_steps.split(",") if step.strip()]
+            if args.checkpoint_steps
+            else None
+        ),
         **logger_kwargs,
     )
 

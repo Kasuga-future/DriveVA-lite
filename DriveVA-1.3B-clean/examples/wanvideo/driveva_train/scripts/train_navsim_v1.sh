@@ -77,6 +77,11 @@ args=(
 )
 
 if [[ -n "${FULL_CKPT:-}" ]]; then args+=(--full_ckpt "${FULL_CKPT}"); fi
+if [[ -n "${EMA_CHECKPOINT:-}" ]]; then args+=(--ema_checkpoint "${EMA_CHECKPOINT}"); fi
+if [[ -n "${RESUME_TRAINING_STATE:-}" ]]; then args+=(--resume_training_state "${RESUME_TRAINING_STATE}"); fi
+if [[ -n "${INITIAL_GLOBAL_STEP:-}" ]]; then args+=(--initial_global_step "${INITIAL_GLOBAL_STEP}"); fi
+if [[ -n "${MAX_OPTIMIZER_STEPS:-}" ]]; then args+=(--max_optimizer_steps "${MAX_OPTIMIZER_STEPS}"); fi
+if [[ -n "${CHECKPOINT_STEPS:-}" ]]; then args+=(--checkpoint_steps "${CHECKPOINT_STEPS}"); fi
 if [[ -n "${CACHE_PATH:-}" ]]; then args+=(--cache_path "${CACHE_PATH}"); fi
 if [[ -n "${TRAIN_LOG_NAMES:-}" ]]; then args+=(--train_log_names "${TRAIN_LOG_NAMES}"); fi
 if [[ -n "${MAX_SCENES:-}" ]]; then args+=(--max_scenes "${MAX_SCENES}"); fi
