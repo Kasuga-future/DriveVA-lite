@@ -136,6 +136,33 @@ class DiffusionTrainingModule(torch.nn.Module):
                 state_dict[export_name] = value
         return state_dict
 
+    def load_ema_trainable_state_dict(self, state_dict, strict=True):
+        if not self.has_ema():
+            raise RuntimeError("EMA must be initialized before restoring its state.")
+
+        named_params = dict(self.named_parameters())
+        restored = []
+        unexpected = []
+        for key, value in state_dict.items():
+            name = key if key in named_params else f"pipe.{key}"
+            if name not in self._ema_shadow:
+                unexpected.append(key)
+                continue
+            shadow = self._ema_shadow[name]
+            if tuple(shadow.shape) != tuple(value.shape):
+                raise ValueError(
+                    f"EMA shape mismatch for {key}: checkpoint={tuple(value.shape)} current={tuple(shadow.shape)}"
+                )
+            shadow.copy_(value.to(device=shadow.device, dtype=shadow.dtype))
+            restored.append(name)
+
+        missing = [name for name, _ in self._ema_named_params if name not in restored]
+        if strict and (missing or unexpected):
+            raise RuntimeError(
+                f"EMA restore mismatch: restored={len(restored)} missing={len(missing)} unexpected={len(unexpected)}"
+            )
+        return restored, missing, unexpected
+
     def parse_model_configs(self, model_paths, model_id_with_origin_paths, enable_fp8_training=False):
         offload_dtype = torch.float8_e4m3fn if enable_fp8_training else None
         model_configs = []
@@ -185,6 +212,8 @@ class ModelLogger:
         save_raw_ckpt=True,
         save_ema_ckpt=False,
         ema_file_suffix="-ema",
+        initial_step=0,
+        checkpoint_steps=None,
     ):
         self.output_path = output_path
         self.remove_prefix_in_ckpt = remove_prefix_in_ckpt
@@ -192,21 +221,28 @@ class ModelLogger:
         self.save_raw_ckpt = bool(save_raw_ckpt)
         self.save_ema_ckpt = bool(save_ema_ckpt)
         self.ema_file_suffix = str(ema_file_suffix)
-        self.num_steps = 0
+        self.initial_step = max(int(initial_step), 0)
+        self.num_steps = self.initial_step
+        self.checkpoint_steps = {int(step) for step in (checkpoint_steps or [])}
 
-    def on_step_end(self, accelerator, model, save_steps=None):
+    def should_save_step(self, save_steps=None):
+        if self.checkpoint_steps:
+            return self.num_steps in self.checkpoint_steps
+        return save_steps is not None and (self.num_steps - self.initial_step) % int(save_steps) == 0
+
+    def on_step_end(self, accelerator, model, save_steps=None, optimizer=None, training_state=None):
         self.num_steps += 1
-        if save_steps is not None and self.num_steps % int(save_steps) == 0:
-            self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
+        if self.should_save_step(save_steps):
+            self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors", optimizer, training_state)
 
     def on_epoch_end(self, accelerator, model, epoch_id):
         self.save_model(accelerator, model, f"epoch-{epoch_id}.safetensors")
 
-    def on_training_end(self, accelerator, model, save_steps=None):
-        if save_steps is not None and self.num_steps % int(save_steps) != 0:
-            self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
+    def on_training_end(self, accelerator, model, save_steps=None, optimizer=None, training_state=None):
+        if save_steps is not None and not self.should_save_step(save_steps):
+            self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors", optimizer, training_state)
 
-    def save_model(self, accelerator, model, file_name):
+    def save_model(self, accelerator, model, file_name, optimizer=None, training_state=None):
         accelerator.wait_for_everyone()
         if accelerator.is_main_process:
             os.makedirs(self.output_path, exist_ok=True)
@@ -230,6 +266,15 @@ class ModelLogger:
                     accelerator.save(ema_state, os.path.join(self.output_path, ema_name), safe_serialization=True)
                 else:
                     print("[train][ema][warn] save_ema_ckpt enabled but EMA is not initialized; skip.")
+            if optimizer is not None and training_state is not None:
+                state_path = os.path.join(self.output_path, "latest-training-state.pt")
+                tmp_state_path = f"{state_path}.tmp"
+                payload = dict(training_state)
+                payload["optimizer"] = optimizer.state_dict()
+                payload["checkpoint_file"] = file_name
+                torch.save(payload, tmp_state_path)
+                os.replace(tmp_state_path, state_path)
+                print(f"[train][state] saved: {state_path}")
         accelerator.wait_for_everyone()
 
 
@@ -310,7 +355,12 @@ def launch_training_task(
         dataloader_kwargs["prefetch_factor"] = 2
     dataloader = torch.utils.data.DataLoader(dataset, **dataloader_kwargs)
     updates_per_epoch = max(math.ceil(len(dataloader) / gradient_accumulation_steps), 1)
+    initial_global_step = max(int(getattr(args, "initial_global_step", 0)), 0) if args is not None else 0
     total_steps = max(num_epochs * updates_per_epoch, 1)
+    max_optimizer_steps = getattr(args, "max_optimizer_steps", None) if args is not None else None
+    if max_optimizer_steps is not None:
+        max_optimizer_steps = max(int(max_optimizer_steps), 1)
+        total_steps = min(total_steps, max_optimizer_steps)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=gradient_accumulation_steps,
@@ -349,12 +399,71 @@ def launch_training_task(
         else:
             unwrapped_model.init_ema(enabled=False)
 
-    step_id = 0
+    resume_training_state = getattr(args, "resume_training_state", None) if args is not None else None
+    resume_state = None
+    if resume_training_state:
+        if not os.path.exists(resume_training_state):
+            raise FileNotFoundError(f"resume_training_state not found: {resume_training_state}")
+        resume_state = torch.load(resume_training_state, map_location="cpu", weights_only=False)
+        saved_world_size = int(resume_state.get("world_size", accelerator.num_processes))
+        if saved_world_size != accelerator.num_processes:
+            raise ValueError(
+                f"Resume world_size mismatch: checkpoint={saved_world_size} current={accelerator.num_processes}"
+            )
+        expected = {
+            "gradient_accumulation_steps": gradient_accumulation_steps,
+            "lr_scheduler_type": scheduler_type,
+            "warmup_steps": warmup_steps,
+            "warmup_start_factor": warmup_start_factor,
+        }
+        for key, current_value in expected.items():
+            if key in resume_state and resume_state[key] != current_value:
+                raise ValueError(
+                    f"Resume config mismatch for {key}: checkpoint={resume_state[key]} current={current_value}"
+                )
+        optimizer.load_state_dict(resume_state["optimizer"])
+
+    ema_checkpoint = getattr(args, "ema_checkpoint", None) if args is not None else None
+    if ema_checkpoint:
+        if not os.path.exists(ema_checkpoint):
+            raise FileNotFoundError(f"ema_checkpoint not found: {ema_checkpoint}")
+        ema_state = load_state_dict(ema_checkpoint)
+        restored, missing, unexpected = unwrapped_model.load_ema_trainable_state_dict(ema_state, strict=True)
+        if accelerator.is_main_process:
+            print(
+                "[train][continuation] EMA restored:",
+                f"checkpoint={ema_checkpoint}",
+                f"restored={len(restored)} missing={len(missing)} unexpected={len(unexpected)}",
+            )
+
+    local_updates_per_epoch = max(math.ceil(len(dataloader) / gradient_accumulation_steps), 1)
+    resume_epoch = int(resume_state.get("epoch", 0)) if resume_state else 0
+    resume_batch_in_epoch = int(resume_state.get("batch_in_epoch", 0)) if resume_state else 0
+    if resume_state:
+        initial_global_step = int(resume_state["global_step"])
+        model_logger.initial_step = initial_global_step
+        model_logger.num_steps = initial_global_step
+    planned_final_step = initial_global_step + num_epochs * local_updates_per_epoch
+    if accelerator.is_main_process:
+        print(
+            "[train][continuation] setup:",
+            f"initial_global_step={initial_global_step}",
+            f"local_updates_per_epoch={local_updates_per_epoch}",
+            f"planned_final_step={planned_final_step}",
+            f"optimizer_state={'restored' if resume_state else 'initialized'}",
+            f"resume_epoch={resume_epoch}",
+            f"resume_batch_in_epoch={resume_batch_in_epoch}",
+        )
+
+    step_id = initial_global_step
     optimizer.zero_grad()
     last_log = time.perf_counter()
-    for epoch_id in range(num_epochs):
+    for epoch_offset in range(num_epochs):
+        epoch_id = resume_epoch + epoch_offset
         progress = tqdm(dataloader, disable=not accelerator.is_main_process, desc=f"epoch {epoch_id}")
-        for data in progress:
+        for batch_id, data in enumerate(progress):
+            if epoch_offset == 0 and batch_id < resume_batch_in_epoch:
+                continue
             with accelerator.accumulate(model):
                 current_lr = learning_rate * _lr_factor(
                     step_id,
@@ -386,7 +495,25 @@ def launch_training_task(
                     step_id += 1
                     if use_ema and hasattr(unwrapped_model, "update_ema"):
                         unwrapped_model.update_ema(step_id)
-                    model_logger.on_step_end(accelerator, model, save_steps)
+                    next_epoch = epoch_id
+                    next_batch = batch_id + 1
+                    if next_batch >= len(dataloader):
+                        next_epoch += 1
+                        next_batch = 0
+                    training_state = {
+                        "format_version": 1,
+                        "global_step": step_id,
+                        "epoch": next_epoch,
+                        "batch_in_epoch": next_batch,
+                        "world_size": accelerator.num_processes,
+                        "gradient_accumulation_steps": gradient_accumulation_steps,
+                        "lr_scheduler_type": scheduler_type,
+                        "warmup_steps": warmup_steps,
+                        "warmup_start_factor": warmup_start_factor,
+                        "learning_rate": learning_rate,
+                        "weight_decay": weight_decay,
+                    }
+                    model_logger.on_step_end(accelerator, model, save_steps, optimizer, training_state)
 
                     if accelerator.is_main_process and log_every_steps > 0 and step_id % log_every_steps == 0:
                         elapsed = time.perf_counter() - last_log
@@ -399,8 +526,29 @@ def launch_training_task(
                             f"lr={current_lr:.6e} "
                             f"elapsed_s={elapsed:.2f}"
                         )
+                    if max_optimizer_steps is not None and step_id >= max_optimizer_steps:
+                        break
+
+            if max_optimizer_steps is not None and step_id >= max_optimizer_steps:
+                break
+
+        if max_optimizer_steps is not None and step_id >= max_optimizer_steps:
+            break
 
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
 
-    model_logger.on_training_end(accelerator, model, save_steps)
+    final_state = {
+        "format_version": 1,
+        "global_step": step_id,
+        "epoch": resume_epoch + num_epochs,
+        "batch_in_epoch": 0,
+        "world_size": accelerator.num_processes,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "lr_scheduler_type": scheduler_type,
+        "warmup_steps": warmup_steps,
+        "warmup_start_factor": warmup_start_factor,
+        "learning_rate": learning_rate,
+        "weight_decay": weight_decay,
+    }
+    model_logger.on_training_end(accelerator, model, save_steps, optimizer, final_state)

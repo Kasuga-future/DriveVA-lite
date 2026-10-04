@@ -28,6 +28,7 @@ from diffsynth.pipelines.wan_video_new import ModelConfig, WanVideoPipeline
 from diffsynth.trainers.utils import DiffusionTrainingModule, ModelLogger, launch_training_task
 
 from navsim_dataset import DEFAULT_NEGATIVE_PROMPT, NavsimDriveVAConfig, NavsimDriveVADataset
+from examples.wanvideo.backbone_config import BACKBONES, WAN22_TI2V_5B, build_model_configs, get_backbone_config, validate_loaded_backbone
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -213,11 +214,11 @@ class InProcessAutoEvalModelLogger(ModelLogger):
         if self.auto_eval_ckpt_kind not in {"raw", "ema", "all"}:
             raise ValueError(f"auto_eval_ckpt_kind must be raw, ema, or all; got {self.auto_eval_ckpt_kind}")
 
-    def on_step_end(self, accelerator, model, save_steps=None):
+    def on_step_end(self, accelerator, model, save_steps=None, optimizer=None, training_state=None):
         self.num_steps += 1
-        if save_steps is not None and self.num_steps % int(save_steps) == 0:
+        if self.should_save_step(save_steps):
             file_name = f"step-{self.num_steps}.safetensors"
-            self.save_model(accelerator, model, file_name)
+            self.save_model(accelerator, model, file_name, optimizer, training_state)
             self._run_auto_eval(accelerator, model, os.path.splitext(file_name)[0])
 
     def on_epoch_end(self, accelerator, model, epoch_id):
@@ -225,10 +226,10 @@ class InProcessAutoEvalModelLogger(ModelLogger):
         self.save_model(accelerator, model, file_name)
         self._run_auto_eval(accelerator, model, os.path.splitext(file_name)[0])
 
-    def on_training_end(self, accelerator, model, save_steps=None):
-        if save_steps is not None and self.num_steps % int(save_steps) != 0:
+    def on_training_end(self, accelerator, model, save_steps=None, optimizer=None, training_state=None):
+        if save_steps is not None and not self.should_save_step(save_steps):
             file_name = f"step-{self.num_steps}.safetensors"
-            self.save_model(accelerator, model, file_name)
+            self.save_model(accelerator, model, file_name, optimizer, training_state)
             self._run_auto_eval(accelerator, model, os.path.splitext(file_name)[0])
 
     def _eval_module(self, name: str):
@@ -528,6 +529,7 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
         infer_replace_history_latents_before_decode: bool,
         trajectory_condition_mode: str,
         num_history_frames: int,
+        backbone_type: str,
     ):
         super().__init__()
         self.negative_prompt = negative_prompt
@@ -538,35 +540,8 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
         self.max_timestep_boundary = float(max_timestep_boundary)
         self.min_timestep_boundary = float(min_timestep_boundary)
 
-        model_configs = [
-            ModelConfig(
-                model_id="Wan-AI/Wan2.2-TI2V-5B",
-                origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth",
-                offload_device="cpu",
-                local_model_path=local_model_path,
-                skip_download=True,
-            ),
-            ModelConfig(
-                model_id="Wan-AI/Wan2.2-TI2V-5B",
-                origin_file_pattern="diffusion_pytorch_model*.safetensors",
-                offload_device="cpu",
-                local_model_path=local_model_path,
-                skip_download=True,
-            ),
-            ModelConfig(
-                model_id="Wan-AI/Wan2.2-TI2V-5B",
-                origin_file_pattern="Wan2.2_VAE.pth",
-                offload_device="cpu",
-                local_model_path=local_model_path,
-                skip_download=True,
-            ),
-        ]
-        tokenizer_config = ModelConfig(
-            model_id="Wan-AI/Wan2.2-TI2V-5B",
-            origin_file_pattern="google/*",
-            local_model_path=local_model_path,
-            skip_download=True,
-        )
+        self.backbone_config = get_backbone_config(backbone_type)
+        model_configs, tokenizer_config, _ = build_model_configs(self.backbone_config, local_model_path, offload_device="cpu")
         self.pipe = WanVideoPipeline.from_pretrained(
             torch_dtype=torch.bfloat16,
             device="cpu",
@@ -574,6 +549,7 @@ class DriveVANavsimTrainingModule(DiffusionTrainingModule):
             tokenizer_config=tokenizer_config,
             use_trajectory=use_trajectory,
         )
+        validate_loaded_backbone(self.pipe.dit, self.backbone_config)
         self.pipe.target_fps = target_fps
         self.pipe.num_history_frames = max(0, int(num_history_frames))
         self.pipe.train_future_video_noise_only = bool(train_future_video_noise_only)
@@ -670,7 +646,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--target_fps", type=int, default=2)
 
     parser.add_argument("--local_model_path", type=str, default=None)
+    parser.add_argument("--backbone_type", type=str, default=WAN22_TI2V_5B, choices=sorted(BACKBONES))
     parser.add_argument("--full_ckpt", type=str, default=None)
+    parser.add_argument("--ema_checkpoint", type=str, default=None)
+    parser.add_argument("--resume_training_state", type=str, default=None)
+    parser.add_argument("--initial_global_step", type=int, default=0)
     parser.add_argument("--trainable_models", type=str, default=None)
     parser.add_argument("--lora_base_model", type=str, default=None)
     parser.add_argument("--lora_target_modules", type=str, default="q,k,v,o,ffn.0,ffn.2")
@@ -678,6 +658,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--lora_checkpoint", type=str, default=None)
 
     parser.add_argument("--learning_rate", type=float, default=1e-4)
+    parser.add_argument("--max_optimizer_steps", type=int, default=None)
     parser.add_argument("--num_epochs", type=int, default=8)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--dataset_num_workers", type=int, default=4)
@@ -718,6 +699,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--train_log_file", type=str, default="train.log")
     parser.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT)
     parser.add_argument("--save_steps", type=int, default=None)
+    parser.add_argument("--checkpoint_steps", type=str, default=None)
     parser.add_argument("--auto_eval", dest="auto_eval", action="store_true")
     parser.add_argument("--no_auto_eval", dest="auto_eval", action="store_false")
     parser.set_defaults(auto_eval=False)
@@ -741,6 +723,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
+    if args.resume_training_state and not args.full_ckpt:
+        raise ValueError("--resume_training_state requires --full_ckpt for matching raw model weights")
     if args.lora_base_model is not None and args.lora_base_model.strip().lower() in {"none", "null", ""}:
         args.lora_base_model = None
     if int(args.target_fps) <= 0:
@@ -808,6 +792,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         infer_replace_history_latents_before_decode=args.infer_replace_history_latents_before_decode,
         trajectory_condition_mode=args.trajectory_condition_mode,
         num_history_frames=args.num_history_frames,
+        backbone_type=args.backbone_type,
     )
 
     if args.full_ckpt:
@@ -838,6 +823,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         remove_prefix_in_ckpt=remove_prefix,
         save_raw_ckpt=args.save_raw_ckpt,
         save_ema_ckpt=args.save_ema,
+        initial_step=args.initial_global_step,
+        checkpoint_steps=(
+            [int(step.strip()) for step in args.checkpoint_steps.split(",") if step.strip()]
+            if args.checkpoint_steps
+            else None
+        ),
         **logger_kwargs,
     )
 
