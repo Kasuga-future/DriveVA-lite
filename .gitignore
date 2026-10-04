@@ -4,3 +4,7 @@ DriveVA-1.3B-clean/models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth
 DriveVA-1.3B-clean/models/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors
 DriveVA-1.3B-clean/models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth
 output/
+
+# Python cache
+__pycache__/
+*.py[cod]
